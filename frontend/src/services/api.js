@@ -1,17 +1,9 @@
 import axios from 'axios';
 import { getToken, clearAuth } from './authStorage';
 
-// ✅ Base URL — prefers an explicit REACT_APP_API_URL (a real deployment,
-// where the frontend and backend live on different hosts/domains), but for
-// local/LAN development — where both run on this same machine — falls back
-// to whatever host the browser actually used to load this page. That makes
-// the app reachable from any device on any Wi-Fi network without ever
-// needing to hardcode/update an IP in .env again: load the page via
-// 192.168.x.x:3000 and it talks to 192.168.x.x:5000; load it via
-// localhost:3000 and it talks to localhost:5000 — it just follows whatever
-// address got you here.
+// ✅ Base URL — uses Render backend in production, falls back to dynamic hostname for local dev
 const API_BASE_URL =
-  process.env.REACT_APP_API_URL || `http://${window.location.hostname}:5000/api`;
+  process.env.REACT_APP_API_URL || `https://agms.onrender.com/api`;
 
 // ✅ Create axios instance
 const api = axios.create({
