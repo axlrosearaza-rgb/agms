@@ -6,7 +6,7 @@ import api from '../../services/api';
 const ROLE_ROUTES = {
   Admin: '/admin',
   Chairperson: '/chairperson',
-  Instructor: '/instructor',
+  Faculty: '/faculty',
   Student: '/student',
 };
 
@@ -135,6 +135,7 @@ export default function LoginPage() {
   const [mounted, setMounted]           = useState(false);
   const [focusedField, setFocusedField] = useState(null);
   const [currentSemester, setCurrentSemester] = useState(null);
+  const [rememberMe, setRememberMe]     = useState(true);
 
   const { login } = useAuth();
   const navigate  = useNavigate();
@@ -150,10 +151,22 @@ export default function LoginPage() {
   const handleSubmit = async (e) => {
     e.preventDefault(); setError(''); setLoading(true);
     try {
-      const user = await login(identifier, password);
+      const user = await login(identifier, password, rememberMe);
       navigate(ROLE_ROUTES[user.role] || '/');
     } catch (err) {
-      setError(err.message || 'Login failed. Please try again.');
+      const message =
+        err?.response?.data?.message ||
+        err?.message ||
+        'Login failed. Please try again.';
+
+      const friendlyMessage =
+        err?.code === 'ERR_NETWORK' ||
+        err?.message === 'Network Error' ||
+        !err?.response
+          ? 'Unable to reach the server. Please make sure the backend is running and try again.'
+          : message;
+
+      setError(friendlyMessage);
     } finally { setLoading(false); }
   };
 
@@ -223,6 +236,7 @@ export default function LoginPage() {
         /* ── Logo pair ── */
         .lp-logo-pair {
           display: flex;
+          justify-content: center;
           align-items: center;
           margin-bottom: 40px;
           opacity: 0;
@@ -256,7 +270,6 @@ export default function LoginPage() {
           --halo-color: rgba(201,168,76,0.6);
           --ring-color: #c9a84c;
         }
-
         .lp-logo-ring-disc {
           width: 108px;
           height: 108px;
@@ -265,6 +278,7 @@ export default function LoginPage() {
           display: flex;
           align-items: center;
           justify-content: center;
+          overflow: hidden;
           box-shadow:
             0 0 0 3px var(--ring-color),
             0 14px 40px rgba(0,0,0,0.6),
@@ -272,8 +286,8 @@ export default function LoginPage() {
         }
 
         .lp-logo-ring-disc img {
-          width: 84%;
-          height: 84%;
+          width: 92%;
+          height: 92%;
           object-fit: contain;
           border-radius: 50%;
         }
@@ -598,7 +612,7 @@ export default function LoginPage() {
             <span className="lp-badge-text">Academic Portal</span>
           </div>
 
-          {/* ── Logo pair ── */}
+            {/* ── Logo pair ── */}
           <div className={`lp-logo-pair ${mounted ? 'in' : ''}`}>
             <div className="lp-logo-ring lp-logo-ring--ssu">
               <div className="lp-logo-ring-disc">
@@ -631,9 +645,8 @@ export default function LoginPage() {
             <span className="lp-tag teal">Samar State University - Main Campus</span>
             <span className="lp-tag">Grade Management</span>
             {currentSemester && (
-              <span className="lp-tag">{currentSemester.name}</span>
+              <span className="lp-tag">{currentSemester.term || currentSemester.name} · A.Y. {currentSemester.academic_year}</span>
             )}
-            <span className="lp-tag">S.Y. 2025–2026</span>
           </div>
         </div>
 
@@ -697,8 +710,10 @@ export default function LoginPage() {
               </div>
 
               <div className="lp-meta">
-                <label className="lp-remember"><input type="checkbox" /> Remember me</label>
-                <a href="#" className="lp-forgot">Forgot password?</a>
+                <label className="lp-remember">
+                  <input type="checkbox" checked={rememberMe} onChange={(e) => setRememberMe(e.target.checked)} /> Remember me
+                </label>
+                <Link to="/forgot-password" className="lp-forgot">Forgot password?</Link>
               </div>
 
               <button type="submit" className="lp-submit" disabled={loading}>
@@ -711,6 +726,13 @@ export default function LoginPage() {
               New student? <Link to="/register">Create an account</Link>
             </p>
 
+            <p className="lp-right-footer" style={{ display: 'flex', gap: 10, justifyContent: 'center', marginBottom: 6 }}>
+              <Link to="/privacy-policy" style={{ color: 'rgba(255,255,255,0.35)' }}>Privacy Policy</Link>
+              <span>·</span>
+              <Link to="/terms" style={{ color: 'rgba(255,255,255,0.35)' }}>Terms and Conditions</Link>
+              <span>·</span>
+              <Link to="/contact" style={{ color: 'rgba(255,255,255,0.35)' }}>Contact Us</Link>
+            </p>
             <p className="lp-right-footer">
               © 2025 <span className="t">Samar State University</span> · <span className="g">CAS</span> · All Rights Reserved
             </p>

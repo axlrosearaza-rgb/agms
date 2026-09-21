@@ -1,31 +1,31 @@
 import { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import API from '../../services/api';
-import { Icons, Avatar, Badge, roleLabel } from '../common';
+import { setUser as persistUser } from '../../services/authStorage';
+import { Icons, Avatar, Badge, ProgramBadge, roleLabel, StudentTypeBadge, RegularityBadge, studentYearLevelsLabel, CurrentSemesterTag } from '../common';
 import toast from 'react-hot-toast';
 
 export default function ProfilePage() {
   const { user, login } = useAuth();
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Email isn't editable from here — changing it goes through Settings'
+  // own "Change Email" flow (current-password confirmation + a verification
+  // code sent to the new address), not a plain unverified text field.
   const [form, setForm] = useState({
     name: user?.name || '',
-    email: user?.email || '',
-    department: user?.department || '',
   });
 
   const roleBadgeColor = {
     Admin: 'green',
     Chairperson: 'orange',
-    Instructor: 'purple',
+    Faculty: 'purple',
     Student: 'blue',
   };
 
   const startEdit = () => {
     setForm({
       name: user?.name || '',
-      email: user?.email || '',
-      department: user?.department || '',
     });
     setEditing(true);
   };
@@ -39,24 +39,18 @@ export default function ProfilePage() {
       toast.error('Name is required');
       return;
     }
-    if (!form.email.trim()) {
-      toast.error('Email is required');
-      return;
-    }
 
     setSaving(true);
     try {
       await API.put(`/users/${user.id}`, {
         name: form.name.trim(),
-        email: form.email.trim(),
-        department: form.department.trim() || null,
       });
 
       // Reload user data
       const res = await API.get('/auth/me');
       const userData = res.data?.user;
       if (userData) {
-        localStorage.setItem('agms_user', JSON.stringify(userData));
+        persistUser(userData);
         // Force page reload to update user context
         window.location.reload();
       }
@@ -119,16 +113,6 @@ export default function ProfilePage() {
                 <input className="form-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Enter your full name" />
               </div>
 
-              <div>
-                <label className="form-label">Email Address</label>
-                <input className="form-input" type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="Enter your email" />
-              </div>
-
-              <div>
-                <label className="form-label">Department</label>
-                <input className="form-input" value={form.department} onChange={(e) => setForm({ ...form, department: e.target.value })} placeholder="Enter department" />
-              </div>
-
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-y-4 gap-x-8 pt-2">
                 <div>
                   <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">Role</p>
@@ -165,10 +149,25 @@ export default function ProfilePage() {
                 <p className="text-[14px] font-medium text-gray-800">{user?.role || '—'}</p>
               </div>
 
-              <div>
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">Department</p>
-                <p className="text-[14px] font-medium text-gray-800">{user?.department || '—'}</p>
-              </div>
+              {(user?.role === 'Faculty' || user?.role === 'Chairperson') && (
+                <div className="sm:col-span-2">
+                  <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">
+                    {(user?.programs?.length > 1) ? 'Programs' : 'Program'}
+                  </p>
+                  {user?.employment_type === 'Part Time' ? (
+                    <Badge variant="golden-yellow">Part Timer</Badge>
+                  ) : (
+                    <div className="flex flex-wrap gap-1.5">
+                      {(user?.programs?.length > 0 ? user.programs : [user?.program]).filter(Boolean).map((p) => (
+                        <ProgramBadge key={p} program={p} bs />
+                      ))}
+                      {!(user?.programs?.length > 0) && !user?.program && (
+                        <span className="text-[14px] font-medium text-gray-800">—</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {user?.role === 'Student' && (
                 <>
@@ -184,13 +183,46 @@ export default function ProfilePage() {
 
                   <div>
                     <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">Year Level</p>
-                    <p className="text-[14px] font-medium text-gray-800">{user?.year_level ? `Year ${user.year_level}` : '—'}</p>
+                    {/* An Irregular student taking classes across more than
+                        one Year Level shows all of them here, not just the
+                        primary pair's year_level. */}
+                    <p className="text-[14px] font-medium text-gray-800">{studentYearLevelsLabel(user)}</p>
                   </div>
 
                   <div>
                     <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">Section</p>
                     <p className="text-[14px] font-medium text-gray-800">{user?.section || '—'}</p>
                   </div>
+
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">Academic Year</p>
+                    <CurrentSemesterTag className="!bg-gray-100" />
+                  </div>
+
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">Status</p>
+                    <RegularityBadge status={user?.student_status} />
+                  </div>
+
+                  {user?.student_type && (
+                    <div>
+                      <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">Student Type</p>
+                      <StudentTypeBadge status={user.student_type} />
+                    </div>
+                  )}
+
+                  {user?.student_status === 'Irregular' && user?.irregular_sections?.length > 0 && (
+                    <div className="sm:col-span-2">
+                      <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">Taking Classes In</p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {user.irregular_sections.map((p, i) => (
+                          <Badge key={i} variant="red">
+                            Year {p.year_level} - Sec {p.section}{p.semester ? ` (${p.semester})` : ''}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
 

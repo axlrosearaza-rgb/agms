@@ -30,10 +30,12 @@ const migrate = async () => {
     );
     console.log(`✅ Backfilled student_status = 'Regular' for existing students (${studentUpdate.rowCount ?? 'n/a'} rows)`);
 
-    // Backfill: existing Instructor/Chairperson keep their current singular `program`
+    // Backfill: existing Faculty/Chairperson keep their current singular `program`
     // value by copying it into the new `programs` array, so nobody loses their tag.
+    // (Historical note: this ran when the role value was still 'Instructor', before
+    // the later rename to 'Faculty' — updated here so a re-run stays valid.)
     const [facultyRows] = await sequelize.query(
-      `SELECT id, program FROM users WHERE role IN ('Instructor','Chairperson') AND program IS NOT NULL AND programs IS NULL;`
+      `SELECT id, program FROM users WHERE role IN ('Faculty','Chairperson') AND program IS NOT NULL AND programs IS NULL;`
     );
     for (const row of facultyRows) {
       await sequelize.query(`UPDATE users SET programs = ARRAY[:program] WHERE id = :id;`, {

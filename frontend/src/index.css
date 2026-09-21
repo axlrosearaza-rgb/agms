@@ -37,20 +37,46 @@
   }
 
   .card {
-    @apply bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden;
+    /* min-w-0 overrides the browser default (min-width: auto) that flex/grid
+       items get automatically — without it, a wide intrinsic-content child
+       (a Chart.js canvas especially; also a not-yet-wrapped table) forces
+       its OWN grid track/flex item wider than the space actually available,
+       which either pushes the whole row wider than the viewport or makes
+       this card visually overlap/collide with its neighbor once the grid
+       collapses to one column on mobile. Harmless everywhere .card isn't a
+       flex/grid item — min-width defaults to that same 0 there already. */
+    @apply bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden min-w-0;
   }
   .card-header {
     @apply px-6 py-5 flex items-center justify-between border-b border-gray-100;
   }
   .card-body {
-    @apply px-6 py-5;
+    @apply px-6 py-5 max-h-[70vh] overflow-y-auto;
   }
 
   .form-input {
     @apply w-full px-4 py-3 border border-gray-200 rounded-lg text-sm font-sans transition-all bg-white text-gray-900 focus:outline-none focus:border-navy focus:ring-2 focus:ring-navy/10;
   }
+  /* Every number input (max scores, weights, units, ratings, etc.) — drop
+     the browser's own up/down spinner. It reads as unstyled/out of place
+     next to the rest of this design system, and typing a value directly is
+     the normal way these get filled in anyway. Applies globally since
+     .form-input is what practically every number input in the app uses. */
+  .form-input[type='number']::-webkit-inner-spin-button,
+  .form-input[type='number']::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  .form-input[type='number'] {
+    -moz-appearance: textfield;
+  }
   .form-select {
-    @apply w-full px-4 py-3 border border-gray-200 rounded-lg text-sm font-sans bg-white cursor-pointer appearance-none bg-no-repeat focus:outline-none focus:border-navy focus:ring-2 focus:ring-navy/10;
+    /* pr-10 (not px-4's symmetric pr-4) — the chevron below is a background
+       image, so it doesn't push text over on its own; a select sized to fit
+       its own text (e.g. w-auto, used by every filter dropdown) would render
+       the arrow directly on top of the last character or two without extra
+       reserved space on the right. */
+    @apply w-full pl-4 pr-10 py-3 border border-gray-200 rounded-lg text-sm font-sans bg-white cursor-pointer appearance-none bg-no-repeat focus:outline-none focus:border-navy focus:ring-2 focus:ring-navy/10;
     background-image: url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1.5L6 6.5L11 1.5' stroke='%236b7280' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
     background-position: right 16px center;
   }
@@ -100,4 +126,36 @@
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
   ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+}
+
+/* A one-off "pop" for an unread badge the instant its count changes — the
+   number itself already updates live (see Messages.js/AppLayout.js), but a
+   plain number swap is easy to miss at a glance. Re-keying the badge
+   element (see .badge-pop's callers) restarts this animation from scratch
+   on every new message, not just the first, so it stays noticeable however
+   many arrive. Paired with a brief continuous pulse afterward so it keeps
+   catching the eye until actually read, not just for this first instant. */
+@keyframes badge-pop {
+  0% { transform: scale(0.5); opacity: 0; }
+  50% { transform: scale(1.35); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.badge-pop {
+  animation: badge-pop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* Same idea as .badge-pop above, applied to a chat bubble instead of a
+   count — now that sending no longer blocks on a "sending..." spinner (see
+   Messages.js's handleSend), a message needs its OWN instant, obvious
+   feedback the moment it lands: it pops in with a little life instead of
+   just abruptly appearing, for both the sender's own bubble and one
+   arriving live from someone else. Each bubble only ever mounts once (its
+   own key is the message's real, permanent id), so this naturally plays
+   exactly once per message, not on every re-render. */
+@keyframes message-pop {
+  0% { transform: scale(0.85) translateY(4px); opacity: 0; }
+  100% { transform: scale(1) translateY(0); opacity: 1; }
+}
+.message-pop {
+  animation: message-pop 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
 }

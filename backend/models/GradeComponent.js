@@ -34,6 +34,18 @@ const GradeComponent = sequelize.define('GradeComponent', {
     defaultValue: 0,
     comment: 'Display order within the period',
   },
+  // Whether this component's own Ave column is shown in the read-only
+  // Class Record (ClassRecordView.js) and its Excel export — Weighted is
+  // still shown either way, still computed from Ave internally. Has no
+  // effect on the Faculty's own editable grading grid. A component made up
+  // of a single Rate-only item hides its Ave regardless of this flag (see
+  // isRateOnlyComp in classRecordExcel.js) — this is for manually hiding
+  // Ave on any OTHER component too.
+  show_ave: {
+    type: DataTypes.BOOLEAN,
+    allowNull: false,
+    defaultValue: true,
+  },
 }, {
   tableName: 'grade_components',
   indexes: [

@@ -5,6 +5,7 @@ require('dotenv').config();
 const seed = async () => {
   try {
     console.log('🌱 Starting clean database setup...');
+    console.log('⚠️  This DROPS every table and recreates them empty (sequelize.sync({ force: true })).');
 
     await sequelize.sync({ force: true });
     console.log('✅ Tables created.');
@@ -13,6 +14,7 @@ const seed = async () => {
     await User.create({
       name: 'System Administrator',
       email: 'admin@ssu.edu.ph',
+      username: 'admin',
       password: 'admin123',
       role: 'Admin',
       department: null,
@@ -36,7 +38,7 @@ const seed = async () => {
     console.log('\n📋 Admin Login:');
     console.log('  Email:    admin@ssu.edu.ph');
     console.log('  Password: admin123');
-    console.log('\n📌 Use the Admin panel to create Chairpersons, Instructors, Students, Subjects, and Classes.');
+    console.log('\n📌 Use the Admin panel to create Chairpersons, Faculty, Students, Subjects, and Classes.');
     console.log('📊 Grading: GWA Scale 1.0-5.0 (3.0 = passing)');
 
     process.exit(0);
@@ -46,4 +48,11 @@ const seed = async () => {
   }
 };
 
-seed();
+// Guard: only runs when this file is executed directly (`node seeds/seed.js`),
+// never when something else `require()`s it — this is a destructive, whole-database
+// wipe (sequelize.sync({ force: true })), and a plain require() must never trigger it.
+if (require.main === module) {
+  seed();
+} else {
+  module.exports = seed;
+}

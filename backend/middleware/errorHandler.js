@@ -18,6 +18,15 @@ const errorHandler = (err, req, res, next) => {
     return res.status(400).json({ message: 'Referenced record does not exist.' });
   }
 
+  // Raw Postgres "value too long for type character varying(N)" (code 22001,
+  // string data right truncation) — happens whenever a column is narrower than
+  // real-world input and slips past app-level validation. Without this, the raw
+  // driver message (e.g. "value too long for type character varying(20)") leaks
+  // straight to the user, which is confusing and doesn't say what field to fix.
+  if (err.name === 'SequelizeDatabaseError' && (err.original?.code === '22001' || /value too long/i.test(err.message))) {
+    return res.status(400).json({ message: 'One of the fields you entered is too long. Please shorten it and try again.' });
+  }
+
   // Default
   const statusCode = err.statusCode || 500;
   res.status(statusCode).json({

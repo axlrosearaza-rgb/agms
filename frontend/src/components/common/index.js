@@ -1,4 +1,6 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import API from '../../services/api';
+import { agoLabel } from '../../hooks/usePresence';
 
 // ============ ICONS (SVG components) ============
 export const Icons = {
@@ -38,14 +40,64 @@ export const Icons = {
   MessageSquare: (p) => <svg {...p} width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>,
   VolumeX: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>,
   Volume2: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>,
+  MapPin: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>,
+  Phone: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.362 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.338 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>,
+  Mail: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><polyline points="22 6 12 13 2 6"/></svg>,
+  Globe: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>,
+  Sun: (p) => <svg {...p} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>,
+  Moon: (p) => <svg {...p} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>,
+  Archive: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><line x1="10" y1="13" x2="14" y2="13"/></svg>,
+  RotateCcw: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>,
+  Forward: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/></svg>,
 };
 
 // ============ ROLE DISPLAY LABEL ============
-// The stored `role` value stays 'Instructor' everywhere (DB, routes, authorize()
-// checks) — this only controls what users see. Instructor accounts are shown as
-// "Faculty" throughout the UI.
-const ROLE_LABELS = { Instructor: 'Faculty' };
-export const roleLabel = (role) => ROLE_LABELS[role] || role;
+// The stored `role` value is 'Faculty' natively now (DB, routes, authorize()
+// checks all use it directly) — this is kept as a passthrough so existing call
+// sites don't need to change, in case a future role ever needs a display alias.
+export const roleLabel = (role) => role;
+
+// ============ PERSON NAME SHARED FORMATTER ============
+// Single system-wide convention for every human-facing name label:
+// "Last name, First name Middle name(s)" — exactly the way the stored
+// name was entered, with the surname alphabetically leading the sort and
+// the middle token left intact as `G.` instead of being reduced to one
+// guessed letter or removed altogether.
+export function formatPersonName(name = '') {
+  const parts = String(name || '').trim().replace(/\s+/g, ' ').split(' ').filter(Boolean);
+  if (parts.length === 0) return '';
+
+  const first = parts[0];
+  const last = parts[parts.length - 1];
+  const middle = parts.slice(1, -1);
+
+  if (middle.length === 0) {
+    return `${last}, ${first}`;
+  }
+
+  return `${last}, ${first} ${middle.join(' ')}`;
+}
+
+// Same "Last, First Middle" order as formatPersonName, but the surname
+// itself is capitalized (e.g. "ARAZA, Axl Rose G.") — the convention the
+// Grading Sheet's printed roster follows, distinguishing the surname from
+// the given/middle names at a glance the way an all-lowercase-vs-mixed-case
+// distinction alone doesn't.
+export function formatPersonNameCapsSurname(name = '') {
+  const formatted = formatPersonName(name);
+  const commaIdx = formatted.indexOf(',');
+  if (commaIdx === -1) return formatted.toUpperCase();
+  return formatted.slice(0, commaIdx).toUpperCase() + formatted.slice(commaIdx);
+}
+
+export function comparePeopleNames(a, b) {
+  const left = formatPersonName(a?.name || a || '');
+  const right = formatPersonName(b?.name || b || '');
+  return left.localeCompare(right, undefined, { sensitivity: 'base' });
+}
+
+export const formatStudentName = formatPersonName;
+export const compareStudentNames = comparePeopleNames;
 
 // ============ AVATAR ============
 export function Avatar({ letter, className = '', size = 'w-9 h-9 text-sm' }) {
@@ -59,6 +111,30 @@ export function Avatar({ letter, className = '', size = 'w-9 h-9 text-sm' }) {
 // ============ BADGE ============
 export function Badge({ children, variant = 'green', className = '' }) {
   return <span className={`badge badge-${variant} ${className}`}>{children}</span>;
+}
+
+// ============ PRESENCE (Online/Offline) ============
+// A small colored dot + label — "Online" or "Offline · 3h ago" — driven by
+// usePresence's live { online, last_seen_at } state. `presence` undefined
+// (still loading, or this user's ID was never passed to usePresence) reads
+// as an unlit gray dot with no label, not a false "Offline".
+export function PresenceDot({ presence, className = '' }) {
+  const online = presence?.online;
+  return (
+    <span
+      className={`inline-block w-2.5 h-2.5 rounded-full flex-shrink-0 ${online ? 'bg-green-500' : 'bg-gray-300'} ${className}`}
+      title={online ? 'Online' : presence?.last_seen_at ? `Offline · last seen ${agoLabel(presence.last_seen_at)}` : 'Offline'}
+    />
+  );
+}
+
+export function PresenceLabel({ presence, className = '' }) {
+  if (!presence) return null;
+  if (presence.online) {
+    return <span className={`text-xs font-medium text-green-600 ${className}`}>Online</span>;
+  }
+  const ago = presence.last_seen_at ? agoLabel(presence.last_seen_at) : null;
+  return <span className={`text-xs text-gray-400 ${className}`}>{ago ? `Offline · ${ago}` : 'Offline'}</span>;
 }
 
 // ============ PROGRAM COLOR CODING ============
@@ -89,16 +165,56 @@ export const programShortLabel = (value) => {
   if (!value) return '';
   const v = value.toLowerCase();
   if (v.includes('information technology')) return 'BSIT';
-  if (v.includes('psychology')) return 'Psychology';
+  if (v.includes('psychology')) return 'BS Psych';
   if (v.includes('information systems')) return 'BSIS';
-  if (v.includes('statistics')) return 'Statistics';
+  if (v.includes('statistics')) return 'BSS';
+  if (v.includes('general education')) return 'GE';
   return value;
 };
 
-export function ProgramBadge({ program, short = false, size = 'sm' }) {
+// Always-prefixed "BS <Major>" label — distinct from programShortLabel above
+// (which abbreviates IT/IS all the way down to "BSIT"/"BSIS" for the tightest
+// spaces, and inconsistently skips the "BS" prefix for Psych/Statistics).
+// Callers that want the fuller, consistently-prefixed form (a person's own
+// "BS Psychology" / "BS Information Technology" identity label) use this one.
+export const programBSLabel = (value) => {
+  if (!value) return '';
+  const v = value.toLowerCase();
+  if (v.includes('information technology')) return 'BS Information Technology';
+  if (v.includes('psychology')) return 'BS Psychology';
+  if (v.includes('information systems')) return 'BS Information Systems';
+  if (v.includes('statistics')) return 'BS Statistics';
+  return value;
+};
+
+export function ProgramBadge({ program, short = false, bs = false, size = 'sm', className = '' }) {
   if (!program) return <span className="text-gray-400">—</span>;
   const sizeClass = size === 'lg' ? 'text-base px-4 py-1.5 font-bold' : '';
-  return <Badge variant={programColorVariant(program)} className={sizeClass}>{short ? programShortLabel(program) : program}</Badge>;
+  const label = bs ? programBSLabel(program) : (short ? programShortLabel(program) : program);
+  // BSIT/BSIS/BSPsych/BSS need to read as a program identity at a glance, not
+  // blend in with the rest of a row's text — bold (not just the badge's own
+  // default font-semibold) everywhere this renders, not just the `lg` size.
+  return <Badge variant={programColorVariant(program)} className={`font-bold ${sizeClass} ${className}`}>{label}</Badge>;
+}
+
+// A part-time faculty account is tagged with every program (so every
+// Chairperson can find them), not because they actually belong to all of
+// them — listing all four program badges next to their name overstates that
+// and just reads as noise. Anywhere an instructor/faculty's program tags
+// would normally be shown, this collapses to a single plain "Part Timer"
+// label instead once employment_type is Part Time.
+export function FacultyProgramTags({ user, short = true }) {
+  if (!user) return null;
+  if (user.employment_type === 'Part Time') {
+    return <Badge variant="yellow">Part Timer</Badge>;
+  }
+  const programs = user.programs?.length ? user.programs : (user.program ? [user.program] : []);
+  if (programs.length === 0) return null;
+  return (
+    <>
+      {programs.map((p) => <ProgramBadge key={p} program={p} short={short} />)}
+    </>
+  );
 }
 
 // Solid-dot version of the same palette, for use as a small color accent inside
@@ -112,6 +228,35 @@ const PROGRAM_DOT_CLASS = {
 };
 export function ProgramDot({ program, className = '' }) {
   return <span className={`w-2 h-2 rounded-full flex-shrink-0 inline-block ${PROGRAM_DOT_CLASS[programColorVariant(program)]} ${className}`} />;
+}
+
+// Two deliberately separate fields, both self-declared once at registration
+// (RegisterPage) — kept apart because only one of them has any functional
+// effect elsewhere in the app:
+//
+// - student_status: Regular vs Irregular. Functional — decides whether a
+//   student is on the normal year/section track or has a custom mix of
+//   subjects across years (see irregular_sections on the User model), and
+//   promotionController can flip it automatically during evaluation.
+// - student_type: New/Shifter/Transferee/Old Student/Quitter. Purely
+//   descriptive — nothing branches on it — and locked to what the student
+//   picked at registration (Admin/Chairperson can't edit it afterward, see
+//   UserManagement.js).
+//
+// Shared here so both display consistently wherever a student shows up —
+// Admin, Chairperson, Faculty, and the student's own account alike.
+export const STUDENT_TYPES = ['New', 'Shifter', 'Transferee', 'Old', 'Quitter'];
+const STUDENT_TYPE_LABELS = { New: 'New Student', Old: 'Old Student' };
+export const studentTypeLabel = (t) => STUDENT_TYPE_LABELS[t] || t;
+const STUDENT_TYPE_BADGE_VARIANT = { New: 'blue', Shifter: 'purple', Transferee: 'yellow', Old: 'gray', Quitter: 'red' };
+export function StudentTypeBadge({ status, className = '' }) {
+  if (!status) return null;
+  return <Badge variant={STUDENT_TYPE_BADGE_VARIANT[status] || 'gray'} className={className}>{studentTypeLabel(status)}</Badge>;
+}
+
+export const REGULARITY_OPTIONS = ['Regular', 'Irregular'];
+export function RegularityBadge({ status, className = '' }) {
+  return <Badge variant={status === 'Irregular' ? 'red' : 'green'} className={className}>{status === 'Irregular' ? 'Irregular' : 'Regular'}</Badge>;
 }
 
 // Border-color equivalent of the same palette, for accent stripes (e.g. a sidebar edge).
@@ -152,24 +297,136 @@ const PROGRAM_CASCADE = {
 };
 export const programCascadeGradient = (program) => PROGRAM_CASCADE[programColorVariant(program)];
 
-// ============ STAT CARD ============
-export function StatCard({ label, value, sub, icon, iconBg = 'bg-blue-50 text-blue-500', valueClass = '' }) {
+// An Irregular student's `irregular_sections` can span more than one Year
+// Level (e.g. retaking a Year 2 subject while also taking Year 3 classes) —
+// showing only the primary pair's `year_level` (the first pair, kept in sync
+// for code that reads the singular field) understates that. This collapses
+// every distinct year they're actually enrolled across into one label
+// ("Year 2, Year 3") instead, falling back to the plain singular year for a
+// Regular student.
+export function studentYearLevelsLabel(user) {
+  if (user?.student_status === 'Irregular' && user?.irregular_sections?.length) {
+    const years = [...new Set(user.irregular_sections.map((p) => p.year_level))].sort((a, b) => a - b);
+    return years.map((y) => `Year ${y}`).join(', ');
+  }
+  return user?.year_level ? `Year ${user.year_level}` : '—';
+}
+
+// Same idea as studentYearLevelsLabel above, but pairs each year with its OWN
+// section too ("Year 1 · Sec C, Year 2 · Sec D, Year 4 · Sec D") — an
+// Irregular student's self-declared per-year mix (irregular_sections, set at
+// registration) often has a genuinely DIFFERENT section for each year
+// they're actually taking classes in, so showing just the single primary
+// year_level/section pair silently drops the rest of what they entered.
+export function studentYearSectionsLabel(user) {
+  if (user?.student_status === 'Irregular' && user?.irregular_sections?.length) {
+    return user.irregular_sections
+      .slice()
+      .sort((a, b) => (a.year_level || 0) - (b.year_level || 0))
+      .map((p) => `Year ${p.year_level}${p.section ? ` · Sec ${p.section}` : ''}${p.is_current ? ' (Current)' : ''}`)
+      .join(', ');
+  }
+  return `Year ${user?.year_level ?? '—'}${user?.section ? ` · Sec ${user.section}` : ''}`;
+}
+
+// Just the ONE pair the student should see as "where I am right now" — the
+// `is_current`-marked pair for an Irregular student (registration requires
+// marking exactly one), or their plain year_level/section for a Regular
+// student. Older Irregular accounts with no `is_current` on any pair (from
+// before that distinction existed) fall back to their first pair, same as
+// the singular year_level/section field already mirrors.
+export function studentCurrentYearSectionLabel(user) {
+  if (user?.student_status === 'Irregular' && user?.irregular_sections?.length) {
+    const current = user.irregular_sections.find((p) => p.is_current) || user.irregular_sections[0];
+    return `Year ${current.year_level}${current.section ? ` · Sec ${current.section}` : ''}`;
+  }
+  return `Year ${user?.year_level ?? '—'}${user?.section ? ` · Sec ${user.section}` : ''}`;
+}
+
+// ============ CURRENT SEMESTER TAG ============
+// A small "1st Semester · A.Y. 2025-2026" pill next to a page's own "Welcome
+// back" heading — same current-semester record Admin's Semester Settings
+// manages (Semester.is_current), just surfaced everywhere someone might
+// otherwise wonder which term the numbers on screen belong to. Fetches for
+// itself so any dashboard can drop it in without wiring up its own semester
+// call.
+export function CurrentSemesterTag({ className = '' }) {
+  const [semester, setSemester] = useState(null);
+  useEffect(() => {
+    API.get('/semesters/public/current')
+      .then(({ data }) => setSemester(data.semester))
+      .catch(() => {});
+  }, []);
+  if (!semester) return null;
   return (
-    <div className="stat-card">
-      <div>
+    <span className={`inline-flex items-center gap-1.5 text-xs font-medium text-gray-500 bg-gray-100 px-3 py-1.5 rounded-full ${className}`}>
+      <Icons.Clock className="w-3 h-3" />
+      {semester.term || semester.name} · A.Y. {semester.academic_year}
+    </span>
+  );
+}
+
+// ============ STAT CARD ============
+// `accent` (a `border-*` class) and `progress` (0-100) are optional, additive —
+// every existing call site that doesn't pass them renders exactly as before.
+// `progress`, when given, draws a thin fill bar under the value so a percentage
+// metric (pass rate, completion, etc.) reads as "how full" at a glance, not just
+// a number.
+export function StatCard({ label, value, sub, icon, iconBg = 'bg-blue-50 text-blue-500', valueClass = '', accent = '', progress = null }) {
+  return (
+    <div className={`stat-card ${accent ? `border-l-4 ${accent}` : ''}`}>
+      <div className="flex-1 min-w-0">
         <p className="text-xs text-gray-500 mb-1">{label}</p>
         <p className={`text-2xl font-bold ${valueClass}`}>{value}</p>
-        {sub && <p className="text-xs text-green-500 mt-0.5">{sub}</p>}
+        {sub && <p className="text-xs text-gray-400 mt-0.5">{sub}</p>}
+        {progress !== null && (
+          <div className="mt-2 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full ${progress >= 75 ? 'bg-green-500' : progress >= 50 ? 'bg-amber-500' : 'bg-red-500'}`}
+              style={{ width: `${Math.min(100, Math.max(0, progress))}%` }}
+            />
+          </div>
+        )}
       </div>
-      {icon && <div className={`stat-icon ${iconBg}`}>{icon}</div>}
+      {icon && <div className={`stat-icon ${iconBg} flex-shrink-0`}>{icon}</div>}
     </div>
   );
 }
 
 // ============ MODAL ============
-export function Modal({ title, onClose, children, footer, size = 'max-w-lg' }) {
+// Every open Modal (ConfirmDialog included — it's a Modal) registers here, so
+// Escape closes only the TOPMOST one: a confirm dialog stacked on top of a
+// details modal closes the confirm first, and a second Esc closes the one
+// underneath, instead of one keypress dismissing the whole pile at once.
+const modalStack = [];
+function handleModalEscape(e) {
+  if (e.key !== 'Escape' || modalStack.length === 0) return;
+  const top = modalStack[modalStack.length - 1].current;
+  // A modal that opted out of backdrop-click dismissal (an in-progress form
+  // that must never be discarded by a stray click) is just as easy to
+  // dismiss by a stray Esc — it ignores it too, and blocks the ones below.
+  if (top.dismissible) top.close();
+}
+
+export function Modal({ title, onClose, children, footer, size = 'max-w-lg', closeOnBackdropClick = true }) {
+  // Always the latest onClose/dismissible without re-registering on every
+  // render (parents pass a fresh inline onClose each time).
+  const handle = useRef({ close: onClose, dismissible: closeOnBackdropClick });
+  handle.current.close = onClose;
+  handle.current.dismissible = closeOnBackdropClick;
+
+  useEffect(() => {
+    if (modalStack.length === 0) document.addEventListener('keydown', handleModalEscape);
+    modalStack.push(handle);
+    return () => {
+      const i = modalStack.indexOf(handle);
+      if (i !== -1) modalStack.splice(i, 1);
+      if (modalStack.length === 0) document.removeEventListener('keydown', handleModalEscape);
+    };
+  }, []);
+
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[1000] p-5 animate-fadeIn" onClick={onClose}>
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[1000] p-5 animate-fadeIn" onClick={closeOnBackdropClick ? onClose : undefined}>
       <div className={`bg-white rounded-xl w-full ${size} max-h-[90vh] overflow-y-auto shadow-2xl animate-slideUp`} onClick={(e) => e.stopPropagation()}>
         <div className="px-6 py-5 border-b border-gray-100 flex items-center justify-between">
           <h3 className="text-lg font-semibold">{title}</h3>
@@ -208,6 +465,21 @@ export function LoadingSpinner({ text = 'Loading...' }) {
   );
 }
 
+// ============ CONFIDENTIALITY BANNER (Data Privacy Act / RA 10173) ============
+// Reusable notice for any page displaying grades or other confidential academic
+// records — currently used on the student's My Grades page.
+export function ConfidentialityBanner({ className = '' }) {
+  return (
+    <div className={`flex items-start gap-2.5 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 mb-5 ${className}`}>
+      <Icons.Lock className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+      <p className="text-[12.5px] text-amber-800 leading-relaxed">
+        This academic record contains confidential information protected under the Data Privacy Act of 2012
+        (RA 10173). Unauthorized access, copying, disclosure, or distribution is prohibited.
+      </p>
+    </div>
+  );
+}
+
 // ============ EMPTY STATE ============
 export function EmptyState({ icon, title, description }) {
   return (
@@ -220,12 +492,12 @@ export function EmptyState({ icon, title, description }) {
 }
 
 // ============ CONFIRM DIALOG ============
-export function ConfirmDialog({ title, message, onConfirm, onCancel, confirmText = 'Confirm', variant = 'red' }) {
+export function ConfirmDialog({ title, message, onConfirm, onCancel, confirmText = 'Confirm', variant = 'red', confirmDisabled = false }) {
   return (
     <Modal title={title} onClose={onCancel} footer={
       <>
         <button className="btn btn-outline" onClick={onCancel}>Cancel</button>
-        <button className={`btn btn-${variant}`} onClick={onConfirm}>{confirmText}</button>
+        <button className={`btn btn-${variant}`} onClick={onConfirm} disabled={confirmDisabled}>{confirmText}</button>
       </>
     }>
       <p className="text-sm text-gray-600">{message}</p>

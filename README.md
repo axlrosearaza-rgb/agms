@@ -304,3 +304,5 @@ npm run dev:frontend   # http://localhost:3000
 ## 📄 License
 
 This project is developed as a capstone project for Samar State University.
+ 
+ 

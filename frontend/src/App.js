@@ -1,3 +1,4 @@
+import { lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Toaster } from 'react-hot-toast';
 import { AuthProvider, useAuth } from './context/AuthContext';
@@ -5,41 +6,44 @@ import { Icons, LoadingSpinner } from './components/common';
 import AppLayout from './components/layout/AppLayout';
 import LoginPage from './components/auth/LoginPage';
 import RegisterPage from './components/auth/RegisterPage';
-import ProfilePage from './components/common/ProfilePage';
-import SettingsPage from './components/common/SettingsPage';
-import Messages from './pages/common/Messages';
-import GradingSheet from './pages/common/GradingSheet';
+import ForgotPasswordPage from './components/auth/ForgotPasswordPage';
+import ResetPasswordPage from './components/auth/ResetPasswordPage';
+
+// Lazy loaded role & feature pages for fast chunk loading
+const ProfilePage = lazy(() => import('./components/common/ProfilePage'));
+const SettingsPage = lazy(() => import('./components/common/SettingsPage'));
+const Messages = lazy(() => import('./pages/common/Messages'));
+const AssignedToMe = lazy(() => import('./pages/common/AssignedToMe'));
+const GradingSheet = lazy(() => import('./pages/common/GradingSheet'));
+const ClassRecordView = lazy(() => import('./pages/common/ClassRecordView'));
+const PrivacyPolicy = lazy(() => import('./pages/public/PrivacyPolicy'));
+const Terms = lazy(() => import('./pages/public/Terms'));
+const ContactUs = lazy(() => import('./pages/public/ContactUs'));
 
 // Admin pages
-import AdminDashboard from './pages/admin/AdminDashboard';
-import UserManagement from './pages/admin/UserManagement';
-import SubjectManagement from './pages/admin/SubjectManagement';
-import SemesterManagement from './pages/admin/SemesterManagement';
-import Reports from './pages/admin/Reports';
-import StudentDirectory from './pages/admin/StudentDirectory';
-import AdminEndorsements from './pages/admin/AdminEndorsements';
-import PromotionManagement from './pages/admin/PromotionManagement';
-import GradeApproval from './pages/admin/GradeApproval';
-import GradeApprovalDetail from './pages/admin/GradeApprovalDetail';
+const AdminDashboard = lazy(() => import('./pages/admin/AdminDashboard'));
+const UserManagement = lazy(() => import('./pages/admin/UserManagement'));
+const SubjectManagement = lazy(() => import('./pages/admin/SubjectManagement'));
+const SemesterManagement = lazy(() => import('./pages/admin/SemesterManagement'));
+const GradeApproval = lazy(() => import('./pages/admin/GradeApproval'));
+const GradeApprovalDetail = lazy(() => import('./pages/admin/GradeApprovalDetail'));
+const PromotionManagement = lazy(() => import('./pages/admin/PromotionManagement'));
 
 // Chairperson pages
-import ChairpersonDashboard from './pages/chairperson/ChairpersonDashboard';
-import DepartmentStudents from './pages/chairperson/DepartmentStudents';
-import Endorsements from './pages/chairperson/Endorsements';
-import ChairpersonGradingSheets from './pages/chairperson/GradingSheets';
-import ChairpersonReports from './pages/chairperson/Reports';
+const ChairpersonDashboard = lazy(() => import('./pages/chairperson/ChairpersonDashboard'));
+const PendingRegistrations = lazy(() => import('./pages/chairperson/PendingRegistrations'));
+const ChairpersonGradingSheets = lazy(() => import('./pages/chairperson/GradingSheets'));
+const ChairpersonReports = lazy(() => import('./pages/chairperson/Reports'));
 
 // Instructor pages
-import InstructorDashboard from './pages/instructor/InstructorDashboard';
-import InstructorClasses from './pages/instructor/InstructorClasses';
-import GradeEncoding from './pages/instructor/GradeEncoding';
-import StudentVerification from './pages/instructor/StudentVerification';
-import InstructorSubjects from './pages/instructor/Subjects';
-import InstructorReports from './pages/instructor/Reports';
+const InstructorDashboard = lazy(() => import('./pages/instructor/InstructorDashboard'));
+const InstructorClasses = lazy(() => import('./pages/instructor/InstructorClasses'));
+const GradeEncoding = lazy(() => import('./pages/instructor/GradeEncoding'));
+const InstructorSubjects = lazy(() => import('./pages/instructor/Subjects'));
 
 // Student pages
-import StudentDashboard from './pages/student/StudentDashboard';
-import StudentGrades from './pages/student/StudentGrades';
+const StudentDashboard = lazy(() => import('./pages/student/StudentDashboard'));
+const StudentGrades = lazy(() => import('./pages/student/StudentGrades'));
 
 // Nav configs per role
 const NAV = {
@@ -48,36 +52,35 @@ const NAV = {
     { path: '/admin/users', label: 'User Management', icon: <Icons.Users /> },
     { path: '/admin/subjects', label: 'Subjects', icon: <Icons.FileText /> },
     { path: '/admin/semesters', label: 'Semesters', icon: <Icons.Clock /> },
-    { path: '/admin/endorsements', label: 'Endorsements', icon: <Icons.Send /> },
-    { path: '/admin/promotions', label: 'Promotions', icon: <Icons.Award /> },
     { path: '/admin/grade-approval', label: 'Grade Approval', icon: <Icons.Check /> },
-    { path: '/admin/reports', label: 'Reports', icon: <Icons.BarChart /> },
+    { path: '/admin/promotions', label: 'Promotions', icon: <Icons.Award /> },
     { path: '/admin/messages', label: 'Messages', icon: <Icons.MessageSquare /> },
   ],
   Chairperson: [
     { path: '/chairperson', label: 'Dashboard', icon: <Icons.Dashboard /> },
+    { path: '/chairperson/pending-students', label: 'Pending Registrations', icon: <Icons.Clock /> },
     { path: '/chairperson/users', label: 'User Management', icon: <Icons.Users /> },
-    { path: '/chairperson/students', label: 'Program Overview', icon: <Icons.Users /> },
-    { path: '/chairperson/grading-sheets', label: 'Grading Sheets', icon: <Icons.FileText /> },
-    { path: '/chairperson/endorsements', label: 'Endorsements', icon: <Icons.Send /> },
-    { path: '/chairperson/promotions', label: 'Promotions', icon: <Icons.Award /> },
+    { path: '/chairperson/grading-sheets', label: 'Grade Approval', icon: <Icons.FileText /> },
     { path: '/chairperson/subjects', label: 'Subjects', icon: <Icons.FileText /> },
-    { path: '/chairperson/semesters', label: 'Semesters', icon: <Icons.Clock /> },
     { path: '/chairperson/reports', label: 'Reports', icon: <Icons.BarChart /> },
     { path: '/chairperson/messages', label: 'Messages', icon: <Icons.MessageSquare /> },
   ],
-  Instructor: [
-    { path: '/instructor', label: 'Dashboard', icon: <Icons.Dashboard /> },
-    { path: '/instructor/classes', label: 'My Classes', icon: <Icons.Book /> },
-    { path: '/instructor/subjects', label: 'Subjects', icon: <Icons.FileText /> },
-    { path: '/instructor/students', label: 'Student Directory', icon: <Icons.Search /> },
-    { path: '/instructor/reports', label: 'Reports', icon: <Icons.BarChart /> },
-    { path: '/instructor/verify', label: 'Student Verification', icon: <Icons.Users /> },
-    { path: '/instructor/messages', label: 'Messages', icon: <Icons.MessageSquare /> },
+  Faculty: [
+    { path: '/faculty', label: 'Dashboard', icon: <Icons.Dashboard /> },
+    // Grade Encoding (/faculty/encode/:classId) is a sibling route, not
+    // nested under /faculty/classes — matchAlso keeps the header/breadcrumb/
+    // sidebar showing "My Classes" (its actual parent section) while there,
+    // instead of falling through to the default "Dashboard".
+    { path: '/faculty/classes', label: 'My Classes', icon: <Icons.Book />, matchAlso: ['/faculty/encode'] },
+    { path: '/faculty/students', label: 'Students List', icon: <Icons.Users /> },
+    { path: '/faculty/subjects', label: 'Subjects', icon: <Icons.FileText /> },
+    { path: '/faculty/assigned-students', label: 'Assigned Work', icon: <Icons.Clock /> },
+    { path: '/faculty/messages', label: 'Messages', icon: <Icons.MessageSquare /> },
   ],
   Student: [
     { path: '/student', label: 'Dashboard', icon: <Icons.Dashboard /> },
     { path: '/student/grades', label: 'My Grades', icon: <Icons.FileText /> },
+    { path: '/student/assigned-students', label: 'Assigned Work', icon: <Icons.Clock /> },
     { path: '/student/messages', label: 'Messages', icon: <Icons.MessageSquare /> },
   ],
 };
@@ -85,9 +88,30 @@ const NAV = {
 const ROLE_HOME = {
   Admin: '/admin',
   Chairperson: '/chairperson',
-  Instructor: '/instructor',
+  Faculty: '/faculty',
   Student: '/student',
 };
+
+// A Chairperson who also teaches (`is_teaching`) gets Faculty nav items merged
+// into their normal sidebar — same account, no separate login — rather than a
+// full mode-switch. Appended at the bottom (behind a "Teaching" divider in
+// AppLayout.js) rather than mixed in with their Chairperson duties, so it's
+// visually clear which items are "run the program" vs. "my own classes".
+const TEACHING_NAV_ITEMS = [
+  // Same matchAlso reasoning as Faculty's own "My Classes" above —
+  // /chairperson/encode/:classId is a sibling of /chairperson/classes, not
+  // nested under it.
+  { path: '/chairperson/classes', label: 'My Classes', icon: <Icons.Book />, section: 'teaching', matchAlso: ['/chairperson/encode'] },
+  { path: '/chairperson/students', label: 'Students List', icon: <Icons.Users />, section: 'teaching' },
+];
+
+function getNavItems(user) {
+  const base = NAV[user?.role] || [];
+  if (user?.role === 'Chairperson' && user?.is_teaching) {
+    return [...base, ...TEACHING_NAV_ITEMS];
+  }
+  return base;
+}
 
 function ProtectedRoute({ children, allowedRoles }) {
   const { user, loading, isAuthenticated } = useAuth();
@@ -99,11 +123,43 @@ function ProtectedRoute({ children, allowedRoles }) {
   return children;
 }
 
+const PageLoader = () => (
+  <div className="flex items-center justify-center p-12 min-h-[350px]">
+    <div className="flex flex-col items-center gap-3">
+      <div className="w-8 h-8 border-2 border-[#002147] border-t-transparent rounded-full animate-spin" />
+      <span className="text-xs text-gray-400 font-medium">Loading module...</span>
+    </div>
+  </div>
+);
+
 function RoleLayout({ role, children }) {
+  const { user } = useAuth();
   return (
     <ProtectedRoute allowedRoles={[role]}>
-      <AppLayout navItems={NAV[role]}>{children}</AppLayout>
+      <AppLayout navItems={getNavItems(user)}>
+        <Suspense fallback={<PageLoader />}>
+          {children}
+        </Suspense>
+      </AppLayout>
     </ProtectedRoute>
+  );
+}
+
+// Guards the teaching-only Chairperson routes (My Classes, Grade Encoding) —
+// role="Chairperson" alone isn't enough, the account also needs is_teaching set.
+function RequireTeaching({ children }) {
+  const { user, loading, isAuthenticated } = useAuth();
+  if (loading) return <LoadingSpinner />;
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  if (user?.role !== 'Chairperson' || !user?.is_teaching) {
+    return <Navigate to={ROLE_HOME[user?.role] || '/login'} replace />;
+  }
+  return (
+    <AppLayout navItems={getNavItems(user)}>
+      <Suspense fallback={<PageLoader />}>
+        {children}
+      </Suspense>
+    </AppLayout>
   );
 }
 
@@ -132,58 +188,68 @@ export default function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
-        <Toaster position="top-right" toastOptions={{ duration: 3000, style: { fontFamily: 'DM Sans, sans-serif', fontSize: '14px' } }} />
+        {/* bottom-right, not top-right — top-right sits directly under the
+            header's own notification bell/dropdown, so a toast firing while
+            that's open visually collides with it. */}
+        <Toaster position="bottom-right" toastOptions={{ duration: 3000, style: { fontFamily: 'DM Sans, sans-serif', fontSize: '14px' } }} />
         <Routes>
           <Route path="/" element={<HomeRedirect />} />
           <Route path="/login" element={<LoginGuard />} />
           <Route path="/register" element={<RegisterGuard />} />
+          <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+          <Route path="/reset-password" element={<ResetPasswordPage />} />
+
+          {/* Public — reachable from the footer with or without being signed in */}
+          <Route path="/privacy-policy" element={<Suspense fallback={<PageLoader />}><PrivacyPolicy /></Suspense>} />
+          <Route path="/terms" element={<Suspense fallback={<PageLoader />}><Terms /></Suspense>} />
+          <Route path="/contact" element={<Suspense fallback={<PageLoader />}><ContactUs /></Suspense>} />
 
           {/* Standalone printable grading sheet — no sidebar chrome */}
-          <Route path="/grading-sheet/:classId" element={<ProtectedRoute allowedRoles={['Instructor', 'Chairperson', 'Admin']}><GradingSheet /></ProtectedRoute>} />
+          <Route path="/grading-sheet/:classId" element={<ProtectedRoute allowedRoles={['Faculty', 'Chairperson', 'Admin']}><Suspense fallback={<PageLoader />}><GradingSheet /></Suspense></ProtectedRoute>} />
+          <Route path="/class-record/:classId" element={<ProtectedRoute allowedRoles={['Faculty', 'Chairperson', 'Admin']}><Suspense fallback={<PageLoader />}><ClassRecordView /></Suspense></ProtectedRoute>} />
 
           {/* Admin */}
           <Route path="/admin" element={<RoleLayout role="Admin"><AdminDashboard /></RoleLayout>} />
           <Route path="/admin/users" element={<RoleLayout role="Admin"><UserManagement /></RoleLayout>} />
           <Route path="/admin/subjects" element={<RoleLayout role="Admin"><SubjectManagement /></RoleLayout>} />
           <Route path="/admin/semesters" element={<RoleLayout role="Admin"><SemesterManagement /></RoleLayout>} />
-          <Route path="/admin/endorsements" element={<RoleLayout role="Admin"><AdminEndorsements /></RoleLayout>} />
-          <Route path="/admin/promotions" element={<RoleLayout role="Admin"><PromotionManagement /></RoleLayout>} />
           <Route path="/admin/grade-approval" element={<RoleLayout role="Admin"><GradeApproval /></RoleLayout>} />
           <Route path="/admin/grade-approval/:classId" element={<RoleLayout role="Admin"><GradeApprovalDetail /></RoleLayout>} />
-          <Route path="/admin/reports" element={<RoleLayout role="Admin"><Reports /></RoleLayout>} />
+          <Route path="/admin/promotions" element={<RoleLayout role="Admin"><PromotionManagement /></RoleLayout>} />
           <Route path="/admin/messages" element={<RoleLayout role="Admin"><Messages /></RoleLayout>} />
           <Route path="/admin/profile" element={<RoleLayout role="Admin"><ProfilePage /></RoleLayout>} />
           <Route path="/admin/settings" element={<RoleLayout role="Admin"><SettingsPage /></RoleLayout>} />
 
           {/* Chairperson */}
           <Route path="/chairperson" element={<RoleLayout role="Chairperson"><ChairpersonDashboard /></RoleLayout>} />
+          <Route path="/chairperson/pending-students" element={<RoleLayout role="Chairperson"><PendingRegistrations /></RoleLayout>} />
           <Route path="/chairperson/users" element={<RoleLayout role="Chairperson"><UserManagement chairpersonMode={true} /></RoleLayout>} />
-          <Route path="/chairperson/students" element={<RoleLayout role="Chairperson"><DepartmentStudents /></RoleLayout>} />
           <Route path="/chairperson/grading-sheets" element={<RoleLayout role="Chairperson"><ChairpersonGradingSheets /></RoleLayout>} />
-          <Route path="/chairperson/endorsements" element={<RoleLayout role="Chairperson"><Endorsements /></RoleLayout>} />
-          <Route path="/chairperson/promotions" element={<RoleLayout role="Chairperson"><PromotionManagement chairpersonMode={true} /></RoleLayout>} />
           <Route path="/chairperson/subjects" element={<RoleLayout role="Chairperson"><InstructorSubjects /></RoleLayout>} />
-          <Route path="/chairperson/semesters" element={<RoleLayout role="Chairperson"><SemesterManagement /></RoleLayout>} />
           <Route path="/chairperson/reports" element={<RoleLayout role="Chairperson"><ChairpersonReports /></RoleLayout>} />
           <Route path="/chairperson/messages" element={<RoleLayout role="Chairperson"><Messages /></RoleLayout>} />
           <Route path="/chairperson/profile" element={<RoleLayout role="Chairperson"><ProfilePage /></RoleLayout>} />
           <Route path="/chairperson/settings" element={<RoleLayout role="Chairperson"><SettingsPage /></RoleLayout>} />
+          {/* Teaching-Chairperson only — same pages Faculty use, reused as-is */}
+          <Route path="/chairperson/classes" element={<RequireTeaching><InstructorClasses /></RequireTeaching>} />
+          <Route path="/chairperson/students" element={<RequireTeaching><UserManagement facultyMode={true} /></RequireTeaching>} />
+          <Route path="/chairperson/encode/:classId" element={<RequireTeaching><GradeEncoding /></RequireTeaching>} />
 
-          {/* Instructor */}
-          <Route path="/instructor" element={<RoleLayout role="Instructor"><InstructorDashboard /></RoleLayout>} />
-          <Route path="/instructor/classes" element={<RoleLayout role="Instructor"><InstructorClasses /></RoleLayout>} />
-          <Route path="/instructor/verify" element={<RoleLayout role="Instructor"><StudentVerification /></RoleLayout>} />
-          <Route path="/instructor/subjects" element={<RoleLayout role="Instructor"><InstructorSubjects /></RoleLayout>} />
-          <Route path="/instructor/students" element={<RoleLayout role="Instructor"><StudentDirectory /></RoleLayout>} />
-          <Route path="/instructor/reports" element={<RoleLayout role="Instructor"><InstructorReports /></RoleLayout>} />
-          <Route path="/instructor/messages" element={<RoleLayout role="Instructor"><Messages /></RoleLayout>} />
-          <Route path="/instructor/encode/:classId" element={<RoleLayout role="Instructor"><GradeEncoding /></RoleLayout>} />
-          <Route path="/instructor/profile" element={<RoleLayout role="Instructor"><ProfilePage /></RoleLayout>} />
-          <Route path="/instructor/settings" element={<RoleLayout role="Instructor"><SettingsPage /></RoleLayout>} />
+          {/* Faculty */}
+          <Route path="/faculty" element={<RoleLayout role="Faculty"><InstructorDashboard /></RoleLayout>} />
+          <Route path="/faculty/classes" element={<RoleLayout role="Faculty"><InstructorClasses /></RoleLayout>} />
+          <Route path="/faculty/students" element={<RoleLayout role="Faculty"><UserManagement facultyMode={true} /></RoleLayout>} />
+          <Route path="/faculty/subjects" element={<RoleLayout role="Faculty"><InstructorSubjects /></RoleLayout>} />
+          <Route path="/faculty/assigned-students" element={<RoleLayout role="Faculty"><AssignedToMe /></RoleLayout>} />
+          <Route path="/faculty/messages" element={<RoleLayout role="Faculty"><Messages /></RoleLayout>} />
+          <Route path="/faculty/encode/:classId" element={<RoleLayout role="Faculty"><GradeEncoding /></RoleLayout>} />
+          <Route path="/faculty/profile" element={<RoleLayout role="Faculty"><ProfilePage /></RoleLayout>} />
+          <Route path="/faculty/settings" element={<RoleLayout role="Faculty"><SettingsPage /></RoleLayout>} />
 
           {/* Student */}
           <Route path="/student" element={<RoleLayout role="Student"><StudentDashboard /></RoleLayout>} />
           <Route path="/student/grades" element={<RoleLayout role="Student"><StudentGrades /></RoleLayout>} />
+          <Route path="/student/assigned-students" element={<RoleLayout role="Student"><AssignedToMe /></RoleLayout>} />
           <Route path="/student/messages" element={<RoleLayout role="Student"><Messages /></RoleLayout>} />
           <Route path="/student/profile" element={<RoleLayout role="Student"><ProfilePage /></RoleLayout>} />
           <Route path="/student/settings" element={<RoleLayout role="Student"><SettingsPage /></RoleLayout>} />

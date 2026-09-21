@@ -8,10 +8,14 @@ import {
   Tooltip,
   Legend,
 } from 'chart.js';
+import { snapTicksToValues } from './chartPlugins';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend);
 
-export function GradeDistributionChart({ distribution }) {
+export function GradeDistributionChart({ distribution, height = 300 }) {
+  const textColor = '#6b7280';
+  const gridColor = '#f1f5f9';
+
   if (!distribution) return null;
 
   // GWA labels from 1.0 to 5.0
@@ -65,19 +69,22 @@ export function GradeDistributionChart({ distribution }) {
     },
     scales: {
       x: {
-        title: { display: true, text: 'GWA Value', font: { size: 12 } },
+        title: { display: true, text: 'GWA Value', font: { size: 12 }, color: textColor },
         grid: { display: false },
+        ticks: { color: textColor },
       },
       y: {
-        title: { display: true, text: 'Number of Students', font: { size: 12 } },
+        title: { display: true, text: 'Number of Students', font: { size: 12 }, color: textColor },
         beginAtZero: true,
-        ticks: { stepSize: 1 },
+        ticks: { stepSize: 1, color: textColor },
+        grid: { color: gridColor },
+        ...snapTicksToValues(values),
       },
     },
   };
 
   return (
-    <div style={{ height: '300px' }}>
+    <div style={{ height: `${height}px` }}>
       <Bar data={data} options={options} />
     </div>
   );

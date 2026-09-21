@@ -6,6 +6,32 @@
   <meta name="theme-color" content="#1B3A5C" />
   <meta name="description" content="Academic Grade Management System - Samar State University" />
   <title>AGMS - Samar State University</title>
+
+  <!-- Official AGMS logo — browser tab icon, home-screen icon, and the
+       image search engines/link previews (Slack, Messenger, etc.) show for
+       this site. A PNG favicon works directly in every modern browser, no
+       separate .ico conversion needed. -->
+  <link rel="icon" href="%PUBLIC_URL%/assets/logos/agms-logo.png" type="image/png" />
+  <link rel="apple-touch-icon" href="%PUBLIC_URL%/assets/logos/agms-logo.png" />
+  <meta property="og:title" content="AGMS - Samar State University" />
+  <meta property="og:description" content="Academic Grade Management System - Samar State University, College of Arts and Sciences" />
+  <meta property="og:image" content="%PUBLIC_URL%/assets/logos/agms-logo.png" />
+  <meta property="og:type" content="website" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="AGMS - Samar State University" />
+  <meta name="twitter:image" content="%PUBLIC_URL%/assets/logos/agms-logo.png" />
+  <script>
+    // Applied before React mounts so there's no flash of the wrong theme on
+    // load — mirrors ThemeContext.js's own resolution order exactly (stored
+    // choice, then OS preference).
+    (function () {
+      try {
+        var stored = localStorage.getItem('agms-theme');
+        var dark = stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (dark) document.documentElement.classList.add('dark');
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body>
   <noscript>You need to enable JavaScript to run this app.</noscript>

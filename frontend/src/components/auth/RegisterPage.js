@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import API from '../../services/api';
+import { REGULARITY_OPTIONS } from '../common';
 
 const CAS_PROGRAMS = [
   'Bachelor of Science in Information Systems',
@@ -10,7 +11,34 @@ const CAS_PROGRAMS = [
 ];
 
 const SECTIONS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
-const SEMESTERS = ['1st Semester', '2nd Semester'];
+const TERMS = ['First Semester', 'Second Semester', 'Summer'];
+// Registration accepts a Gmail address or an official SSU email — used for
+// account recovery, the verification code sent below, and status
+// notifications (e.g. registration approved). Mirrors the backend's own
+// REGISTRATION_EMAIL_REGEX in authController.js.
+const EMAIL_REGEX = /^[a-zA-Z0-9](\.?[a-zA-Z0-9_-]){2,}@(gmail\.com|([a-zA-Z0-9-]+\.)*ssu\.edu\.ph)$/;
+
+// Simple length + character-variety heuristic — purely a suggestion shown to
+// the student; it never blocks submission, since the password is still their
+// own decision as long as it clears the 8-character minimum.
+const PASSWORD_STRENGTH_LEVELS = [
+  { label: 'Very weak', color: '#e07070' },
+  { label: 'Weak', color: '#e0995f' },
+  { label: 'Fair', color: '#e0c95f' },
+  { label: 'Good', color: '#62d4e6' },
+  { label: 'Strong', color: '#4ade80' },
+];
+function getPasswordStrength(pw) {
+  if (!pw) return null;
+  let score = 0;
+  if (pw.length >= 8) score++;
+  if (pw.length >= 10) score++;
+  if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) score++;
+  if (/\d/.test(pw)) score++;
+  if (/[^A-Za-z0-9]/.test(pw)) score++;
+  const level = PASSWORD_STRENGTH_LEVELS[Math.min(score, PASSWORD_STRENGTH_LEVELS.length - 1)];
+  return { score, ...level };
+}
 
 /* ── Constellation background (shared with LoginPage) ── */
 function ConstellationBg() {
@@ -130,9 +158,9 @@ function ConstellationBg() {
 
 export default function RegisterPage() {
   const [form, setForm] = useState({
-    name: '', password: '', confirmPassword: '',
+    first_name: '', middle_initial: '', last_name: '', email: '', password: '', confirmPassword: '',
     student_no: '', program: '', year_level: '', section: '', student_status: 'Regular',
-    irregular_sections: [],
+    irregular_sections: [], privacy_consent: false,
   });
   const [error, setError]               = useState('');
   const [success, setSuccess]           = useState('');
@@ -141,27 +169,66 @@ export default function RegisterPage() {
   const [focusedField, setFocusedField] = useState(null);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirm, setShowConfirm]   = useState(false);
+  // 'form' -> 'verify' (code sent, waiting for confirmation) -> back to 'form'
+  // with `success` set once verified, matching the pre-existing success view.
+  const [step, setStep]                 = useState('form');
+  const [infoMessage, setInfoMessage]   = useState('');
+  const [code, setCode]                 = useState('');
+  const [verifying, setVerifying]       = useState(false);
+  const [resending, setResending]       = useState(false);
+  const [currentSemester, setCurrentSemester] = useState(null);
 
   const navigate = useNavigate();
 
   useEffect(() => { const id = setTimeout(() => setMounted(true), 80); return () => clearTimeout(id); }, []);
+
+  // No auth token yet at this point — same public endpoint LoginPage uses.
+  useEffect(() => {
+    API.get('/semesters/public/current')
+      .then(({ data }) => setCurrentSemester(data.semester))
+      .catch(() => {});
+  }, []);
 
   const updateField = (key, value) => {
     setForm(prev => ({ ...prev, [key]: value }));
     setError('');
   };
 
-  // Irregular students get at most one Section + Semester choice per Year level
-  // (they can't be in two sections of the same year at once) — checking a Year
-  // adds a blank entry for it; unchecking removes it.
+  // Irregular students get at most one Section choice per Year level (they
+  // can't be in two sections of the same year at once) — checking a Year adds
+  // a blank entry for it; unchecking removes it. The Year+Section pair is also
+  // what drives automatic enrollment once the account is approved (backend
+  // matches it against any already-existing class for that Year+Section).
+  // Exactly one checked Year also gets marked `is_current` — the Year the
+  // student is actually progressing through normally, as opposed to the
+  // others, which are back subjects they're retaking. That distinction is
+  // what lets the Student Dashboard's "Path to Regular Status" picker offer
+  // only the back-subject Years, not their current, already-on-track one.
   const toggleIrregularYear = (yr) => {
     setForm(prev => {
       const exists = prev.irregular_sections.some(p => p.year_level === yr);
-      const next = exists
-        ? prev.irregular_sections.filter(p => p.year_level !== yr)
-        : [...prev.irregular_sections, { year_level: yr, section: '', semester: '' }];
+      let next;
+      if (exists) {
+        const wasCurrent = prev.irregular_sections.find(p => p.year_level === yr)?.is_current;
+        next = prev.irregular_sections.filter(p => p.year_level !== yr);
+        // Losing the designated current year — hand it to whatever's left so
+        // there's always exactly one (or none, if the list is now empty).
+        if (wasCurrent && next.length > 0) next = next.map((p, i) => ({ ...p, is_current: i === 0 }));
+      } else {
+        // First Year checked defaults to "current" — a sensible starting
+        // guess the student can still move with setCurrentYear below.
+        next = [...prev.irregular_sections, { year_level: yr, section: '', semester: '', is_current: prev.irregular_sections.length === 0 }];
+      }
       return { ...prev, irregular_sections: next };
     });
+    setError('');
+  };
+
+  const setCurrentYear = (yr) => {
+    setForm(prev => ({
+      ...prev,
+      irregular_sections: prev.irregular_sections.map(p => ({ ...p, is_current: p.year_level === yr })),
+    }));
     setError('');
   };
 
@@ -173,12 +240,54 @@ export default function RegisterPage() {
     setError('');
   };
 
+  // A back-subject Year can span BOTH semesters, not just one — an irregular
+  // student retaking Year 1 subjects might have failed classes in both 1st
+  // and 2nd Semester of that year, not only whichever term happens to match
+  // their current year's own. Stored as a single comma-joined string (same
+  // field/shape `semester` already was — every consumer of it, on this page
+  // and elsewhere, just displays it as-is) rather than turning this into an
+  // array, so nothing downstream (validation, the 4 places this shows as a
+  // badge) needs to change to handle it.
+  const toggleIrregularSemester = (yr, term) => {
+    setForm(prev => ({
+      ...prev,
+      irregular_sections: prev.irregular_sections.map(p => {
+        if (p.year_level !== yr) return p;
+        const selected = p.semester ? p.semester.split(', ').filter(Boolean) : [];
+        const next = selected.includes(term) ? selected.filter(t => t !== term) : [...selected, term];
+        // Keeps TERMS' own order regardless of click order, so the joined
+        // string always reads "First Semester, Second Semester", never the
+        // reverse just because Second was checked first.
+        return { ...p, semester: TERMS.filter(t => next.includes(t)).join(', ') };
+      }),
+    }));
+    setError('');
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError(''); setSuccess(''); setLoading(true);
 
-    if (!form.name || !form.password || !form.confirmPassword || !form.student_no || !form.program) {
+    const firstName = String(form.first_name || '').trim();
+    const lastName = String(form.last_name || '').trim();
+    const middleInitialRaw = String(form.middle_initial || '').trim();
+    const isNoMiddle = !middleInitialRaw || /^n\/?a$/i.test(middleInitialRaw) || middleInitialRaw.toLowerCase() === 'none';
+    const middleInitial = isNoMiddle ? '' : (middleInitialRaw.replace(/\.*$/, '') + '.');
+
+    if (!firstName || !lastName || !form.email || !form.password || !form.confirmPassword || !form.student_no || !form.program) {
       setError('Please fill out all required fields.');
+      setLoading(false);
+      return;
+    }
+
+    if (!/^\d{6}$/.test(form.student_no.trim())) {
+      setError('Student Number must be exactly 6 digits.');
+      setLoading(false);
+      return;
+    }
+
+    if (!EMAIL_REGEX.test(form.email.trim().toLowerCase())) {
+      setError('Please enter a valid Gmail or SSU email address (e.g. juandelacruz@gmail.com or juandelacruz@ssu.edu.ph).');
       setLoading(false);
       return;
     }
@@ -189,8 +298,18 @@ export default function RegisterPage() {
         setLoading(false);
         return;
       }
-      if (form.irregular_sections.some(p => !p.section || !p.semester)) {
-        setError('Please select a Section and Semester for every Year you checked.');
+      if (form.irregular_sections.some(p => !p.section)) {
+        setError('Please select a Section for every Year you checked.');
+        setLoading(false);
+        return;
+      }
+      if (form.irregular_sections.some(p => !p.semester)) {
+        setError('Please select a Semester for every Year you checked.');
+        setLoading(false);
+        return;
+      }
+      if (!form.irregular_sections.some(p => p.is_current)) {
+        setError('Please mark which Year is your current one.');
         setLoading(false);
         return;
       }
@@ -200,8 +319,8 @@ export default function RegisterPage() {
       return;
     }
 
-    if (form.password.length < 6) {
-      setError('Password must be at least 6 characters.');
+    if (form.password.length < 8) {
+      setError('Password must be at least 8 characters.');
       setLoading(false);
       return;
     }
@@ -212,14 +331,61 @@ export default function RegisterPage() {
       return;
     }
 
+    if (!form.privacy_consent) {
+      setError('You must accept the Privacy Notice to register.');
+      setLoading(false);
+      return;
+    }
+
     try {
-      const res = await API.post('/auth/register', form);
-      setSuccess(res.data.message);
-      setForm({ name: '', password: '', confirmPassword: '', student_no: '', program: '', year_level: '', section: '', student_status: 'Regular', irregular_sections: [] });
+      const fullName = middleInitial ? `${firstName} ${middleInitial} ${lastName}` : `${firstName} ${lastName}`;
+      const payload = {
+        ...form,
+        first_name: firstName,
+        middle_initial: middleInitial,
+        last_name: lastName,
+        name: fullName,
+      };
+      const res = await API.post('/auth/register', payload);
+      setInfoMessage(res.data.message);
+      setStep('verify');
     } catch (err) {
       setError(err.response?.data?.message || 'Registration failed. Please try again.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleVerify = async (e) => {
+    e.preventDefault();
+    setError('');
+    if (!code || code.trim().length !== 6) {
+      setError('Please enter the 6-digit code from your email.');
+      return;
+    }
+    setVerifying(true);
+    try {
+      const res = await API.post('/auth/verify-email', { student_no: form.student_no, code: code.trim() });
+      setSuccess(res.data.message);
+      setStep('form');
+      setForm({ first_name: '', middle_initial: '', last_name: '', email: '', password: '', confirmPassword: '', student_no: '', program: '', year_level: '', section: '', student_status: 'Regular', irregular_sections: [], privacy_consent: false });
+      setCode('');
+    } catch (err) {
+      setError(err.response?.data?.message || 'Verification failed. Please try again.');
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  const handleResend = async () => {
+    setError(''); setResending(true);
+    try {
+      const res = await API.post('/auth/resend-verification-code', { student_no: form.student_no });
+      setInfoMessage(res.data.message);
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to resend the code. Please try again.');
+    } finally {
+      setResending(false);
     }
   };
 
@@ -242,7 +408,8 @@ export default function RegisterPage() {
         body { background: var(--navy); font-family: 'Inter', sans-serif; }
 
         .rp-shell {
-          min-height: 100vh;
+          height: 100vh;
+          max-height: 100vh;
           display: grid;
           grid-template-columns: 1fr 520px;
           position: relative;
@@ -258,6 +425,9 @@ export default function RegisterPage() {
           align-items: flex-start;
           padding: 60px 64px;
           pointer-events: none;
+          height: 100vh;
+          max-height: 100vh;
+          overflow: hidden;
         }
 
         .rp-left-badge {
@@ -286,6 +456,7 @@ export default function RegisterPage() {
 
         .rp-logo-pair {
           display: flex;
+          justify-content: center;
           align-items: center;
           margin-bottom: 40px;
           opacity: 0;
@@ -319,9 +490,16 @@ export default function RegisterPage() {
           border-radius: 50%;
           background: rgba(255,255,255,0.97);
           display: flex; align-items: center; justify-content: center;
+          overflow: hidden;
           box-shadow: 0 0 0 3px var(--ring-color), 0 14px 40px rgba(0,0,0,0.6), 0 2px 8px rgba(0,0,0,0.3);
         }
-        .rp-logo-ring-disc img { width: 84%; height: 84%; object-fit: contain; border-radius: 50%; }
+        /* Measured directly from the source files: ssu-logo.png's seal fills
+           ~92% of its own transparent canvas; cas-logo.png's seal fills ~99%
+           of its own (white-background) canvas — the opposite of what the
+           old comment here assumed. Sized so both end up the same VISIBLE
+           diameter inside their matching circles, not the same raw
+           width/height percentage (which is what made CAS read larger). */
+        .rp-logo-ring-disc img { width: 92%; height: 92%; object-fit: contain; border-radius: 50%; }
 
         .rp-logo-pair-sep {
           width: 1px; height: 56px; margin: 0 24px; flex-shrink: 0;
@@ -355,7 +533,7 @@ export default function RegisterPage() {
         .rp-tag.gold { border-color: rgba(201,168,76,0.3); color: var(--gold); background: rgba(201,168,76,0.06); }
         .rp-tag.teal { border-color: rgba(58,184,204,0.3); color: var(--teal); background: rgba(58,184,204,0.06); }
 
-        .rp-divider { position: absolute; top: 0; bottom: 0; right: 520px; width: 1px; background: linear-gradient(to bottom, transparent 0%, rgba(201,168,76,0.25) 30%, rgba(201,168,76,0.25) 70%, transparent 100%); z-index: 2; }
+        .rp-divider { position: absolute; top: 0; bottom: 0; right: 520px; width: 1px; background: linear-gradient(to bottom, transparent 0%, rgba(201,168,76,0.25) 30%, rgba(201,168,76,0.25) 70%, transparent 100%); z-index: 2; pointer-events: none; }
 
         .rp-right {
           position: relative; z-index: 1;
@@ -363,8 +541,25 @@ export default function RegisterPage() {
           backdrop-filter: blur(40px) saturate(150%);
           -webkit-backdrop-filter: blur(40px) saturate(150%);
           border-left: 1px solid rgba(255,255,255,0.07);
-          display: flex; flex-direction: column; justify-content: center;
-          padding: 36px 40px; min-height: 100vh; overflow-y: auto;
+          display: flex; flex-direction: column; justify-content: flex-start;
+          padding: 40px 40px 60px;
+          height: 100vh;
+          max-height: 100vh;
+          overflow-y: auto;
+          overflow-x: hidden;
+        }
+        .rp-right::-webkit-scrollbar {
+          width: 6px;
+        }
+        .rp-right::-webkit-scrollbar-track {
+          background: rgba(255,255,255,0.02);
+        }
+        .rp-right::-webkit-scrollbar-thumb {
+          background: rgba(201,168,76,0.3);
+          border-radius: 3px;
+        }
+        .rp-right::-webkit-scrollbar-thumb:hover {
+          background: rgba(201,168,76,0.6);
         }
 
         .rp-right::before {
@@ -484,14 +679,28 @@ export default function RegisterPage() {
         .rp-right-footer .g { color: rgba(201,168,76,0.4); }
 
         @media (max-width: 960px) {
-          .rp-shell { grid-template-columns: 1fr; }
+          .rp-shell {
+            grid-template-columns: 1fr;
+            height: auto;
+            max-height: none;
+            overflow-y: auto;
+          }
           .rp-left { display: none; }
           .rp-divider { display: none; }
-          .rp-right { border-left: none; border-top: 1px solid rgba(255,255,255,0.07); padding: 36px 28px; justify-content: flex-start; padding-top: 48px; }
+          .rp-right {
+            border-left: none;
+            border-top: 1px solid rgba(255,255,255,0.07);
+            padding: 36px 28px 48px;
+            justify-content: flex-start;
+            padding-top: 48px;
+            height: auto;
+            max-height: none;
+            overflow-y: visible;
+          }
         }
         @media (max-width: 520px) {
           .rp-row { grid-template-columns: 1fr; gap: 0; }
-          .rp-right { padding: 32px 18px; }
+          .rp-right { padding: 32px 18px 40px; }
         }
       `}</style>
 
@@ -531,6 +740,9 @@ export default function RegisterPage() {
           <div className={`rp-left-tags ${mounted ? 'in' : ''}`}>
             <span className="rp-tag teal">New Student</span>
             <span className="rp-tag gold">CAS Programs</span>
+            {currentSemester && (
+              <span className="rp-tag">{currentSemester.term || currentSemester.name} · A.Y. {currentSemester.academic_year}</span>
+            )}
           </div>
         </div>
 
@@ -562,21 +774,112 @@ export default function RegisterPage() {
                   <Link to="/login">← Back to Sign In</Link>
                 </div>
               </div>
+            ) : step === 'verify' ? (
+              <form onSubmit={handleVerify}>
+                {infoMessage && (
+                  <p style={{ fontSize: 13, lineHeight: 1.6, color: 'rgba(255,255,255,0.65)', marginBottom: 20 }}>
+                    {infoMessage} Sent to <strong style={{ color: '#fff' }}>{form.email}</strong>.
+                  </p>
+                )}
+                <div className="rp-field">
+                  <label className="rp-label">Verification Code <span className="req">*</span></label>
+                  <div className={`rp-input-wrap ${focusedField === 'code' ? 'focused' : ''}`}>
+                    <span className="rp-input-icon">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                      </svg>
+                    </span>
+                    <input className="rp-input" type="text" inputMode="numeric" maxLength={6} placeholder="6-digit code"
+                      value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      onFocus={() => setFocusedField('code')} onBlur={() => setFocusedField(null)}
+                      style={{ letterSpacing: 4, fontWeight: 600 }} required />
+                  </div>
+                  <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', marginTop: 6 }}>
+                    Code expires in 15 minutes.{' '}
+                    <button type="button" onClick={handleResend} disabled={resending}
+                      style={{ background: 'none', border: 'none', padding: 0, color: 'var(--teal)', cursor: resending ? 'default' : 'pointer', fontSize: 11, textDecoration: 'underline' }}>
+                      {resending ? 'Resending…' : "Didn't get it? Resend code"}
+                    </button>
+                  </p>
+                  <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', marginTop: 4 }}>
+                    Still nothing after resending (check Spam too)? The address above is most likely mistyped — go back and fix it below.
+                  </p>
+                </div>
+
+                <button type="submit" className="rp-submit" disabled={verifying}>
+                  {verifying && <span className="rp-spinner" />}
+                  {verifying ? 'Verifying…' : 'Verify Email'}
+                </button>
+
+                <p style={{ marginTop: 14, textAlign: 'center' }}>
+                  <button type="button" onClick={() => { setStep('form'); setError(''); }}
+                    style={{ background: 'none', border: 'none', padding: 0, color: 'rgba(255,255,255,0.4)', cursor: 'pointer', fontSize: 12.5, textDecoration: 'underline' }}>
+                    ← Back to registration form
+                  </button>
+                </p>
+              </form>
             ) : (
               <form onSubmit={handleSubmit}>
                 {/* Personal Info */}
+                <div className="rp-row">
+                  <div className="rp-field">
+                    <label className="rp-label">First Name <span className="req">*</span></label>
+                    <div className={`rp-input-wrap ${focusedField === 'first_name' ? 'focused' : ''}`}>
+                      <span className="rp-input-icon">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
+                        </svg>
+                      </span>
+                      <input className="rp-input" type="text" placeholder="Juan"
+                        value={form.first_name} onChange={e => updateField('first_name', e.target.value)}
+                        onFocus={() => setFocusedField('first_name')} onBlur={() => setFocusedField(null)} required />
+                    </div>
+                  </div>
+
+                  <div className="rp-field">
+                    <label className="rp-label">Middle Initial</label>
+                    <div className={`rp-input-wrap ${focusedField === 'middle_initial' ? 'focused' : ''}`}>
+                      <span className="rp-input-icon">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
+                        </svg>
+                      </span>
+                      <input className="rp-input" type="text" maxLength={5} placeholder="Optional"
+                        value={form.middle_initial} onChange={e => updateField('middle_initial', e.target.value)}
+                        onFocus={() => setFocusedField('middle_initial')} onBlur={() => setFocusedField(null)} />
+                    </div>
+                  </div>
+
+                  <div className="rp-field">
+                    <label className="rp-label">Last Name <span className="req">*</span></label>
+                    <div className={`rp-input-wrap ${focusedField === 'last_name' ? 'focused' : ''}`}>
+                      <span className="rp-input-icon">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
+                        </svg>
+                      </span>
+                      <input className="rp-input" type="text" placeholder="Dela Cruz"
+                        value={form.last_name} onChange={e => updateField('last_name', e.target.value)}
+                        onFocus={() => setFocusedField('last_name')} onBlur={() => setFocusedField(null)} required />
+                    </div>
+                  </div>
+                </div>
+
                 <div className="rp-field">
-                  <label className="rp-label">Full Name <span className="req">*</span></label>
-                  <div className={`rp-input-wrap ${focusedField === 'name' ? 'focused' : ''}`}>
+                  <label className="rp-label">Gmail or SSU Gmail <span className="req">*</span></label>
+                  <div className={`rp-input-wrap ${focusedField === 'email' ? 'focused' : ''}`}>
                     <span className="rp-input-icon">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
+                        <path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><polyline points="22 6 12 13 2 6"/>
                       </svg>
                     </span>
-                    <input className="rp-input" type="text" placeholder="Juan Dela Cruz"
-                      value={form.name} onChange={e => updateField('name', e.target.value)}
-                      onFocus={() => setFocusedField('name')} onBlur={() => setFocusedField(null)} required />
+                    <input className="rp-input" type="email" placeholder="juandelacruz@gmail.com or juandelacruz@ssu.edu.ph"
+                      value={form.email} onChange={e => updateField('email', e.target.value)}
+                      onFocus={() => setFocusedField('email')} onBlur={() => setFocusedField(null)} required />
                   </div>
+                  <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', marginTop: 6 }}>
+                    We'll send a verification code to confirm it's really yours — used only to recover your password and to notify you once your registration is approved.
+                  </p>
                 </div>
 
                 <div className="rp-row">
@@ -589,7 +892,7 @@ export default function RegisterPage() {
                         </svg>
                       </span>
                       <input className="rp-input has-r" type={showPassword ? 'text' : 'password'}
-                        placeholder="Min. 6 characters" value={form.password}
+                        placeholder="Min. 8 characters" value={form.password}
                         onChange={e => updateField('password', e.target.value)}
                         onFocus={() => setFocusedField('password')} onBlur={() => setFocusedField(null)} required />
                       <button type="button" className="rp-pw-toggle" onClick={() => setShowPassword(s => !s)}>
@@ -606,6 +909,26 @@ export default function RegisterPage() {
                         )}
                       </button>
                     </div>
+                    {(() => {
+                      const strength = getPasswordStrength(form.password);
+                      if (!strength) return null;
+                      return (
+                        <div style={{ marginTop: 7 }}>
+                          <div style={{ display: 'flex', gap: 3 }}>
+                            {PASSWORD_STRENGTH_LEVELS.map((lvl, i) => (
+                              <span key={i} style={{
+                                flex: 1, height: 3, borderRadius: 2,
+                                background: i <= strength.score ? strength.color : 'rgba(255,255,255,0.12)',
+                                transition: 'background 0.2s',
+                              }} />
+                            ))}
+                          </div>
+                          <p style={{ fontSize: 11, marginTop: 4, color: strength.color }}>
+                            {strength.label} — pick whatever you like, as long as it's at least 8 characters. Mixing in a number, a capital letter, or a symbol makes it stronger.
+                          </p>
+                        </div>
+                      );
+                    })()}
                   </div>
 
                   <div className="rp-field">
@@ -634,6 +957,13 @@ export default function RegisterPage() {
                         )}
                       </button>
                     </div>
+                    {form.confirmPassword && (
+                      form.confirmPassword === form.password ? (
+                        <p style={{ fontSize: 11, marginTop: 6, color: '#4ade80' }}>✓ Passwords match.</p>
+                      ) : (
+                        <p style={{ fontSize: 11, marginTop: 6, color: '#e07070' }}>✕ Passwords do not match.</p>
+                      )
+                    )}
                   </div>
                 </div>
 
@@ -649,8 +979,8 @@ export default function RegisterPage() {
                           <rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/>
                         </svg>
                       </span>
-                      <input className="rp-input" type="text" placeholder="e.g. 2021-00123"
-                        value={form.student_no} onChange={e => updateField('student_no', e.target.value)}
+                      <input className="rp-input" type="text" inputMode="numeric" placeholder="e.g. 123456" maxLength={6}
+                        value={form.student_no} onChange={e => updateField('student_no', e.target.value.replace(/\D/g, '').slice(0, 6))}
                         onFocus={() => setFocusedField('student_no')} onBlur={() => setFocusedField(null)} required />
                     </div>
                     <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', marginTop: 6 }}>
@@ -670,23 +1000,25 @@ export default function RegisterPage() {
                 </div>
 
                 <div className="rp-field">
-                  <label className="rp-label">Student Type <span className="req">*</span></label>
+                  <label className="rp-label">Regular / Irregular <span className="req">*</span></label>
+                  {/* Self-declared at registration. The only choice here with
+                      a functional effect — Irregular unlocks the per-year
+                      schedule breakdown below. */}
                   <select className="rp-select" value={form.student_status}
                     onChange={e => updateField('student_status', e.target.value)}
                     onFocus={() => setFocusedField('student_status')} onBlur={() => setFocusedField(null)}>
-                    <option value="Regular">Regular</option>
-                    <option value="Irregular">Irregular</option>
+                    {REGULARITY_OPTIONS.map((t) => <option key={t} value={t}>{t}</option>)}
                   </select>
                   {form.student_status === 'Irregular' && (
                     <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', marginTop: 6 }}>
-                      As an irregular student, check off every Year level you're taking classes in, then pick the Section and Semester for each — one of each per Year.
+                      As an irregular student, check off every Year level you're taking classes in, then pick the Section for each — one per Year. This is what enrolls you into the matching classes automatically.
                     </p>
                   )}
                 </div>
 
                 {form.student_status === 'Irregular' ? (
                   <div className="rp-field">
-                    <label className="rp-label">Year, Semester &amp; Section <span className="req">*</span></label>
+                    <label className="rp-label">Year &amp; Section <span className="req">*</span></label>
                     <div style={{ border: '1px solid rgba(255,255,255,0.09)', borderRadius: 10, padding: '12px', background: 'rgba(255,255,255,0.03)' }}>
                       {[1, 2, 3, 4].map(yr => {
                         const entry = form.irregular_sections.find(p => p.year_level === yr);
@@ -703,31 +1035,60 @@ export default function RegisterPage() {
                               Year {yr}
                             </label>
                             {checked && (
-                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 8, marginLeft: 22 }}>
+                              <div style={{ marginTop: 8, marginLeft: 22, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                                 <select
                                   className="rp-select"
-                                  style={{ padding: '8px 28px 8px 10px', fontSize: 12 }}
-                                  value={entry.semester}
-                                  onChange={e => updateIrregularYearField(yr, 'semester', e.target.value)}
-                                >
-                                  <option value="" disabled>Select semester</option>
-                                  {SEMESTERS.map(s => <option key={s} value={s}>{s}</option>)}
-                                </select>
-                                <select
-                                  className="rp-select"
-                                  style={{ padding: '8px 28px 8px 10px', fontSize: 12 }}
+                                  style={{ padding: '8px 28px 8px 10px', fontSize: 12, width: 'auto', flex: '1 1 140px' }}
                                   value={entry.section}
                                   onChange={e => updateIrregularYearField(yr, 'section', e.target.value)}
                                 >
                                   <option value="" disabled>Select section</option>
                                   {SECTIONS.map(s => <option key={s} value={s}>Section {s}</option>)}
                                 </select>
+                                {/* Which semester(s) THIS Year's classes are
+                                    in — a back subject can be a Year you're
+                                    retaking in EITHER term, or both at once
+                                    (failed/incomplete subjects from both 1st
+                                    and 2nd Semester of that same Year), not
+                                    necessarily just the one matching your
+                                    current year's own term, so more than one
+                                    can be checked per Year. */}
+                                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', flex: '1 1 100%' }}>
+                                  {TERMS.map(t => {
+                                    const selected = (entry.semester || '').split(', ').filter(Boolean).includes(t);
+                                    return (
+                                      <label key={t} style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 11.5, color: selected ? '#c9a84c' : 'rgba(255,255,255,0.5)' }}>
+                                        <input
+                                          type="checkbox"
+                                          checked={selected}
+                                          onChange={() => toggleIrregularSemester(yr, t)}
+                                          style={{ width: 13, height: 13, cursor: 'pointer', accentColor: '#c9a84c' }}
+                                        />
+                                        {t}
+                                      </label>
+                                    );
+                                  })}
+                                </div>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 11.5, color: entry.is_current ? 'var(--teal)' : 'rgba(255,255,255,0.4)', whiteSpace: 'nowrap' }}>
+                                  <input
+                                    type="radio"
+                                    name="irregular-current-year"
+                                    checked={!!entry.is_current}
+                                    onChange={() => setCurrentYear(yr)}
+                                    style={{ width: 13, height: 13, cursor: 'pointer', accentColor: '#3ab8cc' }}
+                                  />
+                                  This is my current year
+                                </label>
                               </div>
                             )}
                           </div>
                         );
                       })}
                     </div>
+                    <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', marginTop: 6 }}>
+                      Your current year is the one you're normally progressing through — the others are back subjects you're retaking.
+                      This is what keeps "Path to Regular Status" from asking you to clear subjects you're already on track for.
+                    </p>
                   </div>
                 ) : (
                   <div className="rp-row">
@@ -757,7 +1118,38 @@ export default function RegisterPage() {
                   </div>
                 )}
 
-                <button type="submit" className="rp-submit" disabled={loading}>
+                {/* Privacy Notice — Data Privacy Act of 2012 (RA 10173) */}
+                <div style={{
+                  marginTop: 22, marginBottom: 16, padding: '14px 16px', borderRadius: 12,
+                  background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.09)',
+                }}>
+                  <p style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1.5, textTransform: 'uppercase', color: 'var(--gold)', marginBottom: 8 }}>
+                    Privacy Notice
+                  </p>
+                  <p style={{ fontSize: 12, lineHeight: 1.6, color: 'rgba(255,255,255,0.5)', marginBottom: 8 }}>
+                    AGMS collects and processes your name, student number, program, year level, section, and
+                    academic records to manage your grades, and communication within the system, in
+                    accordance with the Data Privacy Act of 2012 (RA 10173). Read the full{' '}
+                    <Link to="/privacy-policy" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--teal)' }}>
+                      Privacy Policy
+                    </Link>.
+                  </p>
+                  <label style={{ display: 'flex', alignItems: 'flex-start', gap: 9, cursor: 'pointer', fontSize: 12.5, lineHeight: 1.55, color: 'rgba(255,255,255,0.75)' }}>
+                    <input
+                      type="checkbox"
+                      checked={form.privacy_consent}
+                      onChange={e => updateField('privacy_consent', e.target.checked)}
+                      style={{ marginTop: 2, width: 15, height: 15, flexShrink: 0, accentColor: '#c9a84c', cursor: 'pointer' }}
+                    />
+                    <span>
+                      I have read and understood the Privacy Notice and consent to the collection, processing,
+                      and storage of my personal information in accordance with the Data Privacy Act of 2012
+                      (RA 10173). <span style={{ color: '#e07070' }}>*</span>
+                    </span>
+                  </label>
+                </div>
+
+                <button type="submit" className="rp-submit" disabled={loading || !form.privacy_consent}>
                   {loading && <span className="rp-spinner" />}
                   {loading ? 'Creating Account…' : 'Create Account'}
                 </button>
@@ -768,6 +1160,13 @@ export default function RegisterPage() {
               Already have an account? <Link to="/login">Sign in</Link>
             </p>
 
+            <p className="rp-right-footer" style={{ display: 'flex', gap: 10, justifyContent: 'center', marginBottom: 6 }}>
+              <Link to="/privacy-policy" style={{ color: 'rgba(255,255,255,0.35)' }}>Privacy Policy</Link>
+              <span>·</span>
+              <Link to="/terms" style={{ color: 'rgba(255,255,255,0.35)' }}>Terms and Conditions</Link>
+              <span>·</span>
+              <Link to="/contact" style={{ color: 'rgba(255,255,255,0.35)' }}>Contact Us</Link>
+            </p>
             <p className="rp-right-footer">
               © 2025 <span className="t">Samar State University</span> · <span className="g">CAS</span> · All Rights Reserved
             </p>

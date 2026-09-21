@@ -1,7 +1,13 @@
-const { Endorsement, User, Grade, Class, Subject, Enrollment, Notification, Semester } = require('../models');
+const { Endorsement, User, Grade, Class, Subject, Enrollment, Semester } = require('../models');
 const { Op } = require('sequelize');
 const { logActivity } = require('../utils/activityLogger');
 const { asyncHandler } = require('../middleware/errorHandler');
+// Shared "notify every Admin" helper — emits the real-time
+// `notification:${userId}` Socket.IO event the frontend bell (and its
+// notification sound) listens for, unlike a bare Notification.create which
+// would leave it silently sitting there until the recipient's next page
+// load/manual refresh.
+const { notifyAdmins } = require('./notificationController');
 
 // Resolve the semester to endorse/flag/override for: explicit value from the
 // client, or the school's current active Semester (matches the free-text
@@ -10,22 +16,6 @@ const resolveSemester = async (explicit) => {
   if (explicit) return explicit;
   const current = await Semester.findOne({ where: { is_current: true } });
   return current ? current.name : null;
-};
-
-// Helper: notify all admins
-const notifyAdmins = async (title, message, link) => {
-  const admins = await User.findAll({ where: { role: 'Admin', status: 'Active' } });
-  await Promise.all(
-    admins.map(admin =>
-      Notification.create({
-        user_id: admin.id,
-        title,
-        message,
-        type: 'endorsement',
-        link,
-      })
-    )
-  );
 };
 
 // GET /api/endorsements
@@ -89,7 +79,7 @@ const getDepartmentStudents = asyncHandler(async (req, res) => {
         ? await Endorsement.findOne({ where: { student_id: student.id, chairperson_id: req.user.id, semester } })
         : null;
 
-      // Current-semester class enrollment — gives Endorsements its Instructor/Subject/
+      // Current-semester class enrollment — gives Endorsements its Faculty/Subject/
       // Section context without adding new columns to Endorsement itself.
       const currentEnrollments = semester
         ? await Enrollment.findAll({
@@ -216,11 +206,12 @@ const endorseStudent = asyncHandler(async (req, res) => {
   await logActivity(req.user.id, `endorsed student ${student.name}`, 'Endorsement', endorsement.id);
 
   // Notify admins
-  await notifyAdmins(
-    'Student Endorsed',
-    `${req.user.name} endorsed ${student.name} (${student.program} - Year ${student.year_level}, Section ${student.section}).`,
-    '/admin/endorsements'
-  );
+  await notifyAdmins(req.app, {
+    title: 'Student Endorsed',
+    message: `${req.user.name} endorsed ${student.name} (${student.program} - Year ${student.year_level}, Section ${student.section}).`,
+    type: 'endorsement',
+    link: '/admin/endorsements',
+  });
 
   res.json({ message: 'Student endorsed successfully.', endorsement });
 });
@@ -262,11 +253,12 @@ const flagStudent = asyncHandler(async (req, res) => {
   await logActivity(req.user.id, `flagged student ${student.name}: ${flagged_reason}`, 'Endorsement', endorsement.id);
 
   // Notify admins
-  await notifyAdmins(
-    'Student Flagged',
-    `${req.user.name} flagged ${student.name} (${student.program} - Year ${student.year_level}, Section ${student.section}). Reason: ${flagged_reason}`,
-    '/admin/endorsements'
-  );
+  await notifyAdmins(req.app, {
+    title: 'Student Flagged',
+    message: `${req.user.name} flagged ${student.name} (${student.program} - Year ${student.year_level}, Section ${student.section}). Reason: ${flagged_reason}`,
+    type: 'endorsement',
+    link: '/admin/endorsements',
+  });
 
   res.json({ message: 'Student flagged.', endorsement });
 });

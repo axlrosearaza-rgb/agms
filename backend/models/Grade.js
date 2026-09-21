@@ -121,8 +121,13 @@ const Grade = sequelize.define('Grade', {
         return;
       }
 
-      // Auto-compute average and status only when both midterm and finals are present
-      if (grade.midterm !== null && grade.finals !== null) {
+      // Auto-compute average and status only when both midterm and finals are
+      // present. `!= null` (loose) on purpose — catches `undefined` too, not
+      // just explicit `null`: a bare Grade.create()/findOrCreate() call whose
+      // `defaults` omits the midterm/finals keys entirely leaves them
+      // `undefined`, which `!== null` (strict) would wrongly treat as
+      // "present" and compute NaN average / a false "Failed" status from.
+      if (grade.midterm != null && grade.finals != null) {
         const mid = parseFloat(grade.midterm);
         const fin = parseFloat(grade.finals);
         const avg = Math.round(((mid + fin) / 2) * 100) / 100;

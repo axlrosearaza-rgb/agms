@@ -34,6 +34,18 @@ const Notification = sequelize.define('Notification', {
     allowNull: true,
     comment: 'Optional URL to navigate to when clicked',
   },
+  // Auto-set once a notification turns 24h old (see
+  // notificationController.archiveStaleNotifications) — archived
+  // notifications drop out of the bell dropdown and the unread count, but
+  // the row itself isn't deleted, so the history isn't lost.
+  archived: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+  },
+  archived_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
 }, {
   tableName: 'notifications',
 });
