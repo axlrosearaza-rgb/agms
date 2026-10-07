@@ -3,7 +3,9 @@ import { Icons, Avatar, Badge, SearchBar, LoadingSpinner, FacultyProgramTags, Mo
 import { classService, reportService, gradeService, dashboardService, userService } from '../../services';
 import toast from 'react-hot-toast';
 import { usePageState } from '../../hooks/usePageState';
-import socket from '../../services/socket';
+import { useSearchParams } from 'react-router-dom';
+import { EncodingProgress } from '../../components/common/FacultyProgressRow';
+import { onGradesUpdated } from '../../services/socket';
 
 const PROGRAMS = [
   'Bachelor of Science in Information Technology',
@@ -27,20 +29,24 @@ const DOC = {
   sheet: { field: 'grade_sheet_verified', adminField: 'admin_grade_sheet_approved', label: 'Grade Sheet', path: '/grading-sheet' },
 };
 
-// Where a class sits in the pipeline right now — drives which of the two
-// containers below it lands in. A class the Chairperson hasn't forwarded yet
-// isn't Admin's concern at all — it's filtered out entirely before this ever
-// runs (see `classes.filter` below), not just parked in its own container.
-// "Done" only once BOTH of Admin's own document approvals are in — same
-// per-document pattern Chairperson's page uses, not a bulk single button.
-const stageOf = (c) => (c.admin_class_record_approved && c.admin_grade_sheet_approved) ? 'done' : 'needs_approval';
+// Where a class sits in the pipeline right now — drives which stage container
+// it lands in:
+// - 'pending': Not yet submitted by Faculty or awaiting Chairperson verification.
+// - 'needs_approval': Chairperson has verified and forwarded — awaiting Admin approval.
+// - 'done': Both Class Record and Grade Sheet are approved by Admin.
+const stageOf = (c) => {
+  if (c.admin_class_record_approved && c.admin_grade_sheet_approved) return 'done';
+  if (c.chairperson_verified) return 'needs_approval';
+  return 'pending';
+};
 
 // Solid color, not a pale tint — each stage's header is its own bright block
-// (white text/icons throughout) so the two containers read apart from each
+// (white text/icons throughout) so the three containers read apart from each
 // other at a glance instead of blurring into one long grey list.
 const STAGES = [
+  { key: 'pending', label: 'Pending Grades', hint: 'Not yet submitted by Faculty or awaiting Chairperson verification.', header: 'bg-gray-500 hover:bg-gray-600' },
   { key: 'needs_approval', label: 'Needs Your Approval', hint: 'Chairperson has forwarded these — approve each document.', header: 'bg-amber-500 hover:bg-amber-600' },
-  { key: 'done', label: 'Done', hint: 'Fully approved — Faculty has been notified they can export & release.', header: 'bg-green-500 hover:bg-green-600' },
+  { key: 'done', label: 'Done', hint: 'Fully approved — release the grades to the students.', header: 'bg-green-500 hover:bg-green-600' },
 ];
 
 // Approve only happens from inside the preview now (see the Preview modal's
@@ -99,8 +105,17 @@ function groupByYearSection(classes) {
 export default function GradeApproval() {
   const [classes, setClasses] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [searchParams, setSearchParams] = useSearchParams();
   // Filters + collapsible state persist across navigation (usePageState).
   const [search, setSearch] = usePageState('GradeApproval.search', '');
+
+  useEffect(() => {
+    const instructor = searchParams.get('instructor');
+    if (instructor) {
+      setSearch(instructor);
+      setSearchParams({}, { replace: true });
+    }
+  }, []);
   const [programFilter, setProgramFilter] = usePageState('GradeApproval.programFilter', '');
   const [yearFilter, setYearFilter] = usePageState('GradeApproval.yearFilter', '');
   const [sectionFilter, setSectionFilter] = usePageState('GradeApproval.sectionFilter', '');
@@ -119,6 +134,10 @@ export default function GradeApproval() {
   const [returnMessage, setReturnMessage] = useState('');
   const [returning, setReturning] = useState(false);
   const [confirmReturn, setConfirmReturn] = useState(false);
+  // Shown after a successful Send Back — a real popup summarizing exactly
+  // what just happened (who was notified, and the reason sent), not just the
+  // small toast that's easy to miss. { subjectLabel, reason, chairpersonCount }
+  const [returnSent, setReturnSent] = useState(null);
 
   // Approving is also fully inline now — no more sending Admin to a separate
   // page just to click one button; the confirm dialog is the only extra step.
@@ -132,6 +151,21 @@ export default function GradeApproval() {
   // Chairperson's Grading Sheets page both already use.
   const [archiving, setArchiving] = useState(null); // class id currently in flight
   const [archiveTarget, setArchiveTarget] = useState(null); // class about to be archived, pending confirm
+  // Admin releases a fully approved class's grades to its students.
+  const [releaseTarget, setReleaseTarget] = useState(null);
+  const [releasing, setReleasing] = useState(null); // class id being released
+  const handleRelease = async (cls) => {
+    setReleasing(cls.id);
+    try {
+      const { data } = await gradeService.releaseClass(cls.id);
+      toast.success(data.message || 'Grades released to students');
+      loadClasses();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to release grades');
+    } finally {
+      setReleasing(null);
+    }
+  };
   const [showArchived, setShowArchived] = usePageState('GradeApproval.showArchived', false);
 
   // Faculty completion widget's own data — deliberately NOT the `classes`
@@ -147,15 +181,16 @@ export default function GradeApproval() {
   // silently disappearing (facultyReview above only ever knows about
   // instructors on an Active class).
   const [allFaculty, setAllFaculty] = useState([]);
+  const [allClasses, setAllClasses] = useState([]);
   const [openFacultyGroups, setOpenFacultyGroups] = usePageState('GradeApproval.openFacultyGroups', {});
 
   const loadClasses = async () => {
     try {
       const { data } = await classService.getAll({ limit: 200 });
-      // A class the Chairperson hasn't verified & forwarded yet isn't ready
-      // for Admin at all — it stays entirely off this page (not shown in a
-      // "not yet forwarded" section either) until they do.
-      setClasses((data.classes || []).filter((c) => c.chairperson_verified));
+      const clsList = data.classes || [];
+      setAllClasses(clsList);
+      // Both forwarded and pending classes are shown under their respective stages
+      setClasses(clsList);
     } catch (err) {
       toast.error('Failed to load classes');
     } finally {
@@ -192,8 +227,7 @@ export default function GradeApproval() {
   // `classes`, so loadClasses() alone left it stale after any action.
   useEffect(() => {
     const handler = () => { loadClasses(); loadFacultyReview(); };
-    socket.on('gradesUpdated', handler);
-    return () => socket.off('gradesUpdated', handler);
+    return onGradesUpdated(handler);
   }, []);
 
   const handleArchiveToggle = async (cls, archived) => {
@@ -230,12 +264,20 @@ export default function GradeApproval() {
       toast.error("Explain what needs to be revised.");
       return;
     }
+    const subjectLabel = `${preview.cls.subject?.code || 'This class'}${preview.cls.section ? ` - Section ${preview.cls.section}` : ''}`;
+    const reason = returnMessage.trim();
     try {
       setReturning(true);
-      const { data } = await reportService.returnToChairperson(preview.cls.id, returnMessage.trim());
+      const { data } = await reportService.returnToChairperson(preview.cls.id, reason);
       toast.success(data.message);
       closePreview();
       loadClasses();
+      // The toast alone is easy to miss — this is the actual confirmation
+      // that the send-back went through, who it went to, and what reason
+      // was sent, so Admin doesn't have to just trust a message that
+      // disappears in a few seconds.
+      const chairpersonCount = parseInt(data.message?.match(/\d+/)?.[0] || '0', 10);
+      setReturnSent({ subjectLabel, reason, chairpersonCount });
     } catch (err) {
       toast.error(err.response?.data?.message || 'Failed to send this back');
     } finally {
@@ -298,8 +340,11 @@ export default function GradeApproval() {
     setSectionFilter('');
   };
 
-  const byStage = { needs_approval: [], done: [] };
-  filtered.forEach((c) => byStage[stageOf(c)].push(c));
+  const byStage = { pending: [], needs_approval: [], done: [] };
+  filtered.forEach((c) => {
+    const stage = stageOf(c);
+    if (byStage[stage]) byStage[stage].push(c);
+  });
 
   // Faculty completion — every Faculty with an Active class this semester
   // (facultyReview, not the forwarded-only `classes` list), all-or-nothing
@@ -320,8 +365,16 @@ export default function GradeApproval() {
   // A class that hasn't even been forwarded yet correctly keeps its faculty
   // out of "passed", same as one still sitting in Needs Your Approval.
   const approvedClassIds = new Set(classes.filter((c) => stageOf(c) === 'done').map((c) => c.id));
-  const facultyPassed = (f) => f.classes.length > 0 && f.classes.every((c) => approvedClassIds.has(c.class_id));
-  const facultySent = (f) => f.classes.length > 0 && f.classes.every((c) => c.sent);
+  // A class with zero enrolled students has nothing to submit at all — it
+  // can never turn `sent` true no matter what, so counting it in the
+  // all-or-nothing check below permanently blocked a faculty from ever
+  // reading as "done" once every class that actually HAS students is
+  // already through, just because some other unrelated empty class was
+  // still sitting there. Only classes with real students in them count
+  // toward whether a faculty is actually done.
+  const realClasses = (f) => f.classes.filter((c) => (c.total_students ?? 0) > 0);
+  const facultyPassed = (f) => { const rc = realClasses(f); return rc.length > 0 && rc.every((c) => approvedClassIds.has(c.class_id)); };
+  const facultySent = (f) => { const rc = realClasses(f); return rc.length > 0 && rc.every((c) => c.sent); };
 
   // Merge the full Faculty roster (allFaculty — every Faculty account,
   // regardless of whether they have an Active class right now) with the
@@ -350,12 +403,22 @@ export default function GradeApproval() {
   // Every known program shows up here even with 0 faculty right now (not
   // just the ones that happen to have someone in facultyByProgram already)
   // — a program isn't supposed to disappear from the roster just because
-  // nobody's teaching in it yet this semester.
+  // nobody's teaching in it yet this semester. No separate "(Teaching Here)"
+  // tile for cross-program teaching — a faculty appears once, under their
+  // own real (account) program, same as everyone else; their own row's
+  // class chips (below) already list every class they teach regardless of
+  // program, so a BSIT class still shows up there even for a Psychology
+  // faculty's own entry.
   const facultyGroups = [
     ...PROGRAMS.map((program) => ({ key: program, label: programShortLabel(program), program, list: facultyByProgram[program] || [] })),
     ...Object.entries(facultyByProgram).filter(([program]) => !PROGRAMS.includes(program)).sort(([a], [b]) => a.localeCompare(b)).map(([program, list]) => ({ key: program, label: programShortLabel(program), program, list })),
     ...(facultyPartTime.length > 0 ? [{ key: 'part_time', label: 'Part Timer', list: facultyPartTime }] : []),
   ];
+
+  const allClassMap = new Map((allClasses || []).map((c) => [c.id, c]));
+  const totalDoneClasses = (allClasses || []).filter((c) => c.admin_class_record_approved && c.admin_grade_sheet_approved).length;
+  const totalPendingRecordClasses = (allClasses || []).filter((c) => !c.admin_class_record_approved).length;
+  const totalPendingSheetClasses = (allClasses || []).filter((c) => !c.admin_grade_sheet_approved).length;
 
   const toggleStage = (key) => setOpenStages((prev) => ({ ...prev, [key]: !prev[key] }));
   const toggleGroup = (key) => setOpenGroups((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -371,50 +434,73 @@ export default function GradeApproval() {
       {/* Program/Year/Section are now the outer containers' own headers
           (groupByProgramYearSection), so none of them need repeating on
           every row. */}
-      <td className="px-4 py-3.5 align-top">
+      <td className="px-4 py-3.5 align-middle">
         <p className="font-semibold text-[13px] text-navy whitespace-nowrap">{c.subject?.code}</p>
-        <p className="text-gray-500 text-xs">{c.subject?.name}</p>
+        <p className="text-gray-500 text-xs min-w-[180px] max-w-[260px]">{c.subject?.name}</p>
+        {c.admin_return_reason && (
+          <p className="text-[11px] text-red-600 mt-1 max-w-xs">
+            <Icons.AlertTriangle className="w-3 h-3 inline mr-1 -mt-0.5" />
+            Returned: "{c.admin_return_reason}"
+          </p>
+        )}
       </td>
       {/* `c.semester` already bakes the academic year in ("First Semester
           2026-2027") — appending c.academic_year again duplicated it into
           "First Semester 2026-2027 2026-2027" whenever both were set. */}
-      <td className="px-4 py-3.5 text-xs align-top whitespace-nowrap">{c.semester}</td>
-      <td className="px-4 py-3.5 text-[13px] align-top">
-        <div>{c.instructor?.name || '—'}</div>
+      <td className="px-4 py-3.5 text-xs align-middle whitespace-nowrap">{c.semester}</td>
+      <td className="px-4 py-3.5 text-[13px] align-middle">
+        <div className="whitespace-nowrap font-medium">{c.instructor?.name || '—'}</div>
         {c.instructor && (
           <div className="mt-1 flex flex-wrap gap-1">
             <FacultyProgramTags user={c.instructor} />
           </div>
         )}
       </td>
-      <td className="px-4 py-3.5 text-[13px] align-top text-center">{c.student_count ?? 0}</td>
-      <td className="px-4 py-3.5 align-top">
+      <td className="px-4 py-3.5 text-[13px] align-middle min-w-[150px]">
+        <EncodingProgress c={c} />
+      </td>
+      <td className="px-4 py-3.5 align-middle">
         <DocCell cls={c} type="record" verified={c.class_record_verified} approved={c.admin_class_record_approved} onPreview={openPreview} />
       </td>
-      <td className="px-4 py-3.5 align-top">
+      <td className="px-4 py-3.5 align-middle">
         <DocCell cls={c} type="sheet" verified={c.grade_sheet_verified} approved={c.admin_grade_sheet_approved} onPreview={openPreview} />
       </td>
       {/* Archive is only ever offered once a class is actually Done (both
           documents approved) — not while it's still Needs Your Approval. */}
       {isDoneStage && (
-        <td className="px-4 py-3.5 align-top text-center">
-          <button
-            className="btn btn-outline btn-sm whitespace-nowrap"
-            onClick={() => setArchiveTarget(c)}
-            disabled={archiving === c.id}
-            title="Move this class to Archived"
-          >
-            <Icons.Archive className="w-3.5 h-3.5" /> {archiving === c.id ? 'Archiving...' : 'Archive'}
-          </button>
+        <td className="px-4 py-3.5 align-middle text-center">
+          <div className="flex flex-col items-center gap-1.5">
+            {/* Admin releases the grades once both documents are approved. */}
+            {c.all_released ? (
+              <Badge variant="green"><Icons.Check className="w-3 h-3" /> Released to Students</Badge>
+            ) : (
+              <button
+                className="btn btn-gold btn-sm whitespace-nowrap"
+                onClick={() => setReleaseTarget(c)}
+                disabled={releasing === c.id}
+                title="Make these grades visible to the students"
+              >
+                <Icons.Send className="w-3.5 h-3.5" /> {releasing === c.id ? 'Releasing...' : 'Release to Students'}
+              </button>
+            )}
+            <button
+              className="btn btn-outline btn-sm whitespace-nowrap"
+              onClick={() => setArchiveTarget(c)}
+              disabled={archiving === c.id}
+              title="Move this class to Archived"
+            >
+              <Icons.Archive className="w-3.5 h-3.5" /> {archiving === c.id ? 'Archiving...' : 'Archive'}
+            </button>
+          </div>
         </td>
       )}
     </tr>
   );
 
   const renderStage = (stage) => {
-    const stageClasses = byStage[stage.key];
+    const stageClasses = byStage[stage.key] || [];
     if (stageClasses.length === 0) return null;
-    const stageOpen = !!openStages[stage.key];
+    const stageOpen = !!openStages[stage.key] || hasActiveFilters;
     const programs = groupByProgramYearSection(stageClasses);
     const programKeys = Object.keys(programs).sort((a, b) => (a === 'No Program' ? 1 : b === 'No Program' ? -1 : a.localeCompare(b)));
     const isDoneStage = stage.key === 'done';
@@ -499,7 +585,7 @@ export default function GradeApproval() {
                                         <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Subject</th>
                                         <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Semester</th>
                                         <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Faculty</th>
-                                        <th className="text-center px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Students</th>
+                                        <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Progress</th>
                                         <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Class Record</th>
                                         <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Grade Sheet</th>
                                         {isDoneStage && <th className="text-center px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Action</th>}
@@ -543,14 +629,26 @@ export default function GradeApproval() {
       {facultyList.length > 0 && (
         <div className="card p-4 mb-5">
           <div className="flex items-center gap-3 mb-3">
-            <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 ${facultyDoneCount === facultyList.length ? 'bg-green-50 text-green-500' : 'bg-amber-50 text-amber-500'}`}>
+            <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 ${totalDoneClasses > 0 ? 'bg-green-50 text-green-500' : 'bg-amber-50 text-amber-500'}`}>
               <Icons.Users className="w-4 h-4" />
             </div>
-            <div className="min-w-0">
-              <p className="text-sm font-semibold text-navy leading-snug">
-                {facultyDoneCount}/{facultyList.length} faculty done submitting · {facultyPassedCount}/{facultyList.length} fully approved
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2.5 flex-wrap">
+                <span className="text-sm font-bold text-navy leading-snug">
+                  <span className="text-green-600 font-bold">{totalDoneClasses}</span> Done
+                </span>
+                <span className="text-gray-300">·</span>
+                <span className="text-sm font-semibold text-amber-600 leading-snug">
+                  {totalPendingRecordClasses} Pending Class Record
+                </span>
+                <span className="text-gray-300">·</span>
+                <span className="text-sm font-semibold text-blue-600 leading-snug">
+                  {totalPendingSheetClasses} Pending Grade Sheet
+                </span>
+              </div>
+              <p className="text-xs text-gray-400 leading-snug mt-0.5">
+                Overview across College of Arts and Sciences programs
               </p>
-              <p className="text-xs text-gray-400 leading-snug mt-0.5">Submitted = Faculty sent every class. Approved = Chairperson and Admin have both cleared every class.</p>
             </div>
           </div>
           {/* auto-fit instead of a fixed column count — with only a handful of
@@ -561,54 +659,91 @@ export default function GradeApproval() {
               pack snugly regardless of how many groups exist. */}
           <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))' }}>
             {facultyGroups.map((g) => {
-              const done = g.list.filter((f) => facultySent(f)).length;
-              const passed = g.list.filter(facultyPassed).length;
               const total = g.list.length;
-              const complete = total > 0 && done === total;
-              const allPassed = total > 0 && passed === total;
-              // Total classes this program's faculty are carrying — a
-              // faculty only counts as "done" once ALL of their classes are
-              // in (unchanged all-or-nothing rule above), but the class
-              // count itself is what that "all" actually means for this
-              // group, so it's worth showing alongside the faculty count.
-              const classCount = g.list.reduce((sum, f) => sum + f.classes.length, 0);
+
+              // Collect classes belonging exclusively to this program group's instructors
+              const seenClassIds = new Set();
+              const groupClasses = [];
+              g.list.forEach((f) => {
+                (f.classes || []).forEach((c) => {
+                  if (!seenClassIds.has(c.class_id)) {
+                    seenClassIds.add(c.class_id);
+                    const fullClass = allClassMap.get(c.class_id) || c;
+                    groupClasses.push(fullClass);
+                  }
+                });
+              });
+
+              const doneClasses = groupClasses.filter((c) => c.admin_class_record_approved && c.admin_grade_sheet_approved).length;
+              const pendingRecordClasses = groupClasses.filter((c) => !c.admin_class_record_approved).length;
+              const pendingSheetClasses = groupClasses.filter((c) => !c.admin_grade_sheet_approved).length;
+              const classCount = groupClasses.length;
+
+              // Jumps to (and opens) this program's own dropdown in the
+              // "Every group's own faculty" list further down the card,
+              // instead of leaving the tile purely informational and making
+              // the admin go hunt for the matching group by hand. Mirrors
+              // Chairperson's own GradingSheets.js tile behavior exactly.
+              const openGroupBelow = () => {
+                setOpenFacultyGroups((prev) => ({ ...prev, [g.key]: true }));
+                document.getElementById(`faculty-group-${g.key}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              };
               return (
-                <div key={g.key} className="border border-gray-100 rounded-lg p-3 min-w-0">
-                  <div className="flex items-center gap-1.5 mb-2 min-w-0">
-                    {g.key === 'part_time'
-                      ? <span className="w-2 h-2 rounded-full bg-amber-400 flex-shrink-0 inline-block" />
-                      : <ProgramDot program={g.program} />}
-                    <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide truncate">{g.label}</span>
-                  </div>
-                  <p className="text-[11px] text-gray-400 mb-1.5">{total} faculty · {classCount} class{classCount !== 1 ? 'es' : ''} total</p>
+                <div
+                  key={g.key}
+                  className="border border-gray-100 dark:border-slate-800 rounded-lg p-3 min-w-0 cursor-pointer hover:border-navy/30 hover:shadow-sm transition-all bg-white dark:bg-slate-900 flex flex-col justify-between"
+                  role="button"
+                  tabIndex={0}
+                  onClick={openGroupBelow}
+                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openGroupBelow(); } }}
+                  title={`View ${g.label} faculty`}
+                >
+                  <div>
+                    <div className="flex items-center gap-1.5 mb-1.5 min-w-0">
+                      {g.key === 'part_time'
+                        ? <span className="w-2 h-2 rounded-full bg-amber-400 flex-shrink-0 inline-block" />
+                        : <ProgramDot program={g.program} />}
+                      <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide truncate">{g.label}</span>
+                    </div>
+                    <p className="text-[11px] text-gray-400 mb-2">{total} faculty · {classCount} class{classCount !== 1 ? 'es' : ''}</p>
 
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] text-gray-500 uppercase tracking-wide">Submitted</span>
-                    <span className={`text-xs font-bold ${complete ? 'text-green-600' : 'text-navy'}`}>{done}/{total}</span>
-                  </div>
-                  <div className="w-full h-1 bg-gray-100 rounded-full overflow-hidden mt-1 mb-2">
-                    <div className={`h-full rounded-full ${complete ? 'bg-green-500' : 'bg-amber-400'}`} style={{ width: `${total > 0 ? (done / total) * 100 : 0}%` }} />
-                  </div>
+                    {classCount === 0 ? (
+                      <p className="text-xs text-gray-300 dark:text-slate-600 italic py-3 text-center">No active classes</p>
+                    ) : (
+                      <div className="space-y-2 py-0.5">
+                        <div>
+                          <div className="flex items-center justify-between text-xs mb-1">
+                            <span className="text-gray-600 dark:text-gray-300 flex items-center gap-1 font-medium">
+                              <Icons.Check className="w-3.5 h-3.5 text-green-500" /> Done
+                            </span>
+                            <span className={`font-bold ${doneClasses > 0 ? 'text-green-600' : 'text-gray-400'}`}>
+                              {doneClasses}/{classCount}
+                            </span>
+                          </div>
+                          <div className="w-full h-1.5 bg-gray-100 dark:bg-slate-700 rounded-full overflow-hidden">
+                            <div className="h-full bg-green-500 rounded-full transition-all" style={{ width: `${(doneClasses / classCount) * 100}%` }} />
+                          </div>
+                        </div>
 
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] text-gray-500 uppercase tracking-wide">Approved</span>
-                    <span className={`text-xs font-bold ${allPassed ? 'text-green-600' : 'text-navy'}`}>{passed}/{total}</span>
-                  </div>
-                  <div className="w-full h-1 bg-gray-100 rounded-full overflow-hidden mt-1 mb-2">
-                    <div className={`h-full rounded-full ${allPassed ? 'bg-green-500' : 'bg-blue-400'}`} style={{ width: `${total > 0 ? (passed / total) * 100 : 0}%` }} />
-                  </div>
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-gray-600 dark:text-gray-300 flex items-center gap-1 truncate" title="Pending Class Record">
+                            <Icons.Book className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" /> Pending Class Record
+                          </span>
+                          <span className={`font-bold px-1.5 py-0.5 rounded text-xs ${pendingRecordClasses > 0 ? 'text-amber-700 bg-amber-50 dark:text-amber-400 dark:bg-amber-950/40' : 'text-gray-400'}`}>
+                            {pendingRecordClasses}
+                          </span>
+                        </div>
 
-                  {/* Spelled out explicitly, not just left to the ratio above
-                      — the whole point of the tile is answering "how many
-                      have passed and how many haven't, per program" at a
-                      glance. */}
-                  <div className="flex items-center gap-3 pt-1 border-t border-gray-50">
-                    <span className="flex items-center gap-1 text-[11px] text-green-600 font-medium">
-                      <Icons.Check className="w-3 h-3" /> {passed} passed
-                    </span>
-                    <span className="flex items-center gap-1 text-[11px] text-gray-400 font-medium">
-                      <Icons.Clock className="w-3 h-3" /> {total - passed} not yet
-                    </span>
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-gray-600 dark:text-gray-300 flex items-center gap-1 truncate" title="Pending Grade Sheet">
+                            <Icons.FileText className="w-3.5 h-3.5 text-blue-500 flex-shrink-0" /> Pending Grade Sheet
+                          </span>
+                          <span className={`font-bold px-1.5 py-0.5 rounded text-xs ${pendingSheetClasses > 0 ? 'text-blue-700 bg-blue-50 dark:text-blue-400 dark:bg-blue-950/40' : 'text-gray-400'}`}>
+                            {pendingSheetClasses}
+                          </span>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               );
@@ -629,14 +764,14 @@ export default function GradeApproval() {
               : <ProgramDot program={g.program} />;
             if (g.list.length === 0) {
               return (
-                <div key={`${g.key}-faculty`} className="mt-3 pt-3 border-t border-gray-100 flex items-center gap-1.5">
+                <div key={`${g.key}-faculty`} id={`faculty-group-${g.key}`} className="mt-3 pt-3 border-t border-gray-100 flex items-center gap-1.5">
                   {dot}
                   <span className="text-xs font-semibold text-gray-300 uppercase tracking-wide">{g.label} — no faculty yet</span>
                 </div>
               );
             }
             return (
-            <div key={`${g.key}-faculty`} className="mt-3 pt-3 border-t border-gray-100">
+            <div key={`${g.key}-faculty`} id={`faculty-group-${g.key}`} className="mt-3 pt-3 border-t border-gray-100">
               <button
                 onClick={() => toggleFacultyGroup(g.key)}
                 className="w-full flex items-center justify-between mb-2 border-none bg-transparent cursor-pointer p-0"
@@ -648,18 +783,24 @@ export default function GradeApproval() {
                 {facultyOpen ? <Icons.ChevronUp className="w-3.5 h-3.5 text-gray-400" /> : <Icons.ChevronDown className="w-3.5 h-3.5 text-gray-400" />}
               </button>
               {facultyOpen && (
-              <div className="space-y-1.5">
+              <div className="space-y-1.5 max-h-80 overflow-y-auto pr-1">
                 {g.list
                   .slice()
-                  .sort(comparePeopleNames)
+                  .sort((a, b) => comparePeopleNames(a.instructor, b.instructor))
                   .map((f) => {
                     const sent = facultySent(f);
                     const passed = facultyPassed(f);
                     // Partial progress, not just the all-or-nothing badges
                     // beside it — a faculty with 5 classes and 3 submitted
                     // reads as "3/5", not just an undifferentiated "5 classes".
-                    const classesSubmitted = f.classes.filter((c) => c.sent).length;
-                    const classesApproved = f.classes.filter((c) => approvedClassIds.has(c.class_id)).length;
+                    // Counted against realClasses (students > 0), not
+                    // f.classes.length — an empty, unenrolled class has
+                    // nothing to submit, so it shouldn't read as a missing
+                    // one dragging the ratio down (e.g. "1/2" for a faculty
+                    // whose only real class is fully done).
+                    const rc = realClasses(f);
+                    const classesSubmitted = rc.filter((c) => c.sent).length;
+                    const classesApproved = rc.filter((c) => approvedClassIds.has(c.class_id)).length;
                     return (
                       <div key={f.instructor.id} className="px-3 py-2 rounded-lg border border-gray-100">
                         <div className="flex items-center gap-3">
@@ -669,10 +810,10 @@ export default function GradeApproval() {
                             <p className="text-[11px] text-gray-400">{f.classes.length} class{f.classes.length !== 1 ? 'es' : ''} handled</p>
                           </div>
                           <Badge variant={sent ? 'green' : 'gray'} className="flex-shrink-0" title={sent ? 'Every class submitted' : 'Not every class submitted yet'}>
-                            {sent && <Icons.Check className="w-3 h-3" />} {classesSubmitted}/{f.classes.length} submitted
+                            {sent && <Icons.Check className="w-3 h-3" />} {classesSubmitted}/{rc.length} submitted
                           </Badge>
                           <Badge variant={passed ? 'green' : 'gray'} className="flex-shrink-0" title={passed ? 'Every class approved' : 'Not every class approved yet'}>
-                            {passed && <Icons.Check className="w-3 h-3" />} {classesApproved}/{f.classes.length} approved
+                            {passed && <Icons.Check className="w-3 h-3" />} {classesApproved}/{rc.length} approved
                           </Badge>
                         </div>
                         {/* The actual classes this faculty created/is teaching
@@ -734,7 +875,7 @@ export default function GradeApproval() {
       <div className="card p-4 mb-5">
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
           <div className="col-span-2 sm:col-span-3 lg:col-span-2">
-            <SearchBar value={search} onChange={setSearch} placeholder="Search by subject, course title, or instructor..." />
+            <SearchBar value={search} onChange={setSearch} placeholder="Search by subject, course title, or faculty..." />
           </div>
           <select
             className="form-select text-sm py-2.5 w-full truncate"
@@ -875,7 +1016,7 @@ export default function GradeApproval() {
                                             <div className="min-w-0">
                                               <p className="text-sm font-semibold text-navy truncate">{c.subject?.code}</p>
                                               <p className="text-xs text-gray-400 truncate">{c.subject?.name} · {c.semester}</p>
-                                              <p className="text-xs text-gray-500 truncate">{c.instructor?.name || 'No instructor'}</p>
+                                              <p className="text-xs text-gray-500 truncate">{c.instructor?.name || 'No faculty'}</p>
                                             </div>
                                           </div>
                                           <div className="flex items-center gap-1.5 flex-shrink-0">
@@ -924,7 +1065,7 @@ export default function GradeApproval() {
         <Modal
           title={`${previewDoc.label} — ${preview.cls.subject?.code}${preview.cls.section ? ` Sec ${preview.cls.section}` : ''}`}
           onClose={closePreview}
-          size="max-w-5xl"
+          size="max-w-[98vw]"
           footer={
             isArchived(preview.cls) ? (
               // Archived is always already fully approved (that's the only
@@ -942,6 +1083,14 @@ export default function GradeApproval() {
               <>
                 {previewApproved ? (
                   <Badge variant="green"><Icons.Check className="w-3 h-3" /> Approved</Badge>
+                ) : !preview.cls.chairperson_verified ? (
+                  <button
+                    className="btn btn-gold opacity-50 cursor-not-allowed"
+                    disabled
+                    title="This class has not been verified and forwarded by the Chairperson yet."
+                  >
+                    <Icons.Clock className="w-4 h-4" /> Awaiting Chairperson
+                  </button>
                 ) : (
                   <button className="btn btn-gold" onClick={() => setApproveTarget({ cls: preview.cls, type: preview.type })} disabled={approving} title={`Approve the ${previewDoc.label}`}>
                     <Icons.Check className="w-4 h-4" /> Approve
@@ -958,7 +1107,7 @@ export default function GradeApproval() {
             <div>
               <p className="text-[13px] text-gray-500 mb-3">
                 This sends BOTH the Class Record and Grade Sheet back to {preview.cls.subject?.program || 'the'} Chairperson
-                (and notifies {preview.cls.instructor?.name || 'the instructor'}) — they always move together, so this
+                (and notifies {preview.cls.instructor?.name ? formatPersonName(preview.cls.instructor.name) : 'the faculty'}) — they always move together, so this
                 un-verifies both documents (and any of your own approvals) until the issue is fixed and it's forwarded again.
               </p>
               <label className="form-label">What needs to be revised? <span className="text-red-500">*</span></label>
@@ -976,7 +1125,7 @@ export default function GradeApproval() {
               key={`${preview.cls.id}-${preview.type}`}
               src={`${previewDoc.path}/${preview.cls.id}?preview=1`}
               title="Document preview"
-              style={{ width: '100%', height: '65vh', border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
+              style={{ width: '100%', height: 'calc(90vh - 200px)', minHeight: 360, border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
             />
           )}
         </Modal>
@@ -985,12 +1134,44 @@ export default function GradeApproval() {
       {confirmReturn && (
         <ConfirmDialog
           title="Send back to Chairperson?"
-          message={`This un-verifies the ${previewDoc.label} for ${preview?.cls.subject?.code || 'this class'} and blocks approval until the Chairperson and instructor address it and forward it again. Reason: "${returnMessage.trim()}"`}
+          message={`This un-verifies the ${previewDoc.label} for ${preview?.cls.subject?.code || 'this class'} and blocks approval until the Chairperson and faculty address it and forward it again. Reason: "${returnMessage.trim()}"`}
           confirmText={returning ? 'Sending...' : 'Send Back'}
           variant="red"
           confirmDisabled={returning}
           onConfirm={async () => { setConfirmReturn(false); await handleReturnToChairperson(); }}
           onCancel={() => setConfirmReturn(false)}
+        />
+      )}
+
+      {/* Confirmation popup for the Send Back itself — the toast alone is
+          easy to miss, this is what actually tells Admin the action went
+          through, who was notified, and what reason was sent. */}
+      {returnSent && (
+        <Modal
+          title="Sent Back to Chairperson"
+          onClose={() => setReturnSent(null)}
+          footer={<button className="btn btn-navy" onClick={() => setReturnSent(null)}>Done</button>}
+        >
+          <div className="flex items-start gap-3 rounded-lg border border-green-200 bg-green-50 px-4 py-3 mb-3">
+            <Icons.Check className="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" />
+            <p className="text-sm text-green-800">
+              {returnSent.subjectLabel}'s Class Record and Grade Sheet were sent back to {returnSent.chairpersonCount} chairperson{returnSent.chairpersonCount !== 1 ? 's' : ''} for revision.
+              Both documents are un-verified again, and any of your own approvals on them were cleared — nothing moves forward until the Chairperson reviews this and forwards it again.
+            </p>
+          </div>
+          <label className="form-label">Reason sent</label>
+          <p className="text-sm text-gray-600 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">"{returnSent.reason}"</p>
+        </Modal>
+      )}
+
+      {releaseTarget && (
+        <ConfirmDialog
+          title="Release grades to students?"
+          message={`The grades of ${releaseTarget.subject?.code || 'this class'}${releaseTarget.section ? ` - Section ${releaseTarget.section}` : ''} (${releaseTarget.instructor?.name || 'Faculty'}) become visible to its students, who are notified. The faculty member is notified too and can then export the Class Record and Grade Sheet.`}
+          confirmText="Release"
+          variant="gold"
+          onConfirm={async () => { const cls = releaseTarget; setReleaseTarget(null); await handleRelease(cls); }}
+          onCancel={() => setReleaseTarget(null)}
         />
       )}
 
@@ -1009,7 +1190,7 @@ export default function GradeApproval() {
       {approveTarget && (
         <ConfirmDialog
           title={`Approve ${DOC[approveTarget.type].label}`}
-          message={`Approve the ${DOC[approveTarget.type].label} for ${approveTarget.cls.subject?.code || 'this class'}${approveTarget.cls.section ? ` - Section ${approveTarget.cls.section}` : ''}? Once both the Class Record and Grade Sheet are approved, every Passed grade clears and Faculty is notified they can export & release.`}
+          message={`Approve the ${DOC[approveTarget.type].label} for ${approveTarget.cls.subject?.code || 'this class'}${approveTarget.cls.section ? ` - Section ${approveTarget.cls.section}` : ''}? Once both the Class Record and Grade Sheet are approved, release the grades to the students here or from the dashboard.`}
           confirmText={approving ? 'Approving...' : 'Approve'}
           variant="green"
           confirmDisabled={approving}

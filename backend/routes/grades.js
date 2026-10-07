@@ -4,11 +4,13 @@ const {
   getGradesByClass,
   encodeGrades,
   submitGrades,
+  undoSubmission,
   markAsINC,
   undoINC,
   markAsDRP,
   undoDRP,
   getINCList,
+  getMyReleasedINCList,
   getStudentGrades,
   getStudentProspectus,
   getGradeDistribution,
@@ -30,12 +32,13 @@ router.post('/class/:classId/approve-document', authenticate, authorize('Admin')
 
 // ── Release to students — gated on Chairperson verification + Admin approval,
 // re-checked server-side in the controller regardless of who's calling.
-router.post('/class/:classId/release', authenticate, authorizeTeaching('Faculty', 'Admin', 'Chairperson'), releaseClassGrades);
+router.post('/class/:classId/release', authenticate, authorize('Admin'), releaseClassGrades);
 
 // ── Encode / submit grades ───────────────────────────────────────────────────
 // authorizeTeaching also admits a Chairperson flagged is_teaching (own classes only).
 router.post('/encode',  authenticate, authorizeTeaching('Faculty', 'Admin'), encodeGrades);
 router.post('/submit',  authenticate, authorizeTeaching('Faculty', 'Admin'), submitGrades);
+// Take back a submission the Chairperson hasn't started reviewing yet.
 
 // ── INC workflow ─────────────────────────────────────────────────────────────
 // Mark a student as INC
@@ -45,6 +48,9 @@ router.post('/inc',         authenticate, authorizeTeaching('Faculty', 'Admin'),
 router.post('/inc/undo',    authenticate, authorizeTeaching('Faculty', 'Admin'), undoINC);
 // List all INC grades (filtered by class or semester)
 router.get('/inc',          authenticate, authorize('Faculty', 'Admin', 'Chairperson'), getINCList);
+// The signed-in instructor's own still-INC students in already-released
+// classes (Faculty's follow-up list on My Classes / Dashboard)
+router.get('/inc/mine',     authenticate, authorizeTeaching('Faculty', 'Admin'), getMyReleasedINCList);
 
 // ── DRP workflow ─────────────────────────────────────────────────────────────
 // Mark a student as Dropped

@@ -73,6 +73,35 @@ const Grade = sequelize.define('Grade', {
     defaultValue: null,
   },
 
+  // INC is per period: a student can be incomplete in the Midterm, the
+  // Finals, or both, independently — marking one never marks the other.
+  // `status` stays 'INC' as the overall summary while either flag is set (no
+  // average can exist yet). Rows marked INC before these existed have neither
+  // flag set; they're read as "INC in whichever period is still missing scores".
+  inc_midterm: {
+    type: DataTypes.BOOLEAN,
+    allowNull: false,
+    defaultValue: false,
+  },
+  inc_finals: {
+    type: DataTypes.BOOLEAN,
+    allowNull: false,
+    defaultValue: false,
+  },
+  // Set when an INC wasn't completed by its compliance deadline: the grade
+  // became 5.0 (Failed) automatically (utils/incLapse.js), and the Remarks
+  // show the faculty's own INC reason (inc_remarks) instead of "FAILED".
+  inc_lapsed_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  // Which period the lapsed INC was in ('Midterm' / 'Finals' / 'Both') —
+  // the Class Record shows the reason only under that period.
+  inc_lapsed_period: {
+    type: DataTypes.STRING(10),
+    allowNull: true,
+  },
+
   submitted: {
     type: DataTypes.BOOLEAN,
     defaultValue: false,
@@ -110,7 +139,7 @@ const Grade = sequelize.define('Grade', {
     { unique: true, fields: ['class_id', 'student_id'] },
   ],
   hooks: {
-    beforeSave: (grade) => {
+    beforeSave: (grade, options) => {
       // ✅ FIX: Never auto-overwrite status if instructor explicitly set INC or DRP.
       // INC/DRP are manual decisions — the hook must not touch them.
       if (grade.status === 'INC' || grade.status === 'DRP') {
@@ -121,6 +150,20 @@ const Grade = sequelize.define('Grade', {
         return;
       }
 
+      // A component-driven class (gradeComponentController.js's saveScores /
+      // resolveCompletedINCs) already worked out the correct average/status
+      // itself before calling save() — combining BOTH periods' raw composites
+      // first and clamping once (see its own combinedGWA), not averaging the
+      // two already-clamped period GWAs the fallback below does. That naive
+      // (midterm+finals)/2 can read a tenth or more off whenever either raw
+      // composite converts to a GWA past the 1.0/5.0 clamp before ever being
+      // averaged. `skipAutoAverage` says the caller already set the right
+      // figures — leave them alone instead of overwriting them here. Only a
+      // manual-entry class (no components, an instructor types Midterm/Finals
+      // GWA straight in via gradeController.js) still needs this fallback —
+      // there's no raw composite behind those numbers to combine.
+      if (options && options.skipAutoAverage) return;
+
       // Auto-compute average and status only when both midterm and finals are
       // present. `!= null` (loose) on purpose — catches `undefined` too, not
       // just explicit `null`: a bare Grade.create()/findOrCreate() call whose
@@ -130,10 +173,17 @@ const Grade = sequelize.define('Grade', {
       if (grade.midterm != null && grade.finals != null) {
         const mid = parseFloat(grade.midterm);
         const fin = parseFloat(grade.finals);
-        const avg = Math.round(((mid + fin) / 2) * 100) / 100;
+        // GWA is 1 decimal (matches classRecordExcel.js's formatGrade
+        // convention, verified against the real official spreadsheet).
+        // Epsilon-corrected — same reason gradeComponentController.js's own
+        // combinedGWA/toGWA need it: a true x.5 can be stored as
+        // x.49999999999994 in binary float, silently rounding down.
+        const avg = Math.round(((mid + fin) / 2) * 10 + 1e-9) / 10;
 
         grade.average = avg;
-        grade.status = avg >= 1.0 && avg <= 3.0 ? 'Passed' : 'Failed';
+        // <=3.01, not 3.0 — matches the real official spreadsheet's own
+        // Remarks formula exactly.
+        grade.status = avg >= 1.0 && avg <= 3.01 ? 'Passed' : 'Failed';
       }
     },
   },

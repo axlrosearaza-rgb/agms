@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Avatar, Badge, ProgramBadge, RegularityBadge, Modal, LoadingSpinner } from './index';
+import { Avatar, Badge, ProgramBadge, Modal, LoadingSpinner, formatPersonName, Icons } from './index';
 import ProspectusTable from '../student/ProspectusTable';
 import { gradeService } from '../../services';
 import toast from 'react-hot-toast';
@@ -35,6 +35,7 @@ export default function StudentGradeRecordModal({ studentId, onClose }) {
 
   const student = data?.student;
   const summary = data?.summary;
+  const isPendingSetup = !student?.account_setup_at || data?.account_setup_pending;
 
   return (
     <Modal
@@ -47,25 +48,44 @@ export default function StudentGradeRecordModal({ studentId, onClose }) {
         <LoadingSpinner />
       ) : !data ? null : (
         <>
-          <div className="flex flex-wrap items-center justify-between gap-4 mb-5 pb-5 border-b border-gray-100">
-            <div className="flex items-center gap-3">
-              <Avatar letter={student.avatar || student.name?.[0]} className="bg-navy text-white" size="w-12 h-12 text-lg" />
+          <div className="flex flex-wrap items-center justify-between gap-4 mb-5 pb-5 border-b border-gray-100 dark:border-gray-800">
+            <div className="flex items-center gap-4">
+              <Avatar letter={student.avatar || student.name?.[0]} className="bg-navy text-white shadow-sm" size="w-14 h-14 text-xl" />
               <div>
-                <h3 className="text-base font-bold text-navy">{student.name}</h3>
-                <div className="flex items-center flex-wrap gap-2 mt-1">
-                  <span className="text-xs text-gray-500">{student.student_no}</span>
-                  {student.program && <ProgramBadge program={student.program} bs />}
-                  <RegularityBadge status={student.student_status} />
-                  {student.year_level && <Badge variant="blue">Year {student.year_level}{student.section ? ` - Sec ${student.section}` : ''}</Badge>}
+                <h3 className="text-lg font-bold text-navy dark:text-sky-300">{formatPersonName(student.name)}</h3>
+                <div className="flex items-center flex-wrap gap-2.5 mt-1 text-sm">
+                  <span className="text-gray-500 font-medium">{student.student_no}</span>
+                  <span className="text-gray-300 dark:text-gray-600">·</span>
+                  <span className="font-semibold text-gray-800 dark:text-gray-200">{student.program || '—'}</span>
+                  {student.year_level && (
+                    <>
+                      <span className="text-gray-300 dark:text-gray-600">·</span>
+                      <span className="font-medium text-blue-600 dark:text-blue-400">Year {student.year_level}{student.section ? ` - Sec ${student.section}` : ''}</span>
+                    </>
+                  )}
+                  {isPendingSetup && <Badge variant="yellow">Account Not Set Up</Badge>}
                 </div>
               </div>
             </div>
-            <div className="text-right flex-shrink-0">
-              <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Overall GWA</p>
-              <p className="text-2xl font-bold text-navy tabular-nums">{summary?.gwa ?? '—'}</p>
-              <p className="text-[11px] text-gray-400">{summary?.passed ?? 0} passed · {summary?.failed ?? 0} failed{summary?.inc ? ` · ${summary.inc} INC` : ''}</p>
+            <div className="text-right flex-shrink-0 bg-gray-50 dark:bg-gray-800/60 px-4 py-2.5 rounded-xl border border-gray-100 dark:border-gray-700/60">
+              <p className="text-[11px] uppercase tracking-wider text-gray-400 font-semibold">Overall GWA</p>
+              <p className="text-2xl font-bold text-navy dark:text-sky-300 tabular-nums">{isPendingSetup ? '—' : (summary?.gwa ?? '—')}</p>
+              {isPendingSetup ? (
+                <p className="text-xs text-amber-600 dark:text-amber-400 font-medium">Pending account setup</p>
+              ) : (
+                <p className="text-xs text-gray-500">{summary?.passed ?? 0} passed · {summary?.failed ?? 0} failed{summary?.inc ? ` · ${summary.inc} INC` : ''}</p>
+              )}
             </div>
           </div>
+
+          {isPendingSetup && (
+            <div className="mb-4 p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg text-xs text-amber-800 dark:text-amber-300 flex items-center gap-2">
+              <Icons.AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-600 dark:text-amber-400" />
+              <span>
+                <strong>Account setup pending:</strong> This student has not completed their account setup yet. Grades are recorded in the system and will automatically appear once the student completes their account setup.
+              </span>
+            </div>
+          )}
 
           <div className="max-h-[60vh] overflow-y-auto -mx-1 px-1">
             {/* Collapsible per Year (ProspectusTable's own built-in support

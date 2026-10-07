@@ -1,14 +1,16 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
-import { Icons, Avatar, Badge, StatCard, LoadingSpinner, FacultyProgramTags, CurrentSemesterTag, studentYearSectionsLabel, ProgramDot, programShortLabel, formatPersonName } from '../../components/common';
+import { Icons, Avatar, Badge, StatCard, LoadingSpinner, FacultyProgramTags, CurrentSemesterTag, studentYearSectionsLabel, ProgramDot, programShortLabel, formatPersonName, comparePeopleNames, SearchBar } from '../../components/common';
 import { GradeDistributionChart } from '../../components/charts/GradeCharts';
 import { GradeStatusChart, StudentsByYearChart } from '../../components/charts/AdminAnalyticsCharts';
-import { endorsementService, dashboardService, gradeService, userService } from '../../services';
+import { endorsementService, dashboardService, gradeService } from '../../services';
 import toast from 'react-hot-toast';
 import { usePageState } from '../../hooks/usePageState';
 import ArchivedActivitiesModal from '../../components/common/ArchivedActivitiesModal';
-import socket from '../../services/socket';
+import FacultyProgressRow from '../../components/common/FacultyProgressRow';
+import StudentGradeRecordModal from '../../components/common/StudentGradeRecordModal';
+import socket, { onGradesUpdated } from '../../services/socket';
 
 // Excluded from grouping (same as UserManagement.js / AdminDashboard.js) — GE
 // is a bonus tag every program's faculty can carry, not a program of its own.
@@ -45,90 +47,6 @@ const sortLeastDoneFirst = (a, b) => {
   return pctA - pctB; // least-done first — the ones needing a nudge surface at the top
 };
 
-// Clicking a row jumps to Grade Approval (grading-sheets) pre-filtered to
-// just this instructor's own classes — same search box that page's own
-// filter bar already exposes, just pre-filled via a query param instead of
-// making the chairperson retype the name there themselves.
-function FacultyProgressRow({ f }) {
-  const navigate = useNavigate();
-  const done = f.classes.filter((c) => c.sent).length;
-  const total = f.classes.length;
-  const complete = total > 0 && done === total;
-  return (
-    <div
-      className="flex items-center gap-3 p-2.5 rounded-lg hover:bg-gray-50 cursor-pointer transition-colors"
-      role="button"
-      tabIndex={0}
-      onClick={() => navigate(`/chairperson/grading-sheets?instructor=${encodeURIComponent(f.instructor.name || '')}`)}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          navigate(`/chairperson/grading-sheets?instructor=${encodeURIComponent(f.instructor.name || '')}`);
-        }
-      }}
-      title={`View ${f.instructor.name}'s classes in Grade Approval`}
-    >
-      <Avatar letter={f.instructor.avatar || f.instructor.name?.[0]} className="bg-purple-500 text-white flex-shrink-0" size="w-8 h-8 text-xs" />
-      <div className="flex-1 min-w-0">
-        <p className="text-sm font-medium truncate">{f.instructor.name}</p>
-        <div className="w-full h-1.5 bg-gray-100 rounded-full overflow-hidden mt-1">
-          <div
-            className={`h-full rounded-full ${complete ? 'bg-green-500' : 'bg-amber-400'}`}
-            style={{ width: `${total > 0 ? (done / total) * 100 : 0}%` }}
-          />
-        </div>
-      </div>
-      <Badge variant={complete ? 'green' : 'gray'} className="flex-shrink-0">
-        {complete && <Icons.Check className="w-3 h-3" />} {done}/{total}
-      </Badge>
-    </div>
-  );
-}
-
-// One CLASS's own row in Faculty Pending Review below (not one card per
-// faculty) — a faculty carrying both a sent and a still-pending class needs
-// to actually show up split between the Pending and Grades Sent groups, not
-// pinned entirely to whichever status happens to cover ALL of their classes.
-// Ordered Subject → Year → Section → Faculty name (compareClassEntries), so
-// within a status group everything reads by class first, faculty second.
-function ClassReviewRow({ c }) {
-  return (
-    <div className="flex items-center justify-between gap-4 border border-gray-100 rounded-xl p-4 hover:shadow-sm transition-shadow">
-      <div className="flex items-center gap-3 min-w-0">
-        <Avatar letter={c.instructor?.avatar || c.instructor?.name?.[0]} className="bg-purple-500 text-white flex-shrink-0" size="w-9 h-9 text-xs" />
-        <div className="min-w-0">
-          <p className="text-sm font-semibold text-navy truncate">
-            {c.subject_code}{c.year_level ? ` · Year ${c.year_level}` : ''}{c.section ? ` · Sec ${c.section}` : ''}
-          </p>
-          <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
-            <p className="text-xs text-gray-500 truncate">{c.instructor?.name}</p>
-            <FacultyProgramTags user={c.instructor} />
-          </div>
-        </div>
-      </div>
-      <div className="flex-shrink-0">
-        {c.sent ? (
-          <div className="flex gap-1.5">
-            <Badge variant="green">{c.passed} Passed</Badge>
-            <Badge variant="yellow">{c.inc} INC</Badge>
-            <Badge variant="gray">{c.dropped} Dropped</Badge>
-          </div>
-        ) : (
-          <span className="text-xs text-gray-400 whitespace-nowrap">{c.submitted_count}/{c.total_students} submitted</span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// Subject → Year → Section → Faculty name, in that order — matches how the
-// rest of this page (and GradingSheets.js) already reads a class.
-const compareClassEntries = (a, b) =>
-  String(a.subject_code ?? '').localeCompare(String(b.subject_code ?? '')) ||
-  (a.year_level ?? 0) - (b.year_level ?? 0) ||
-  String(a.section ?? '').localeCompare(String(b.section ?? '')) ||
-  String(a.instructor?.name ?? '').localeCompare(String(b.instructor?.name ?? ''));
-
 // "Sep 2, 2026 · 2:30 PM" — date AND time, so a Chairperson can tell exactly
 // when they verified or changed something, not just "a few hours ago."
 const formatDateTime = (date) => {
@@ -143,7 +61,6 @@ export default function ChairpersonDashboard() {
   const [data, setData] = useState(null);
   const [facultyReview, setFacultyReview] = useState([]);
   const [distribution, setDistribution] = useState(null);
-  const [pendingCount, setPendingCount] = useState(0);
   // Chairperson activity feed is department/program scoped — the log is
   // populated from the users inside the chairperson's program scope, so
   // the dashboard summarizes the same cross-user trace the department sees.
@@ -174,6 +91,9 @@ export default function ChairpersonDashboard() {
   // single "Year X · Sec Y" the rest of this list is keyed by elsewhere.
   const [irregYearFilter, setIrregYearFilter] = useState('');
   const [irregSectionFilter, setIrregSectionFilter] = useState('');
+  const [irregSearch, setIrregSearch] = useState('');
+  // A student's full prospectus with grades (Chairperson of their program can view it).
+  const [prospectusTarget, setProspectusTarget] = useState(null);
   // Starts collapsed — usePageState (not plain useState) so navigating away
   // and back within the session remembers whatever the Chairperson last
   // left it as, starting collapsed the very first time.
@@ -191,8 +111,7 @@ export default function ChairpersonDashboard() {
   // first opened, stale until a manual refresh or navigating away and back.
   useEffect(() => {
     const handler = () => loadData();
-    socket.on('gradesUpdated', handler);
-    return () => socket.off('gradesUpdated', handler);
+    return onGradesUpdated(handler);
   }, []);
 
   // 'gradesUpdated' above only reaches this page WHILE the socket is
@@ -211,21 +130,14 @@ export default function ChairpersonDashboard() {
 
   const loadData = async () => {
     try {
-      const [{ data: result }, { data: reviewResult }, { data: distResult }, { data: pendingResult }] = await Promise.all([
+      const [{ data: result }, { data: reviewResult }, { data: distResult }] = await Promise.all([
         endorsementService.getDepartmentStudents(),
         dashboardService.getChairpersonFacultyReview(),
         gradeService.getDistribution(),
-        // Same source the sidebar's own "Pending Registrations" badge uses —
-        // data?.summary?.pending (below) is a leftover from the old
-        // Endorsement workflow ("active students never endorsed/flagged"),
-        // which is always ~everyone now that Endorsements no longer exist in
-        // the UI. This is the real, actionable "nobody to verify" count.
-        userService.getPending(),
       ]);
       setData(result);
       setFacultyReview(reviewResult.faculty || []);
       setDistribution(distResult);
-      setPendingCount(pendingResult.users?.length || 0);
     } catch (err) {
       toast.error('Failed to load program data');
     } finally {
@@ -258,7 +170,8 @@ export default function ChairpersonDashboard() {
   const irregSectionOptions = [...new Set(irregularStudents.map((s) => s.section).filter(Boolean))].sort();
   const filteredIrregularStudents = irregularStudents.filter((s) =>
     (!irregYearFilter || String(s.year_level) === irregYearFilter) &&
-    (!irregSectionFilter || s.section === irregSectionFilter)
+    (!irregSectionFilter || s.section === irregSectionFilter) &&
+    (!irregSearch.trim() || s.name?.toLowerCase().includes(irregSearch.trim().toLowerCase()) || s.student_no?.includes(irregSearch.trim()))
   );
   const regularStudents = data?.students?.filter((s) => s.student_status !== 'Irregular') || [];
 
@@ -287,9 +200,8 @@ export default function ChairpersonDashboard() {
         <p className="text-sm text-gray-500 mt-0.5">Academic standing validation and endorsement</p>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
         <StatCard label="Program Students" value={data?.summary?.total || 0} icon={<Icons.Users />} iconBg="bg-blue-50 text-blue-500" />
-        <StatCard label="Pending Registrations" value={pendingCount} icon={<Icons.Clock />} iconBg="bg-amber-50 text-amber-500" />
         {/* Count-only tiles; the actual Irregular names live in the card
             below where there's room to list them without cramping a stat
             tile. Regular sits right beside it so the split (not just the
@@ -382,7 +294,7 @@ export default function ChairpersonDashboard() {
         >
           <div>
             <h3 className="text-base font-semibold text-navy">Faculty Submission Progress</h3>
-            <p className="text-xs text-gray-400 mt-0.5">Sections fully submitted, out of how many each instructor is teaching this semester.</p>
+            <p className="text-xs text-gray-400 mt-0.5">Sections fully submitted, out of how many each faculty is teaching this semester.</p>
           </div>
           {progressExpanded ? <Icons.ChevronUp className="w-4 h-4 text-gray-400 flex-shrink-0" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />}
         </button>
@@ -408,7 +320,7 @@ export default function ChairpersonDashboard() {
                           <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">{programShortLabel(program)}</h4>
                         </div>
                         <div className="space-y-1">
-                          {progList.slice().sort(sortLeastDoneFirst).map((f) => <FacultyProgressRow key={f.instructor.id} f={f} />)}
+                          {progList.slice().sort(sortLeastDoneFirst).map((f) => <FacultyProgressRow key={f.instructor.id} f={f} gradeApprovalPath="/chairperson/grading-sheets" />)}
                         </div>
                       </div>
                     ))}
@@ -419,7 +331,7 @@ export default function ChairpersonDashboard() {
                         <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Part Timer</h4>
                       </div>
                       <div className="space-y-1">
-                        {partTime.slice().sort(sortLeastDoneFirst).map((f) => <FacultyProgressRow key={f.instructor.id} f={f} />)}
+                        {partTime.slice().sort(sortLeastDoneFirst).map((f) => <FacultyProgressRow key={f.instructor.id} f={f} gradeApprovalPath="/chairperson/grading-sheets" />)}
                       </div>
                     </div>
                   )}
@@ -469,79 +381,6 @@ export default function ChairpersonDashboard() {
         )}
       </div>
 
-      {/* Faculty Pending Review */}
-      <div className="card mb-6">
-        <button
-          onClick={() => setPendingReviewExpanded((prev) => !prev)}
-          className="card-header w-full flex items-center justify-between gap-3 border-none bg-transparent cursor-pointer font-sans text-left"
-        >
-          <div>
-            <h3 className="text-base font-semibold text-navy">Faculty Pending Review</h3>
-            <p className="text-xs text-gray-400 mt-0.5">Grade submission status per class, sorted by subject, year, and section.</p>
-          </div>
-          {pendingReviewExpanded ? <Icons.ChevronUp className="w-4 h-4 text-gray-400 flex-shrink-0" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />}
-        </button>
-        {pendingReviewExpanded && (() => {
-          // Flattened to one row per CLASS (not one card per faculty) — a
-          // faculty with 2 classes, one sent and one not, needs their sent
-          // class to actually land in the Grades Sent group and their
-          // pending one in Pending, not have the whole faculty pinned to
-          // whichever status covers ALL their classes.
-          const classEntries = facultyReview.flatMap((f) => f.classes.map((c) => ({ ...c, instructor: f.instructor })));
-          const pendingClasses = classEntries.filter((c) => !c.sent).sort(compareClassEntries);
-          const sentClasses = classEntries.filter((c) => c.sent).sort(compareClassEntries);
-          return (
-        <div className="card-body space-y-3 max-h-[420px] overflow-y-auto">
-          {classEntries.length === 0 && (
-            <p className="text-center py-8 text-gray-400 text-sm">No active classes found for your program(s).</p>
-          )}
-          {classEntries.length > 0 && (
-              <>
-                {pendingClasses.length > 0 && (
-                  <div>
-                    <button
-                      onClick={() => setPendingGroupOpen((prev) => !prev)}
-                      className="w-full flex items-center justify-between mb-2 border-none bg-transparent cursor-pointer font-sans p-0"
-                    >
-                      <span className="flex items-center gap-1.5">
-                        <Icons.Clock className="w-3.5 h-3.5 text-amber-500" />
-                        <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Pending — {pendingClasses.length}</h4>
-                      </span>
-                      {pendingGroupOpen ? <Icons.ChevronUp className="w-3.5 h-3.5 text-gray-400" /> : <Icons.ChevronDown className="w-3.5 h-3.5 text-gray-400" />}
-                    </button>
-                    {pendingGroupOpen && (
-                      <div className="space-y-2">
-                        {pendingClasses.map((c) => <ClassReviewRow key={c.class_id} c={c} />)}
-                      </div>
-                    )}
-                  </div>
-                )}
-                {sentClasses.length > 0 && (
-                  <div className={pendingClasses.length > 0 ? 'mt-5' : ''}>
-                    <button
-                      onClick={() => setSentGroupOpen((prev) => !prev)}
-                      className="w-full flex items-center justify-between mb-2 border-none bg-transparent cursor-pointer font-sans p-0"
-                    >
-                      <span className="flex items-center gap-1.5">
-                        <Icons.Check className="w-3.5 h-3.5 text-green-500" />
-                        <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Grades Sent — {sentClasses.length}</h4>
-                      </span>
-                      {sentGroupOpen ? <Icons.ChevronUp className="w-3.5 h-3.5 text-gray-400" /> : <Icons.ChevronDown className="w-3.5 h-3.5 text-gray-400" />}
-                    </button>
-                    {sentGroupOpen && (
-                      <div className="space-y-2">
-                        {sentClasses.map((c) => <ClassReviewRow key={c.class_id} c={c} />)}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </>
-          )}
-        </div>
-          );
-        })()}
-      </div>
-
       {/* Irregular Students */}
       {irregularStudents.length > 0 && (
         <div className="card">
@@ -581,10 +420,13 @@ export default function ChairpersonDashboard() {
                 <option value="">All Sections</option>
                 {irregSectionOptions.map((sec) => <option key={sec} value={sec}>Section {sec}</option>)}
               </select>
-              {(irregYearFilter || irregSectionFilter) && (
+              <div className="flex-1 min-w-[200px] flex">
+                <SearchBar value={irregSearch} onChange={setIrregSearch} placeholder="Search name or student no..." />
+              </div>
+              {(irregYearFilter || irregSectionFilter || irregSearch) && (
                 <button
                   className="btn btn-outline text-xs py-1.5 px-2.5"
-                  onClick={() => { setIrregYearFilter(''); setIrregSectionFilter(''); }}
+                  onClick={() => { setIrregYearFilter(''); setIrregSectionFilter(''); setIrregSearch(''); }}
                 >
                   <Icons.X className="w-3 h-3" /> Clear
                 </button>
@@ -616,6 +458,9 @@ export default function ChairpersonDashboard() {
                     )}
                   </div>
                   <Badge variant="red" className="text-right whitespace-normal">{studentYearSectionsLabel(s)}</Badge>
+                  <button type="button" className="btn btn-outline btn-sm flex items-center gap-1 flex-shrink-0" onClick={() => setProspectusTarget(s)} title="View this student's prospectus with grades">
+                    <Icons.FileText className="w-3.5 h-3.5" /> Prospectus
+                  </button>
                 </div>
               ))}
             </div>
@@ -623,6 +468,8 @@ export default function ChairpersonDashboard() {
           )}
         </div>
       )}
+
+      {prospectusTarget && <StudentGradeRecordModal studentId={prospectusTarget.id} onClose={() => setProspectusTarget(null)} />}
 
       {showArchive && (
         <ArchivedActivitiesModal

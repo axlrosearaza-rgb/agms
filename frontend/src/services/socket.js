@@ -50,7 +50,28 @@ socket.on('disconnect', (reason) => {
 // the server instead of getting the same cached answer back. This module is
 // evaluated before any component attaches its own listeners, so socket.io
 // runs this one first.
-['gradesUpdated', 'notification:new', 'chat:message', 'chat:conversationUpdate', 'chat:messageUpdated', 'chat:messageDeleted']
+['gradesUpdated', 'semestersUpdated', 'notification:new', 'chat:message', 'chat:conversationUpdate', 'chat:messageUpdated', 'chat:messageDeleted']
   .forEach((event) => socket.on(event, () => api.clearCache()));
+
+// 'gradesUpdated' fans out to nine different pages, and each one answers it by
+// re-fetching data. Delivered raw, a burst of events (a class submitting, being
+// verified, forwarded, approved in quick succession) made every open page
+// re-fetch once PER event, all at the same instant across every signed-in
+// browser. This coalesces a burst into one notification per page, spread over
+// a couple of seconds by a random offset so thousands of browsers don't hit
+// the server in lockstep. Pages subscribe with onGradesUpdated(handler), which
+// returns the unsubscribe function (usable directly as an effect cleanup).
+const gradesListeners = new Set();
+let gradesTimer = null;
+socket.on('gradesUpdated', (payload) => {
+  clearTimeout(gradesTimer);
+  gradesTimer = setTimeout(() => {
+    gradesListeners.forEach((fn) => { try { fn(payload); } catch (err) { console.error(err); } });
+  }, 1000 + Math.random() * 2000);
+});
+export const onGradesUpdated = (fn) => {
+  gradesListeners.add(fn);
+  return () => { gradesListeners.delete(fn); };
+};
 
 export default socket;

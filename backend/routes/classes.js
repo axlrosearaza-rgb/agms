@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const { getClasses, getClassById, createClass, updateClass, archiveClass, deleteClass, enrollStudents, getInstructorClasses, getEligibleStudents, getPendingApprovalCount } = require('../controllers/classController');
+const { getClasses, getClassById, createClass, updateClass, archiveClass, enrollStudents, unenrollStudent, getSectionStudents, importClassList, getInstructorClasses, getEligibleStudents, getPendingApprovalCount } = require('../controllers/classController');
 const { authenticate, authorize } = require('../middleware/auth');
 const { authorizeTeaching } = require('../utils/teachingAuth');
 
@@ -12,6 +12,15 @@ router.get('/instructor/:instructorId', authorizeTeaching('Admin', 'Faculty'), g
 // Ahead of the /:id catch-all below — "pending-approval-count" would
 // otherwise be swallowed as an :id param and 404/500 against the DB.
 router.get('/pending-approval-count', authorize('Admin', 'Chairperson'), getPendingApprovalCount);
+// Students who said "No, not mine" about one of this instructor's classes —
+// the dashboard warning, until dismissed (utils/classDisputes.js).
+router.get('/disputes/mine', authorizeTeaching('Faculty'), async (req, res) => {
+  res.json({ disputes: await require('../utils/classDisputes').openDisputesFor(req.user.id) });
+});
+router.post('/disputes/:disputeId/dismiss', authorizeTeaching('Faculty'), async (req, res) => {
+  await require('../utils/classDisputes').dismissDispute(parseInt(req.params.disputeId, 10), req.user.id);
+  res.json({ message: 'Dismissed.' });
+});
 router.get('/:id', getClassById);
 router.post('/', authorizeTeaching('Admin', 'Faculty'), createClass);
 router.put('/:id', authorizeTeaching('Admin', 'Faculty'), updateClass);
@@ -22,8 +31,11 @@ router.put('/:id/archive', authorizeTeaching('Admin', 'Chairperson', 'Faculty'),
 // authorizeTeaching also admits a Chairperson flagged is_teaching — both are
 // restricted to their OWN classes only (enforced in the controller), same as
 // update/enroll above. Admin can still delete any class.
-router.delete('/:id', authorizeTeaching('Admin', 'Faculty'), deleteClass);
 router.post('/:id/enroll', authorizeTeaching('Admin', 'Faculty'), enrollStudents);
+router.delete('/:id/students/:studentId', authorizeTeaching('Admin', 'Faculty'), unenrollStudent);
+router.get('/:id/section-students', authorizeTeaching('Admin', 'Faculty'), getSectionStudents);
+// Faculty (or a teaching Chairperson) importing the class list of their own class.
+router.post('/:id/import-class-list', authorizeTeaching('Faculty'), importClassList);
 router.get('/:id/eligible-students', authorizeTeaching('Admin', 'Faculty'), getEligibleStudents);
 
 module.exports = router;

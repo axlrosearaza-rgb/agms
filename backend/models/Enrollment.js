@@ -17,6 +17,12 @@ const Enrollment = sequelize.define('Enrollment', {
     allowNull: false,
     references: { model: 'users', key: 'id' },
   },
+  // The class isn't the student's own Year + Section — the student is asked
+  // "Is this your class?" (utils/enrollmentChecks.js). Answered → one of the
+  // two dates below is set and needs_confirmation goes back to false.
+  needs_confirmation: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+  confirmed_at: { type: DataTypes.DATE, allowNull: true },
+  disputed_at: { type: DataTypes.DATE, allowNull: true },
 }, {
   tableName: 'enrollments',
   indexes: [

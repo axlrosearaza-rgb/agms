@@ -3,6 +3,7 @@ const { Op } = require('sequelize');
 const { logActivity } = require('../utils/activityLogger');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { notifyAllUsers } = require('./notificationController');
+const { invalidateTags } = require('../utils/responseCache');
 
 // The one real "this semester is over, archive everything in it" moment —
 // called from every path that can retire a semester: Admin explicitly
@@ -28,6 +29,10 @@ const { notifyAllUsers } = require('./notificationController');
 // — so archiving the Class transitively keeps everything under it out of
 // the active views too, without a second "archived" flag to keep in sync.
 const archiveEndedSemester = async (app, semester) => {
+  // Each adviser's Semester overview (My Advisory) for this semester is kept
+  // on record — saved first, while the sections still hold these students.
+  await require('../utils/advisoryOverview').archiveAdvisoryOverviews(semester.name);
+
   await Class.update(
     { status: 'Completed' },
     { where: { semester: semester.name, status: 'Active' } }
@@ -50,6 +55,30 @@ const endSemester = async (app, semester) => {
   semester.status = 'Completed';
   await semester.save();
   await archiveEndedSemester(app, semester);
+  // The semester is over — the system checks every student graded in it and
+  // promotes those who passed everything (year level / graduation after the
+  // 2nd Semester). Runs in the background; never blocks this request.
+  require('./promotionController').autoPromoteSemester(app, semester.name);
+};
+
+const YEAR_LABELS = ['Academic Year', 'School Year'];
+
+// A semester whose end date has already passed can't be made Active or
+// current again (utils/semesterAutoEnd.js ends those automatically) — the
+// Admin has to move the end date first.
+const { hasEnded, endPastSemesters } = require('../utils/semesterAutoEnd');
+const endedMessage = (endDate) => `This semester already ended on ${endDate}, so it can't be Active or current. Change the end date first if it is still running.`;
+
+// Every signed-in user shows semester labels ("A.Y."/"S.Y.", current term
+// pill, document headers), so any semester change is pushed to ALL of them
+// at once — their pages re-read the semester list live, no reload needed.
+// Rare admin-only event, so a plain broadcast is fine here.
+const emitSemestersUpdated = (app) => {
+  // Dashboards, class lists and user lists all depend on the current
+  // semester — drop every cached copy so the refreshed screens are fresh.
+  invalidateTags(['dashboard', 'classes', 'users']);
+  const io = app.get('io');
+  if (io) io.emit('semestersUpdated');
 };
 
 // GET /api/semesters
@@ -75,10 +104,13 @@ const getCurrentSemester = asyncHandler(async (req, res) => {
 
 // POST /api/semesters
 const createSemester = asyncHandler(async (req, res) => {
-  const { term, academic_year, start_date, end_date, is_current, status } = req.body;
+  const { term, academic_year, start_date, end_date, is_current, status, year_label, add_drop_start, add_drop_end } = req.body;
 
   if (!term || !academic_year) {
     return res.status(400).json({ message: 'Term and academic year are required.' });
+  }
+  if (year_label !== undefined && !YEAR_LABELS.includes(year_label)) {
+    return res.status(400).json({ message: 'Year label must be "Academic Year" or "School Year".' });
   }
 
   const name = `${term} ${academic_year}`;
@@ -86,6 +118,9 @@ const createSemester = asyncHandler(async (req, res) => {
   const existing = await Semester.findOne({ where: { name } });
   if (existing) {
     return res.status(409).json({ message: 'This semester already exists.' });
+  }
+  if (hasEnded(end_date) && (is_current || status === 'Active')) {
+    return res.status(400).json({ message: endedMessage(end_date) });
   }
 
   // If marking as current, unset all others — and whichever one WAS
@@ -101,8 +136,11 @@ const createSemester = asyncHandler(async (req, res) => {
     name,
     term,
     academic_year,
+    year_label: year_label || 'Academic Year',
     start_date: start_date || null,
     end_date: end_date || null,
+    add_drop_start: add_drop_start || null,
+    add_drop_end: add_drop_end || null,
     is_current: is_current || false,
     status: status || 'Upcoming',
   });
@@ -112,6 +150,8 @@ const createSemester = asyncHandler(async (req, res) => {
   if (supersededSemester) {
     await endSemester(req.app, supersededSemester);
   }
+  await endPastSemesters(req.app);
+  await semester.reload();
 
   // Every user — not just Admin/Chairperson — cares that a new term now
   // exists (Faculty and Students both plan around it), so this is one of the
@@ -125,6 +165,7 @@ const createSemester = asyncHandler(async (req, res) => {
     type: 'semester',
   });
 
+  emitSemestersUpdated(req.app);
   res.status(201).json({ message: 'Semester created successfully.', semester });
 });
 
@@ -133,20 +174,33 @@ const updateSemester = asyncHandler(async (req, res) => {
   const semester = await Semester.findByPk(req.params.id);
   if (!semester) return res.status(404).json({ message: 'Semester not found.' });
 
-  const { term, academic_year, start_date, end_date, is_current, status } = req.body;
+  const { term, academic_year, start_date, end_date, is_current, status, year_label, add_drop_start, add_drop_end } = req.body;
+  if (year_label !== undefined && !YEAR_LABELS.includes(year_label)) {
+    return res.status(400).json({ message: 'Year label must be "Academic Year" or "School Year".' });
+  }
   // Captured before any of the fields below get overwritten — the only way
   // to tell a genuine "ends here" transition (wasn't Completed, now is)
   // apart from a semester that was already Completed getting some unrelated
   // edit (a typo fix to its dates, say), which shouldn't re-archive/re-notify.
   const wasCompleted = semester.status === 'Completed';
 
+  const nextEnd = end_date !== undefined ? end_date : semester.end_date;
+  const nextStatus = status !== undefined ? status : semester.status;
+  const nextCurrent = is_current !== undefined ? !!is_current : semester.is_current;
+  if (hasEnded(nextEnd) && (nextStatus === 'Active' || nextCurrent)) {
+    return res.status(400).json({ message: endedMessage(nextEnd) });
+  }
+
   if (term !== undefined) semester.term = term;
   if (academic_year !== undefined) semester.academic_year = academic_year;
   if (term || academic_year) {
     semester.name = `${semester.term} ${semester.academic_year}`;
   }
+  if (year_label !== undefined) semester.year_label = year_label;
   if (start_date !== undefined) semester.start_date = start_date;
   if (end_date !== undefined) semester.end_date = end_date;
+  if (add_drop_start !== undefined) semester.add_drop_start = add_drop_start || null;
+  if (add_drop_end !== undefined) semester.add_drop_end = add_drop_end || null;
   if (status !== undefined) semester.status = status;
 
   // Whichever semester WAS current just got superseded — same "ends here"
@@ -171,28 +225,21 @@ const updateSemester = asyncHandler(async (req, res) => {
   // never mutated by this request).
   if (!wasCompleted && semester.status === 'Completed') await archiveEndedSemester(req.app, semester);
   if (supersededSemester) await endSemester(req.app, supersededSemester);
+  await endPastSemesters(req.app);
+  await semester.reload();
 
+  emitSemestersUpdated(req.app);
   res.json({ message: 'Semester updated successfully.', semester });
 });
 
-// DELETE /api/semesters/:id
-const deleteSemester = asyncHandler(async (req, res) => {
-  const semester = await Semester.findByPk(req.params.id);
-  if (!semester) return res.status(404).json({ message: 'Semester not found.' });
-
-  if (semester.is_current) {
-    return res.status(400).json({ message: 'Cannot delete the current semester.' });
-  }
-
-  await semester.destroy();
-  await logActivity(req.user.id, `deleted semester ${semester.name}`, 'Semester', semester.id);
-  res.json({ message: 'Semester deleted successfully.' });
-});
+// Semesters are never deleted — one is archived by marking it Completed
+// (updateSemester), which archives its classes too.
 
 // PUT /api/semesters/:id/set-current
 const setCurrentSemester = asyncHandler(async (req, res) => {
   const semester = await Semester.findByPk(req.params.id);
   if (!semester) return res.status(404).json({ message: 'Semester not found.' });
+  if (hasEnded(semester.end_date)) return res.status(400).json({ message: endedMessage(semester.end_date) });
 
   // Whichever semester WAS current just got superseded by this one — same
   // "ends here" moment createSemester/updateSemester's own is_current
@@ -208,7 +255,8 @@ const setCurrentSemester = asyncHandler(async (req, res) => {
 
   if (supersededSemester) await endSemester(req.app, supersededSemester);
 
+  emitSemestersUpdated(req.app);
   res.json({ message: `${semester.name} is now the current semester.`, semester });
 });
 
-module.exports = { getSemesters, getCurrentSemester, createSemester, updateSemester, deleteSemester, setCurrentSemester };
+module.exports = { getSemesters, getCurrentSemester, createSemester, updateSemester, setCurrentSemester, endSemester, emitSemestersUpdated };

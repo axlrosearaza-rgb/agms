@@ -13,10 +13,13 @@
 import PizZip from 'pizzip';
 import { saveAs } from 'file-saver';
 import toast from 'react-hot-toast';
-import { programShortLabel } from '../components/common';
+import { docxBlobToPdf } from './docxToPdf';
+import { programShortLabel, formatPersonName, formatPersonNameFirstLast } from '../components/common';
 import { gradeCellText, gradeCellColor, hrsOrDash, requisiteText, semesterSums } from '../components/student/ProspectusTable';
 
 const TEMPLATE_URL = '/templates/evaluation-of-grades-template.docx';
+
+const NAME_LINE_PLACEHOLDER = '<w:p><w:r><w:t>@@AGMS_NAME_LINE@@</w:t></w:r></w:p>';
 
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -142,7 +145,50 @@ function stripFollowingEmptyParagraphs(xml, fromIdx) {
   return { xml, idx };
 }
 
-export async function exportEvaluationOfGradesDocx({ student, years, chairperson }) {
+// Mirror of stripFollowingEmptyParagraphs, but walking BACKWARD from
+// `beforeIdx` (a paragraph's own start index) — removes whichever empty
+// paragraphs sit immediately before it. Same source-file leftovers, just on
+// the other side: a Year heading preceded by a pile of stray blank
+// paragraphs reads as a ragged half-empty gap above it instead of a clean
+// break. Returns the updated xml plus that paragraph's own new start index
+// (shifted left by however much was actually removed).
+function stripPrecedingEmptyParagraphs(xml, beforeIdx) {
+  let idx = beforeIdx;
+  for (;;) {
+    if (xml.slice(Math.max(0, idx - '</w:p>'.length), idx) !== '</w:p>') break;
+    const closeEnd = idx;
+    // Matches a real paragraph-open tag only ("<w:p " with attributes, or
+    // bare "<w:p>") — plain lastIndexOf('<w:p', ...) would also match
+    // "<w:pPr>"/"<w:pStyle>"/etc., since they share that same 4-char
+    // prefix, and walk the boundary into the middle of the wrong paragraph.
+    const openStart = Math.max(xml.lastIndexOf('<w:p ', closeEnd - 1), xml.lastIndexOf('<w:p>', closeEnd - 1));
+    if (openStart === -1) break;
+    const paraXml = xml.slice(openStart, closeEnd);
+    const hasVisibleText = /<w:t[^>]*>[^<]*\S[^<]*<\/w:t>/.test(paraXml);
+    if (hasVisibleText) break;
+    xml = xml.slice(0, openStart) + xml.slice(closeEnd);
+    idx = openStart;
+  }
+  return { xml, start: idx };
+}
+
+// Forces a real page break into a "SECOND YEAR" / "THIRD YEAR" / "FOURTH
+// YEAR" heading paragraph — the template itself is inconsistent about this:
+// some of these headings carry only a soft <w:br w:type="textWrapping"/>
+// (a plain line break, which does nothing to start a new page) and "FOURTH
+// YEAR" has no break at all, relying purely on the leftover blank
+// paragraphs stripPrecedingEmptyParagraphs cleans up above to accidentally
+// land it near the top of a new page. Every Year now starts its own
+// deliberate page instead of it being however much content the previous
+// Year's tables happened to fill.
+function forcePageBreakInHeading(paraXml) {
+  if (paraXml.includes('<w:br w:type="textWrapping"/>')) {
+    return paraXml.replace('<w:br w:type="textWrapping"/>', '<w:br w:type="page"/>');
+  }
+  return paraXml.replace(/(<\/w:rPr>)(<w:t)/, '$1<w:br w:type="page"/>$2');
+}
+
+export async function exportEvaluationOfGradesDocx({ student, years, chairperson, adviser, format = 'docx' }) {
   try {
     const templateBuf = await fetch(TEMPLATE_URL).then((r) => {
       if (!r.ok) throw new Error(`Template fetch failed: ${r.status}`);
@@ -150,6 +196,7 @@ export async function exportEvaluationOfGradesDocx({ student, years, chairperson
     });
     const zip = new PizZip(templateBuf);
     let docXml = zip.file('word/document.xml').asText();
+    let pdfNameTableXml = null;
 
     // ── Header on the first page only — the template's own SSU letterhead
     // is set as the "default" header, which Word repeats on every page. A
@@ -225,11 +272,27 @@ export async function exportEvaluationOfGradesDocx({ student, years, chairperson
         const marRight = pgMarMatch ? Number(pgMarMatch[0].match(/w:right="(\d+)"/)?.[1]) : 284;
         const rightTabPos = pageW - marLeft - marRight;
 
-        const nameLineXml =
-          `<w:p><w:pPr><w:tabs><w:tab w:val="right" w:leader="none" w:pos="${rightTabPos}"/></w:tabs>` +
+        // The PDF renderer doesn't honor right-aligned tab stops, so for a
+        // PDF the same line is a borderless two-cell table (name left, ID
+        // flush right) — identical on the page.
+        const noBorders = '<w:tblBorders><w:top w:val="none" w:sz="0" w:space="0"/><w:left w:val="none" w:sz="0" w:space="0"/><w:bottom w:val="none" w:sz="0" w:space="0"/><w:right w:val="none" w:sz="0" w:space="0"/><w:insideH w:val="none" w:sz="0" w:space="0"/><w:insideV w:val="none" w:sz="0" w:space="0"/></w:tblBorders>';
+        const tightP = (jc) => `<w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/><w:jc w:val="${jc}"/></w:pPr>`;
+        // A placeholder paragraph stands in until the end: the semester-table
+        // code below finds the template's own table as the FIRST <w:tbl>.
+        if (format === 'pdf') pdfNameTableXml = `<w:tbl><w:tblPr><w:tblW w:w="${rightTabPos}" w:type="dxa"/>${noBorders}<w:tblLayout w:type="fixed"/><w:tblCellMar><w:left w:w="0" w:type="dxa"/><w:right w:w="0" w:type="dxa"/></w:tblCellMar></w:tblPr>` +
+            `<w:tblGrid><w:gridCol w:w="${rightTabPos - 2400}"/><w:gridCol w:w="2400"/></w:tblGrid><w:tr>` +
+            `<w:tc><w:tcPr><w:tcW w:w="${rightTabPos - 2400}" w:type="dxa"/></w:tcPr><w:p>${tightP('left')}` +
+            `<w:r>${labelRunRPr}<w:t xml:space="preserve">NAME: </w:t></w:r>` +
+            `<w:r>${nameRunRPr}<w:t xml:space="preserve">${esc(formatPersonName(student.name).toUpperCase())}</w:t></w:r></w:p></w:tc>` +
+            `<w:tc><w:tcPr><w:tcW w:w="2400" w:type="dxa"/></w:tcPr><w:p>${tightP('right')}` +
+            `<w:r>${idRunRPr}<w:t xml:space="preserve">${esc(student.student_no || '')}</w:t></w:r></w:p></w:tc>` +
+            `</w:tr></w:tbl>`;
+        const nameLineXml = pdfNameTableXml
+          ? NAME_LINE_PLACEHOLDER
+          : `<w:p><w:pPr><w:tabs><w:tab w:val="right" w:leader="none" w:pos="${rightTabPos}"/></w:tabs>` +
           `<w:spacing w:line="240" w:lineRule="auto"/><w:ind w:left="5" w:firstLine="0"/><w:jc w:val="left"/></w:pPr>` +
           `<w:r>${labelRunRPr}<w:t xml:space="preserve">NAME: </w:t></w:r>` +
-          `<w:r>${nameRunRPr}<w:t xml:space="preserve">${esc((student.name || '').toUpperCase())}</w:t></w:r>` +
+          `<w:r>${nameRunRPr}<w:t xml:space="preserve">${esc(formatPersonName(student.name).toUpperCase())}</w:t></w:r>` +
           `<w:r>${idRunRPr}<w:tab/><w:t xml:space="preserve">${esc(student.student_no || '')}</w:t></w:r>` +
           `</w:p>`;
         const yearHeadingXml = `<w:p><w:pPr><w:jc w:val="center"/></w:pPr>${yearHeadingRuns}</w:p>`;
@@ -289,8 +352,10 @@ export async function exportEvaluationOfGradesDocx({ student, years, chairperson
         const cell = (children) => `<w:tc>${cellPr}<w:p>${tightPPr}${children}</w:p></w:tc>`;
         const run = (r, t) => (t ? `<w:r>${r}<w:t xml:space="preserve">${esc(t)}</w:t></w:r>` : '');
         const gapCell = '<w:tc><w:tcPr><w:tcW w:w="' + gapW + '" w:type="dxa"/></w:tcPr><w:p>' + tightPPr + '</w:p></w:tc>';
-        const chairpersonName = chairperson?.name ? chairperson.name.toUpperCase() : '';
+        const chairpersonName = chairperson?.name ? formatPersonNameFirstLast(chairperson.name).toUpperCase() : '';
         const chairpersonRole = `Chairperson${student.program ? `, ${programShortLabel(student.program)}` : ''}`;
+        // The student's adviser (assigned to their Program / Year / Section).
+        const adviserName = adviser?.name ? formatPersonNameFirstLast(adviser.name).toUpperCase() : '';
 
         // Evaluated By (left) / Noted By (right), side by side, with a
         // deliberate gap column between them and top/bottom cell padding on
@@ -303,7 +368,7 @@ export async function exportEvaluationOfGradesDocx({ student, years, chairperson
           `</w:tblBorders><w:tblLayout w:type="fixed"/></w:tblPr>` +
           `<w:tblGrid><w:gridCol w:w="${colW}"/><w:gridCol w:w="${gapW}"/><w:gridCol w:w="${colW}"/></w:tblGrid>` +
           `<w:tr>${cell(run(evaluatedByLabelRPr, 'Evaluated By:'))}${gapCell}${cell(run(notedByLabelRPr, 'Noted By:'))}</w:tr>` +
-          `<w:tr>${cell(run(blankLineRPr, '            '))}${gapCell}${cell(run(nameRPr, 'SWEET MERCY F. PACOLOR, DIT'))}</w:tr>` +
+          `<w:tr>${cell(adviserName ? run(nameRPr, adviserName) : run(blankLineRPr, '            '))}${gapCell}${cell(run(nameRPr, 'SWEET MERCY F. PACOLOR, DIT'))}</w:tr>` +
           `<w:tr>${cell(run(adviserRPr, 'Adviser'))}${gapCell}${cell(run(deanRPr, 'Dean, College of Arts and Sciences'))}</w:tr>` +
           `</w:tbl>`;
 
@@ -373,8 +438,31 @@ export async function exportEvaluationOfGradesDocx({ student, years, chairperson
       { key: '1st Semester', marker: 'FIRST SEMESTER' },
       { key: '2nd Semester', marker: 'SECOND SEMESTER' },
     ];
+    // Year 1 needs nothing here — it's already page 1, right under the
+    // NAME/ID line. Years 2-4 each get forced onto their own fresh page
+    // below, instead of landing wherever the previous Year's content
+    // happened to end.
+    const YEAR_MARKERS = { 2: 'SECOND YEAR', 3: 'THIRD YEAR', 4: 'FOURTH YEAR' };
     let cursor = 0;
     for (let yr = 1; yr <= 4; yr += 1) {
+      const yearMarker = YEAR_MARKERS[yr];
+      if (yearMarker) {
+        const yearPara = findParagraph(docXml, yearMarker, cursor);
+        if (!yearPara) {
+          console.warn(`Evaluation of Grades template: "${yearMarker}" heading not found — page break skipped.`);
+        } else {
+          const before = stripPrecedingEmptyParagraphs(docXml, yearPara.start);
+          docXml = before.xml;
+          const headingStart = before.start;
+          const headingLen = yearPara.end - yearPara.start;
+          const headingEnd = headingStart + headingLen;
+          const fixedHeadingXml = forcePageBreakInHeading(docXml.slice(headingStart, headingEnd));
+          docXml = docXml.slice(0, headingStart) + fixedHeadingXml + docXml.slice(headingEnd);
+          const after = stripFollowingEmptyParagraphs(docXml, headingStart + fixedHeadingXml.length);
+          docXml = after.xml;
+          cursor = after.idx;
+        }
+      }
       for (const { key, marker } of SEM_MARKERS) {
         const para = findParagraph(docXml, marker, cursor);
         if (!para) {
@@ -394,13 +482,16 @@ export async function exportEvaluationOfGradesDocx({ student, years, chairperson
       }
     }
 
+    if (pdfNameTableXml) docXml = docXml.replace(NAME_LINE_PLACEHOLDER, pdfNameTableXml);
     zip.file('word/document.xml', docXml);
 
     const blob = zip.generate({
       type: 'blob',
       mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     });
-    saveAs(blob, `${(student.student_no || student.name || 'Evaluation').replace(/\s+/g, '_')}_EvaluationOfGrades.docx`);
+    const baseName = `${(student.student_no || student.name || 'Evaluation').replace(/\s+/g, '_')}_EvaluationOfGrades`;
+    if (format === 'pdf') await docxBlobToPdf(blob, `${baseName}.pdf`);
+    else saveAs(blob, `${baseName}.docx`);
     toast.success('Exported the Evaluation of Grades!');
   } catch (err) {
     console.error('Failed to export Evaluation of Grades from template:', err);

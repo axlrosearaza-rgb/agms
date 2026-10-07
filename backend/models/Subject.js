@@ -46,6 +46,22 @@ const Subject = sequelize.define('Subject', {
     type: DataTypes.STRING(100),
     allowNull: false,
   },
+  // Which curriculum this subject belongs to, by the year it took effect
+  // ("2018", "2023", ...). "New" vs "Old" isn't stored — per program, the
+  // latest curriculum year is the New one and earlier years are Old, so
+  // adding a newer curriculum later retires the previous one automatically.
+  curriculum_year: {
+    type: DataTypes.STRING(20),
+    allowNull: true,
+  },
+  // 'Major' or 'Minor'. A student's main year level follows the MAJOR
+  // subjects they're taking (utils/mainYear.js) — minor subjects (GE, PE,
+  // electives outside the program) never change it.
+  subject_type: {
+    type: DataTypes.STRING(10),
+    allowNull: false,
+    defaultValue: 'Major',
+  },
   program: {
     type: DataTypes.STRING(150),
     allowNull: true,
@@ -78,6 +94,12 @@ const Subject = sequelize.define('Subject', {
   // yet just show "not set" until someone fills it in via the Subject form.
   grading_scheme: {
     type: DataTypes.JSONB,
+    allowNull: true,
+  },
+  // Subjects are never deleted — archived ones leave the Subjects list and
+  // the Create Class picker but stay on every record that already uses them.
+  archived_at: {
+    type: DataTypes.DATE,
     allowNull: true,
   },
 }, {

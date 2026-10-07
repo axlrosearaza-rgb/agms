@@ -24,8 +24,23 @@ const archiveStaleNotifications = async () => {
 // dropdown. unreadCount always reflects the ACTIVE (non-archived) list
 // regardless of which one was requested, since that's what the bell badge
 // itself is counting.
+// The sweep is a table-wide UPDATE. It used to run on EVERY notifications
+// request from every user — with thousands of people polling their bell that
+// was thousands of identical table scans a minute — but it's a global sweep
+// (not per-user), so once a minute is exactly as correct: a notification is
+// still archived within ~60s of its 24h window ending.
+let lastArchiveSweep = 0;
+let sweepInFlight = null;
+const archiveStaleNotificationsThrottled = () => {
+  if (sweepInFlight) return sweepInFlight;
+  if (Date.now() - lastArchiveSweep < 60 * 1000) return Promise.resolve();
+  lastArchiveSweep = Date.now();
+  sweepInFlight = archiveStaleNotifications().finally(() => { sweepInFlight = null; });
+  return sweepInFlight;
+};
+
 const getNotifications = asyncHandler(async (req, res) => {
-  await archiveStaleNotifications();
+  await archiveStaleNotificationsThrottled();
 
   const wantArchived = req.query.archived === 'true';
   const notifications = await Notification.findAll({

@@ -4,6 +4,7 @@ import { semesterService, classService } from '../../services';
 import { useAuth } from '../../context/AuthContext';
 import { usePageState } from '../../hooks/usePageState';
 import toast from 'react-hot-toast';
+import { onSemestersUpdated, yearLabelOf } from '../../utils/semesterLabels';
 
 const TERMS = ['First Semester', 'Second Semester', 'Summer'];
 
@@ -48,7 +49,9 @@ const currentAcademicYear = `${defaultYear}-${defaultYear + 1}`;
 // No `is_current` here anymore — "current" is now derived from status
 // (Active ⇒ current) at save time rather than a separate manual checkbox,
 // so there's nothing to default it to; see handleSave.
-const emptyForm = { term: 'First Semester', academic_year: currentAcademicYear, start_date: '', end_date: '', status: 'Upcoming' };
+const emptyForm = { term: 'First Semester', year_label: 'Academic Year', academic_year: currentAcademicYear, start_date: '', end_date: '', status: 'Upcoming' };
+// What this semester's year is called everywhere it's shown ("A.Y." / "S.Y.").
+const YEAR_LABELS = ['Academic Year', 'School Year'];
 
 export default function SemesterManagement() {
   const { user } = useAuth();
@@ -60,6 +63,12 @@ export default function SemesterManagement() {
   const [editSem, setEditSem] = useState(null);
   const [formData, setFormData] = useState({ ...emptyForm });
   const [saving, setSaving] = useState(false);
+  // "Other (type a year)..." — the generated dropdown only runs 8 years
+  // ahead of ACADEMIC_YEAR_START; this covers anything past that without
+  // opening the field up to free text (see academicYearOptions' own comment
+  // on why that broke string-matching elsewhere) — only the starting year is
+  // typed, the "YYYY-YYYY" shape itself is still always generated, never typed.
+  const [customYear, setCustomYear] = useState(false);
   // Shared confirm-warning for Delete/Set Current — same styled ConfirmDialog
   // pattern used elsewhere in the app, instead of the browser's own plain
   // window.confirm() popup.
@@ -106,10 +115,13 @@ export default function SemesterManagement() {
   }, []);
 
   useEffect(() => { loadSemesters(); }, [loadSemesters]);
+  // Another Admin's change (or this one's, from another tab) shows up live.
+  useEffect(() => onSemestersUpdated(loadSemesters), [loadSemesters]);
 
   const openCreate = () => {
     setEditSem(null);
     setFormData({ ...emptyForm });
+    setCustomYear(false);
     setShowModal(true);
   };
 
@@ -117,17 +129,23 @@ export default function SemesterManagement() {
     setEditSem(sem);
     setFormData({
       term: sem.term || 'First Semester',
+      year_label: sem.year_label || 'Academic Year',
       academic_year: sem.academic_year || '',
       start_date: sem.start_date || '',
       end_date: sem.end_date || '',
       status: sem.status || 'Upcoming',
     });
+    // Already outside the generated dropdown range — opens straight into
+    // the typed-year field instead of silently falling back to some other
+    // option, same reasoning as the union trick the dropdown itself used to
+    // rely on alone.
+    setCustomYear(!!sem.academic_year && !academicYearOptions.includes(sem.academic_year));
     setShowModal(true);
   };
 
   const handleSave = async () => {
     if (!formData.term || !formData.academic_year) {
-      toast.error('Term and academic year are required');
+      toast.error(`Term and ${formData.year_label.toLowerCase()} are required`);
       return;
     }
     // Nothing previously stopped an End Date sitting before the Start Date
@@ -169,23 +187,25 @@ export default function SemesterManagement() {
     }
   };
 
-  const handleDelete = (sem) => {
+  // Semesters are never deleted — archiving marks one Completed, which also
+  // archives its classes. Everything in it is kept.
+  const handleArchive = (sem) => {
     if (sem.is_current) {
-      toast.error('Cannot delete the current semester');
+      toast.error('The current semester can\'t be archived — set another semester as current first');
       return;
     }
     requestConfirm({
-      title: 'Delete Semester',
-      message: `Delete ${sem.name}? This cannot be undone.`,
-      confirmText: 'Delete',
-      variant: 'red',
+      title: 'Archive Semester',
+      message: `Archive ${sem.name}? It is marked Completed and its classes are archived. All of its classes, grades and records are kept.`,
+      confirmText: 'Archive',
+      variant: 'gold',
       action: async () => {
         try {
-          await semesterService.delete(sem.id);
-          toast.success('Semester deleted');
+          await semesterService.update(sem.id, { status: 'Completed' });
+          toast.success(`${sem.name} archived`);
           loadSemesters();
         } catch (err) {
-          toast.error(err.response?.data?.message || 'Failed to delete');
+          toast.error(err.response?.data?.message || 'Failed to archive');
         }
       },
     });
@@ -267,15 +287,16 @@ export default function SemesterManagement() {
         ) : <span className="text-xs text-gray-400">—</span>}
       </td>
       <td className="px-4 py-3.5">
-        <div className="flex gap-1.5">
+        <div className="flex gap-1.5 justify-end">
           {/* Everyone can look — View is read-only, not a management action,
               so it's not gated behind canManage the way Edit/Delete are. */}
           <button className="btn-icon" onClick={() => openView(s)} title="View classes & data"><Icons.Eye /></button>
           {canManage && (
             <>
               <button className="btn-icon" onClick={() => openEdit(s)} title="Edit"><Icons.Edit /></button>
-              {!s.is_current && (
-                <button className="btn-icon hover:!bg-red-50 hover:!text-red-500" onClick={() => handleDelete(s)} title="Delete"><Icons.Trash /></button>
+              {/* Archive instead of delete — a Completed semester already is one. */}
+              {!s.is_current && s.status !== 'Completed' && (
+                <button className="btn-icon hover:!bg-amber-50 hover:!text-amber-600" onClick={() => handleArchive(s)} title="Archive"><Icons.Archive /></button>
               )}
             </>
           )}
@@ -296,6 +317,9 @@ export default function SemesterManagement() {
       const yearTotal = Object.values(terms).reduce((s, arr) => s + arr.length, 0);
       const yearKey = `${idPrefix}|${year}`;
       const yearOpen = !!openGroups[yearKey];
+      // Named after its own semesters' label — "School Year 2026-2027" when
+      // they're set to School Year (the first one decides if they're mixed).
+      const yearHeading = yearLabelOf(Object.values(terms)[0]?.[0]);
       return (
         <div key={year} className="border-b border-gray-100 last:border-0">
           <button
@@ -303,7 +327,7 @@ export default function SemesterManagement() {
             className="w-full px-4 py-2.5 flex items-center justify-between border-none cursor-pointer font-sans bg-gray-50 hover:bg-gray-100 transition-colors"
           >
             <div className="flex items-center gap-2">
-              <span className="text-sm font-bold text-navy">Academic Year {year}</span>
+              <span className="text-sm font-bold text-navy">{yearHeading} {year}</span>
               <span className="text-xs text-gray-400">{yearTotal} semester{yearTotal !== 1 ? 's' : ''}</span>
             </div>
             {yearOpen ? <Icons.ChevronUp className="w-3.5 h-3.5 text-gray-500" /> : <Icons.ChevronDown className="w-3.5 h-3.5 text-gray-500" />}
@@ -324,13 +348,24 @@ export default function SemesterManagement() {
                 </button>
                 {termOpen && (
                   <div className="overflow-x-auto">
-                    <table className="w-full">
+                    {/* table-fixed + explicit column widths — plain "auto"
+                        layout let short cell content (a date, a one-word
+                        badge) shrink each column to its own content width
+                        and dump all the leftover w-full space as uneven gaps
+                        between them instead of it going somewhere sensible. */}
+                    <table className="w-full table-fixed min-w-[640px]">
+                      <colgroup>
+                        <col className="w-[30%]" />
+                        <col className="w-[20%]" />
+                        <col className="w-[22%]" />
+                        <col className="w-[28%]" />
+                      </colgroup>
                       <thead>
                         <tr className="bg-gray-50 text-gray-500">
                           <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Duration</th>
                           <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Status</th>
                           <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Current</th>
-                          <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Actions</th>
+                          <th className="text-right px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Actions</th>
                         </tr>
                       </thead>
                       <tbody>{termSemesters.map(renderRow)}</tbody>
@@ -351,7 +386,7 @@ export default function SemesterManagement() {
         <div>
           <h2 className="text-lg font-bold text-navy">Semester Management</h2>
           <p className="text-[13px] text-gray-500">
-            {canManage ? 'Manage academic semesters and set the current term' : 'Read-only — only the Administrator manages semesters.'}
+            {canManage ? 'Manage semesters and set the current term' : 'Read-only — only the Administrator manages semesters.'}
           </p>
         </div>
         {canManage && <button className="btn btn-gold" onClick={openCreate}><Icons.Plus /> Add Semester</button>}
@@ -425,24 +460,78 @@ export default function SemesterManagement() {
                   {TERMS.map(t => <option key={t}>{t}</option>)}
                 </select>
               </div>
+              {/* What the year is called for this semester — shown as "A.Y."
+                  or "S.Y." for every user (dashboards, Class Record, Grade
+                  Sheet, exports) the moment it's saved. */}
               <div>
-                <label className="form-label">Academic Year <span className="text-red-500">*</span></label>
-                <select
-                  className="form-select"
-                  value={formData.academic_year}
-                  onChange={(e) => setFormData({ ...formData, academic_year: e.target.value })}
-                >
-                  <option value="" disabled>Select academic year...</option>
-                  {/* A semester already saved under a year outside the
-                      generated range (an old data-entry typo, or just one
-                      further back than the usual window) still gets its own
-                      option here — editing it should never silently wipe out
-                      what it actually says just because the dropdown's own
-                      default range doesn't happen to cover it. */}
-                  {[...new Set([...(formData.academic_year ? [formData.academic_year] : []), ...academicYearOptions])].map((y) => (
-                    <option key={y} value={y}>{y}</option>
-                  ))}
+                <label className="form-label">Year Type <span className="text-red-500">*</span></label>
+                <select className="form-select" value={formData.year_label} onChange={(e) => setFormData({ ...formData, year_label: e.target.value })}>
+                  {YEAR_LABELS.map((l) => <option key={l}>{l}</option>)}
                 </select>
+              </div>
+              <div className="col-span-2">
+                <label className="form-label">{formData.year_label} <span className="text-red-500">*</span></label>
+                {!customYear ? (
+                  <select
+                    className="form-select"
+                    value={formData.academic_year}
+                    onChange={(e) => {
+                      if (e.target.value === '__custom__') {
+                        setCustomYear(true);
+                        return;
+                      }
+                      setFormData({ ...formData, academic_year: e.target.value });
+                    }}
+                  >
+                    <option value="" disabled>Select {formData.year_label.toLowerCase()}...</option>
+                    {/* A semester already saved under a year outside the
+                        generated range (an old data-entry typo, or just one
+                        further back than the usual window) still gets its own
+                        option here — editing it should never silently wipe out
+                        what it actually says just because the dropdown's own
+                        default range doesn't happen to cover it. */}
+                    {[...new Set([...(formData.academic_year ? [formData.academic_year] : []), ...academicYearOptions])].map((y) => (
+                      <option key={y} value={y}>{y}</option>
+                    ))}
+                    <option value="__custom__">Other (type a year)...</option>
+                  </select>
+                ) : (
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        className="form-input"
+                        placeholder="e.g. 2043"
+                        value={formData.academic_year ? formData.academic_year.split('-')[0] : ''}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          const start = parseInt(raw, 10);
+                          setFormData({
+                            ...formData,
+                            // The "YYYY-YYYY" shape is still always generated,
+                            // never typed directly — only the starting year is
+                            // free text, so nothing downstream that string-matches
+                            // on academic_year's format can break.
+                            academic_year: raw && !Number.isNaN(start) ? `${start}-${start + 1}` : '',
+                          });
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="text-sm text-primary-600 hover:underline whitespace-nowrap"
+                        onClick={() => {
+                          setCustomYear(false);
+                          setFormData({ ...formData, academic_year: currentAcademicYear });
+                        }}
+                      >
+                        Back to list
+                      </button>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Enter just the starting year — the ending year fills in automatically.
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
             <div className="grid grid-cols-2 gap-4">

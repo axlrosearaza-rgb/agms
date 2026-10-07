@@ -9,7 +9,8 @@
 import ExcelJS from 'exceljs';
 import { saveAs } from 'file-saver';
 import toast from 'react-hot-toast';
-import { programShortLabel } from '../components/common';
+import { programShortLabel, comparePeopleNames, formatPersonNameFirstLast, formatPersonNameCapsSurname } from '../components/common';
+import { getSemesterFor, yearAbbrOf } from './semesterLabels';
 
 // ── Grading formula (mirrors backend/controllers/gradeComponentController.js
 // exactly) ───────────────────────────────────────────────────────────────────
@@ -35,8 +36,19 @@ export const getRateFormula = (classData) => RATE_FORMULAS[classData?.rate_formu
 // the value typed in for an item like this already IS the Rate (a Faculty
 // member with no raw score to compute one from), just clamped to the same
 // range the formula below would otherwise produce.
-export const itemRate = (score, maxScore, isRateDirect, formula = RATE_FORMULAS['50_45']) => {
-  if (score === null || score === undefined || score === '') return null;
+// `zeroFillMissing` — opt-in, used ONLY for an already-INC-flagged period's
+// own PREVIEW figures (Composite/Half/GWA), never for a normal ungraded
+// row and never fed back into anything that gets saved. A student still
+// missing this item's score reads as a literal 0 instead of null, so the
+// preview shows a real (if provisional) number — Rate then floors at
+// formula.base (50 for the default 50_45 formula) exactly like a genuine 0
+// score would, instead of leaving the whole period blank until every item
+// is in.
+export const itemRate = (score, maxScore, isRateDirect, formula = RATE_FORMULAS['50_45'], zeroFillMissing = false) => {
+  if (score === null || score === undefined || score === '') {
+    if (!zeroFillMissing) return null;
+    score = 0;
+  }
   const s = parseFloat(score);
   if (isNaN(s)) return null;
   if (isRateDirect) return Math.min(formula.base + formula.range, Math.max(formula.base, s));
@@ -44,30 +56,31 @@ export const itemRate = (score, maxScore, isRateDirect, formula = RATE_FORMULAS[
   return (s / m) * formula.range + formula.base;
 };
 
-export const componentAverage = (comp, studentId, componentScores, formula = RATE_FORMULAS['50_45']) => {
+export const componentAverage = (comp, studentId, componentScores, formula = RATE_FORMULAS['50_45'], zeroFillMissing = false) => {
   const items = comp.items || [];
   if (items.length === 0) return null;
-  const rates = items.map((item) => itemRate(componentScores[studentId]?.[item.id], item.max_score, item.is_rate_direct, formula));
+  const rates = items.map((item) => itemRate(componentScores[studentId]?.[item.id], item.max_score, item.is_rate_direct, formula, zeroFillMissing));
   if (rates.some((r) => r === null)) return null;
   // Exact average — no rounding.
   return rates.reduce((s, r) => s + r, 0) / rates.length;
 };
 
-// Exact — composite is never floored/truncated first, so this reads the
-// real computed composite, not one already thrown off by an earlier
-// rounding step.
-const compositeToGWA = (composite) => {
-  const gwa = 10.5 - 0.1 * composite;
+// Grade equivalent of a WHOLE-NUMBER term/overall grade: 95+ → 1.0,
+// 94 → 1.1, … 75 → 3.0, 74 → 3.1, … 55 and below → 5.0. Written as
+// (105 − grade) / 10 rather than 10.5 − 0.1 × grade so a whole grade gives
+// an exact one-decimal equivalent (79 → 2.6, not 2.5999999999999996).
+const compositeToGWA = (grade) => {
+  const gwa = (105 - grade) / 10;
   return Math.min(5.0, Math.max(1.0, gwa));
 };
 
 // Raw weighted composite for a period (0–100ish scale) — the real SSU Class
 // Record's own "MIDTERM GRADE" / "FINAL TERM GRADE" figure, before it's
 // converted to the 1.0–5.0 GWA scale.
-export const periodComposite = (comps, studentId, componentScores, formula = RATE_FORMULAS['50_45']) => {
+export const periodComposite = (comps, studentId, componentScores, formula = RATE_FORMULAS['50_45'], zeroFillMissing = false) => {
   let composite = 0;
   for (const comp of comps) {
-    const avg = componentAverage(comp, studentId, componentScores, formula);
+    const avg = componentAverage(comp, studentId, componentScores, formula, zeroFillMissing);
     if (avg === null) return null;
     // Exact weighted contribution — no rounding.
     composite += avg * (parseFloat(comp.weight) / 100);
@@ -76,23 +89,121 @@ export const periodComposite = (comps, studentId, componentScores, formula = RAT
 };
 
 export const periodGWA = (comps, studentId, componentScores, formula = RATE_FORMULAS['50_45']) => {
-  const composite = periodComposite(comps, studentId, componentScores, formula);
-  if (composite === null) return null;
-  // GWA is reported to 1 decimal place school-wide (per the Registrar's own
-  // instruction) — rounded here at the source, not just truncated at
-  // display time, so every consumer (Class Record grid, Grade Sheet,
-  // Excel/.docx exports, the student's own Evaluation of Grades) reads the
-  // exact same number instead of each formatting a slightly different
-  // raw value down to 1 decimal on its own.
-  return Math.round(compositeToGWA(composite) * 10) / 10;
+  return gwaFromComposite(periodComposite(comps, studentId, componentScores, formula));
+};
+
+// A composite rounded off to a WHOLE number (half up: 79.5 → 80) — the
+// Midterm/Final Term Grade and Overall Grade exactly as the Class Record
+// shows them. The composite itself is computed at full precision; this is
+// the one place it gets rounded, and every grade equivalent is looked up
+// from this whole number, so the equivalent always matches the grade shown
+// right beside it. Epsilon only cleans up floating-point noise (a true
+// 79.5 stored as 79.49999999999999).
+export const roundedComposite = (composite) => Math.round(composite + 1e-9);
+
+// Grade equivalent (1.0–5.0) of a composite — looked up from its
+// whole-number rounded value (see roundedComposite above).
+export const gwaFromComposite = (composite) => {
+  if (composite === null || composite === undefined) return null;
+  return compositeToGWA(roundedComposite(composite));
+};
+
+// Whole-number display of a Term/Overall Grade ("80", never "79.5").
+export const formatComposite = (composite) => {
+  const n = parseFloat(composite);
+  if (composite === null || composite === undefined || composite === '' || Number.isNaN(n)) return '';
+  return String(roundedComposite(n));
+};
+
+// "Overall 1/2" — half of the TRUE (unrounded) Term Grade, e.g. 79.26 →
+// 39.63. Kept exact so Midterm's half + Finals' half is the true Overall
+// Grade; only its display is rounded, to a whole number (40).
+export const halfComposite = (composite) => {
+  if (composite === null || composite === undefined) return null;
+  return composite / 2;
+};
+
+// Overall Grade — Midterm's Overall 1/2 + Finals' Overall 1/2, i.e. the
+// TRUE average of both periods' exact composites. Rounded only once, at the
+// very end (formatComposite/gwaFromComposite → a whole Overall Grade), so
+// it isn't thrown off by first rounding each Term Grade and then rounding
+// again (79.5 and 79.4 → 79.45 → 79, not 80 + 79 → 79.5 → 80).
+export const overallComposite = (midComposite, finComposite) => {
+  if (midComposite === null || midComposite === undefined || finComposite === null || finComposite === undefined) return null;
+  return (midComposite + finComposite) / 2;
+};
+
+// The course's Final Grade = the simple average of the Midterm Grade and the
+// Finals Grade (each already a 1-decimal period GWA) — the exact figure the
+// Grade Sheet's "Final Grade" column shows (Grade.average, backend Grade
+// model's beforeSave hook), so the Class Record's own Final Grade and
+// Remarks read the same number instead of a Finals-only GWA. Used only as a
+// fallback when there's no live composite to combine (see its callers).
+export const finalGradeAverage = (midtermGwa, finalsGwa) => {
+  if (midtermGwa === null || midtermGwa === undefined || finalsGwa === null || finalsGwa === undefined) return null;
+  // Epsilon-corrected, same reason as gwaFromComposite/periodGWA above.
+  return Math.round(((midtermGwa + finalsGwa) / 2) * 10 + 1e-9) / 10;
+};
+
+// One-decimal display for a grade, rounding half UP (1.45 → 1.5). Plain
+// toFixed(1) rounds off the float's binary error instead (1.45 → "1.4"),
+// which is what made the Grade Sheet and the Class Record disagree by 0.1
+// on exactly those boundary averages. Matches the real official spreadsheet
+// exactly — its own GWA cells are all formatted "0.0" — so every surface
+// here (Class Record grid, Excel export, Grade Sheet screen and .docx) uses
+// this for Midterm/Final Grade. (Term/Overall Grade composites use
+// formatComposite instead, which rounds to a whole number.)
+export const formatGrade = (value) => {
+  const n = parseFloat(value);
+  if (value === null || value === undefined || value === '' || Number.isNaN(n)) return '';
+  return (Math.round(n * 10 + 1e-9) / 10).toFixed(1);
+};
+
+// Same epsilon-corrected rounding as formatGrade, but for a value that
+// ISN'T always a grade (the Weighted/Ave×weight% column, or Overall 1/2) —
+// shows a decimal only when there actually is one; a whole number (e.g.
+// 20.0) shows as plain "20", the same trailing-.0 trim weight% already gets
+// (parseFloat(c.weight) — a real 25% never showed as "25.0%"). `maxDecimals`
+// defaults to 1 (Weighted's own precision); Overall 1/2 passes 2, since
+// halving a 1-decimal composite (e.g. 83.3 ÷ 2 = 41.65) can genuinely need
+// a second decimal place to stay exact — JS's own number→string conversion
+// already drops any trailing zero on top (41.50 prints as "41.5"), so no
+// extra trimming logic is needed for the 2-decimal case either.
+export const fmtTrimmed = (value, maxDecimals = 1) => {
+  const n = parseFloat(value);
+  if (value === null || value === undefined || value === '' || Number.isNaN(n)) return '';
+  const factor = 10 ** maxDecimals;
+  const rounded = Math.round(n * factor + 1e-9) / factor;
+  return String(rounded);
 };
 
 // ── Remarks (mirrors pages/common/GradingSheet.js exactly) ─────────────────
+// INC intentionally has NO Remarks verdict — there's nothing to judge
+// Passed/Failed on while a period is still incomplete, and every consumer
+// already marks the row INC its own way (a dedicated badge, dimmed styling,
+// a blank Final Grade cell) — repeating "INC" here read as a verdict the
+// row doesn't actually have yet. Falls through to the same blank '' every
+// other not-yet-decided status gets.
+// A student whose INC wasn't completed by its deadline (grade.inc_lapsed_at,
+// now 5.0 / Failed): the Remarks show the reason the faculty typed when
+// marking the INC instead of "FAILED".
+export const isLapsedInc = (grade) => !!(grade && grade.inc_lapsed_at && String(grade.status || '').toLowerCase() === 'failed');
+// Remarks for a student marked INC — still INC, or lapsed to 5.0 — are the
+// reason the faculty typed when marking them (Reason / Remarks), not "INC".
+export const remarksText = (status, grade) => {
+  const s = String(status || '').trim().toLowerCase();
+  const isInc = s === 'inc' || s === 'incomplete';
+  if (grade && grade.inc_remarks && String(grade.inc_remarks).trim() && (isInc || isLapsedInc(grade))) return String(grade.inc_remarks).trim();
+  return remarksFor(status);
+};
+
 export const remarksFor = (status) => {
-  if (status === 'Passed') return 'PASSED';
-  if (status === 'Failed') return 'FAILED';
-  if (status === 'INC') return 'INC';
-  if (status === 'DRP') return 'DROP';
+  if (!status) return '';
+  const s = String(status).trim().toLowerCase();
+  if (s === 'inc' || s === 'incomplete') return 'INC';
+  if (s === 'passed' || s === 'pass') return 'PASSED';
+  if (s === 'failed' || s === 'fail') return 'FAILED';
+  if (s === 'drp' || s === 'drop' || s === 'dropped') return 'DROP';
   return '';
 };
 
@@ -135,11 +246,13 @@ export const dropCellStyle = () => ({ background: '#D64545', color: '#FFFFFF' })
 // app tracks DRP as its own status, styled red so a dropped student reads
 // as unmistakably different from everyone else at a glance.
 export const remarksStyle = (status) => {
-  if (status === 'Passed') return { bg: '#C6EFCE', color: '#006100' };
-  if (status === 'Failed') return { bg: '#FFC7CE', color: '#9C0006' };
-  if (status === 'INC') return { bg: '#FFEB9C', color: '#9C5700' };
-  if (status === 'DRP') return { bg: '#D64545', color: '#FFFFFF' };
-  return { bg: '#F5F5F5', color: '#999' };
+  if (!status) return { bg: '#FFFFFF', color: '#999' };
+  const s = String(status).trim().toLowerCase();
+  if (s === 'passed' || s === 'pass') return { bg: '#C6EFCE', color: '#006100' };
+  if (s === 'failed' || s === 'fail') return { bg: '#FFC7CE', color: '#9C0006' };
+  if (s === 'drp' || s === 'drop' || s === 'dropped') return { bg: '#D64545', color: '#FFFFFF' };
+  if (s === 'inc' || s === 'incomplete') return { bg: '#FFF2CC', color: '#B25900' };
+  return { bg: '#FFFFFF', color: '#999' };
 };
 
 // CSS-hex palette — shared by the live editable Class Record grid
@@ -281,7 +394,7 @@ export const buildComponentsFromScheme = (scheme) => {
 // own semester line reads just "First Semester", no year). Strips the same
 // year substring the "SY ..." line already displays, so the two lines stay
 // complementary instead of redundant.
-const stripYearFromSemester = (semester, academicYear) => {
+export const stripYearFromSemester = (semester, academicYear) => {
   const raw = semester || '';
   const withoutYear = academicYear ? raw.replace(academicYear, '') : raw.replace(/\d{4}-\d{4}/, '');
   return withoutYear.replace(/,?\s*$/, '').trim();
@@ -309,9 +422,9 @@ const buildPeriodColumns = (comps) => {
   comps.forEach((c) => {
     (c.items || []).forEach((item) => {
       // A direct-rate item has no raw score at all — just the one Rate
-      // column, not the usual Score+Rate pair.
+      // column. When show_rate is false, Rate is omitted.
       if (!item.is_rate_direct) cols.push({ kind: 'score', comp: c, item });
-      cols.push({ kind: 'rate', comp: c, item });
+      if (item.show_rate !== false) cols.push({ kind: 'rate', comp: c, item });
     });
     if (c.show_ave !== false) cols.push({ kind: 'ave', comp: c });
     cols.push({ kind: 'weighted', comp: c });
@@ -353,11 +466,13 @@ const FINAL_GWA_HEADER = 'FFFFC000';
 // looking washed out next to them.
 const REMARKS_HEADER = 'FF548235';
 const remarksExcelStyle = (status) => {
-  if (status === 'Passed') return { bg: 'FFC6EFCE', font: 'FF006100' };
-  if (status === 'Failed') return { bg: 'FFFFC7CE', font: 'FF9C0006' };
-  if (status === 'INC') return { bg: 'FFFFEB9C', font: 'FF9C5700' };
-  if (status === 'DRP') return { bg: 'FFD64545', font: 'FFFFFFFF' };
-  return { bg: 'FFF5F5F5', font: 'FF999999' };
+  if (!status) return { bg: 'FFFFFFFF', font: 'FF000000' };
+  const s = String(status).trim().toLowerCase();
+  if (s === 'passed' || s === 'pass') return { bg: 'FFC6EFCE', font: 'FF006100' };
+  if (s === 'failed' || s === 'fail') return { bg: 'FFFFC7CE', font: 'FF9C0006' };
+  if (s === 'drp' || s === 'drop' || s === 'dropped') return { bg: 'FFD64545', font: 'FFFFFFFF' };
+  if (s === 'inc' || s === 'incomplete') return { bg: 'FFFFF2CC', font: 'FFB25900' };
+  return { bg: 'FFFFFFFF', font: 'FF000000' };
 };
 
 // Writes one full period block (Midterm or Finals) — component groups in
@@ -402,8 +517,8 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
   comps.forEach((c, ci) => {
     const color = EXPORT_GROUP_COLORS[componentColorIndex(c.name, ci, compNames)];
     // A direct-rate item has no raw score at all — just the one Rate
-    // column, not the usual Score+Rate pair.
-    const span = (c.items || []).reduce((s, item) => s + (item.is_rate_direct ? 1 : 2), 0) + (c.show_ave === false ? 1 : 2);
+    // column, not the usual Score+Rate pair. When show_rate is false, Rate is hidden.
+    const span = (c.items || []).reduce((s, item) => s + (item.is_rate_direct ? (item.show_rate !== false ? 1 : 0) : (item.show_rate !== false ? 2 : 1)), 0) + (c.show_ave === false ? 1 : 2);
     const groupFirstCol = colIdx;
     ws.mergeCells(headerRow1, colIdx, headerRow1, colIdx + span - 1);
     const cCell = ws.getCell(headerRow1, colIdx);
@@ -411,7 +526,8 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
     cCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color.header } };
 
     (c.items || []).forEach((item) => {
-      const itemSpan = item.is_rate_direct ? 1 : 2;
+      const itemSpan = item.is_rate_direct ? (item.show_rate !== false ? 1 : 0) : (item.show_rate !== false ? 2 : 1);
+      if (itemSpan === 0) return;
       if (item.is_rate_direct) {
         // Rows 3-4 are otherwise entirely blank for a rate-only item (no max
         // score, no SCORE/RATE sub-labels) — merged (rowSpan) into this one
@@ -420,7 +536,18 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
         // ("Unit Activity", "Attendance", "Recitation", ...).
         ws.mergeCells(headerRow2, colIdx, headerRow4, colIdx);
         ws.getCell(headerRow2, colIdx).value = item.name;
-        rotatedNameCols.push(colIdx);
+        if ((item.name || '').length > 5) rotatedNameCols.push(colIdx);
+      } else if (item.show_rate === false) {
+        // Rate hidden — only 1 column (Score).
+        if (item.show_score === false) {
+          ws.mergeCells(headerRow2, colIdx, headerRow3, colIdx);
+          ws.getCell(headerRow2, colIdx).value = item.name;
+        } else {
+          ws.getCell(headerRow2, colIdx).value = item.name;
+          ws.getCell(headerRow3, colIdx).value = parseFloat(item.max_score);
+        }
+        ws.getCell(headerRow4, colIdx).value = 'SCORE';
+        scoreRateCols.push(colIdx);
       } else if (item.show_score === false) {
         // Max hidden — row 3 would otherwise be a blank gap under this
         // item's name, so the name cell grows down to fill that space
@@ -451,8 +578,8 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
       // half-column (3.5) — it's the item's ONLY column now, holding the
       // full rotated name, so it needs a little more breathing room to not
       // look cramped against its neighbors — same width as Ave/weight% below.
-      ws.getColumn(colIdx).width = item.is_rate_direct ? 4.5 : 3.5;
-      if (itemSpan === 2) ws.getColumn(colIdx + 1).width = 3.5;
+      ws.getColumn(colIdx).width = item.is_rate_direct ? 5.5 : 4.0;
+      if (itemSpan === 2) ws.getColumn(colIdx + 1).width = 4.0;
       colIdx += itemSpan;
     });
 
@@ -460,17 +587,43 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
     if (c.show_ave !== false) {
       ws.mergeCells(headerRow2, colIdx, headerLastRow, colIdx);
       ws.getCell(headerRow2, colIdx).value = 'Ave';
-      ws.getColumn(colIdx).width = 4.5;
+      ws.getColumn(colIdx).width = 5.0;
       aveCol = colIdx;
       colIdx += 1;
     }
 
     ws.mergeCells(headerRow2, colIdx, headerLastRow, colIdx);
     ws.getCell(headerRow2, colIdx).value = parseFloat(c.weight) / 100;
-    ws.getCell(headerRow2, colIdx).numFmt = '0.##%';
-    ws.getColumn(colIdx).width = 4.5;
+    // Whole percent, never a decimal — component weights are always whole
+    // numbers in practice (SSU's own 25/5/10/20/40 breakdown), and some
+    // spreadsheet viewers (Google Sheets, some LibreOffice builds) don't
+    // reliably drop the optional digits a '0.##%'-style format asks for,
+    // showing "20.0%" instead of "20%" even when the value has no real
+    // fractional part.
+    ws.getCell(headerRow2, colIdx).numFmt = '0%';
+    ws.getColumn(colIdx).width = 5.0;
     const weightCol = colIdx;
     colIdx += 1;
+
+    // Ensure the merged component header has enough width so words in c.name
+    // (e.g. "CLASS PARTICIPATION", "Project/Term Requirement") never break mid-word.
+    let currentGroupWidth = 0;
+    for (let cc = groupFirstCol; cc <= weightCol; cc++) {
+      currentGroupWidth += (ws.getColumn(cc).width || 8.43);
+    }
+    const compWords = (c.name || '').trim().split(/[\s/]+/).filter(Boolean);
+    const longestWordLen = compWords.reduce((max, w) => Math.max(max, w.length), 0);
+    const minWordWidth = longestWordLen * 0.9 + 2.5;
+    const targetGroupWidth = Math.max(15.5, minWordWidth);
+
+    if (currentGroupWidth < targetGroupWidth) {
+      const neededExtra = targetGroupWidth - currentGroupWidth;
+      const numCols = weightCol - groupFirstCol + 1;
+      const addPerCol = neededExtra / numCols;
+      for (let cc = groupFirstCol; cc <= weightCol; cc++) {
+        ws.getColumn(cc).width = +(ws.getColumn(cc).width + addPerCol).toFixed(1);
+      }
+    }
 
     for (let r = headerRow1; r <= headerLastRow; r++) {
       for (let cc = groupFirstCol; cc <= weightCol; cc++) {
@@ -483,17 +636,17 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
 
   const tailHeaders = isFinals
     ? [
-        { label: 'Final Term Grade', color: COMPOSITE_HEADER },
-        { label: 'Overall 1/2', color: HALF_HEADER },
-        { label: 'Overall Grade', color: OVERALL_HEADER },
-        { label: 'Final Grade', color: FINAL_GWA_HEADER },
-        { label: 'Remarks', color: REMARKS_HEADER },
-      ]
+      { label: 'Final Term Grade', color: COMPOSITE_HEADER },
+      { label: 'Overall 1/2', color: HALF_HEADER },
+      { label: 'Overall Grade', color: OVERALL_HEADER },
+      { label: 'Final Grade', color: FINAL_GWA_HEADER },
+      { label: 'Remarks', color: REMARKS_HEADER },
+    ]
     : [
-        { label: 'Midterm Term Grade', color: COMPOSITE_HEADER },
-        { label: 'Overall 1/2', color: HALF_HEADER },
-        { label: 'Midterm Grade', color: GWA_HEADER },
-      ];
+      { label: 'Midterm Term Grade', color: COMPOSITE_HEADER },
+      { label: 'Overall 1/2', color: HALF_HEADER },
+      { label: 'Midterm Grade', color: GWA_HEADER },
+    ];
   const tailColStart = colIdx;
   tailHeaders.forEach(({ label, color }) => {
     ws.mergeCells(headerRow1, colIdx, headerLastRow, colIdx);
@@ -510,7 +663,7 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
     // this to precisely 9 makes ExcelJS think it was NEVER customized and
     // silently drops it from the file, leaving the real default in effect
     // instead of the wider column this needs.
-    ws.getColumn(colIdx).width = label === 'Remarks' ? 9.5 : 5.5;
+    ws.getColumn(colIdx).width = label === 'Remarks' ? 9.5 : 6.0;
     colIdx += 1;
   });
   const tailColEnd = colIdx - 1;
@@ -551,13 +704,16 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
     return lines;
   };
   const headerRow1Height = comps.reduce((tallest, c) => {
-    const itemColUnits = (c.items || []).reduce((s, item) => s + (item.is_rate_direct ? 1 : 2), 0);
-    const approxWidthUnits = itemColUnits * 3.5 + (c.show_ave === false ? 0 : 4.5) + 4.5;
+    const itemColUnits = (c.items || []).reduce((s, item) => {
+      const span = item.is_rate_direct ? (item.show_rate !== false ? 1 : 0) : (item.show_rate !== false ? 2 : 1);
+      return s + span;
+    }, 0);
+    const approxWidthUnits = itemColUnits * 4.0 + (c.show_ave === false ? 0 : 5.0) + 5.0;
     const approxWidthPx = approxWidthUnits * 7 + 5;
     const charsPerLine = Math.max(6, Math.floor(approxWidthPx / 6));
     const linesNeeded = wrappedLineCount(c.name, charsPerLine);
-    return Math.max(tallest, Math.min(linesNeeded * 13 + 8, 90));
-  }, 43);
+    return Math.max(tallest, Math.min(linesNeeded * 16 + 12, 90));
+  }, 48);
   ws.getRow(headerRow1).height = headerRow1Height;
   ws.getRow(headerRow2).height = 22;
   ws.getRow(headerRow3).height = 18;
@@ -566,21 +722,50 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
   let row = headerLastRow + 1;
   const dataStartRow = row;
   let halfColIdx = null;
+  // This section's own per-row TRUE (unrounded) composite formula fragment
+  // — returned below so the Finals section, when combining both periods
+  // into Final Grade, can reach back and use the Midterm's own EXACT
+  // composite instead of its rounded Overall/Half display cells. Indexed by
+  // `gi` (studentGrades' own row order), which both sections share.
+  const exactComposites = [];
 
   studentGrades.forEach((g, gi) => {
     const noCell = ws.getCell(row, startCol);
     noCell.value = gi + 1;
     noCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF757070' } };
     ws.getCell(row, startCol + 1).value = g.student.student_no;
-    ws.getCell(row, startCol + 2).value = g.student.name;
+    // Surname first (e.g. "CERBITO, M. Karl Renzo") — same formatter the
+    // Grade Sheet's roster uses, so the alphabetical-by-surname row order
+    // (see exportClassRecordToExcel) is actually visible in the file.
+    ws.getCell(row, startCol + 2).value = formatPersonNameCapsSurname(g.student.name);
     let c = startCol + 3;
-    const isIncomplete = g.status === 'INC';
-    // Same blanking-instead-of-a-number treatment as INC (see below), just
-    // labeled 'DRP' and colored red — a dropped student's composite/half/
-    // GWA/overall cells never show a leftover computed figure.
+    // INC is per period, not per student — a student marked INC whose scores
+    // for THIS period are all in (e.g. complete in Midterm, missing in
+    // Finals) still shows their real Midterm figures; only the period that's
+    // actually missing scores reads INC.
+    // Which period(s) are INC comes from the per-period flags
+    // (inc_midterm / inc_finals — marked and resolved independently, so INC in
+    // one never makes the other INC). A row from before the flags existed
+    // (INC, neither set) falls back to "INC where this period's scores are
+    // still incomplete".
+    const hasIncFlags = !!(g.inc_midterm || g.inc_finals);
+    const midRowComps = isFinals ? otherComps : comps;
+    const finRowComps = isFinals ? comps : otherComps;
+    const midRowDone = midRowComps.length === 0 || periodComposite(midRowComps, g.student.id, componentScores, formula) !== null;
+    const finRowDone = finRowComps.length === 0 || periodComposite(finRowComps, g.student.id, componentScores, formula) !== null;
+    // No flags = older data: INC in the earliest period still missing scores.
+    const incMidRow = g.status === 'INC' && (hasIncFlags ? !!g.inc_midterm : !midRowDone);
+    const incFinRow = g.status === 'INC' && (hasIncFlags ? !!g.inc_finals : (midRowDone && !finRowDone));
+    // ONLY the period that was marked INC reads INC — the Finals block never
+    // shows INC for a Midterm-only INC, and vice versa. An INC period no
+    // longer blanks its own tail cells (Composite/Half/GWA/Overall) — they
+    // show a zero-filled preview instead (see the item Rate/Ave/Weighted
+    // formulas below), colored amber to flag it as provisional. Only a
+    // DROPPED student's cells still blank out (spelling "DROPPED" across
+    // the row) — a leftover computed figure there would read as "this
+    // student was graded normally", which is exactly wrong.
+    const isIncomplete = isFinals ? incFinRow : incMidRow;
     const isDropped = g.status === 'DRP';
-    const isBlank = isIncomplete || isDropped;
-    const blankLabel = isIncomplete ? 'INC' : isDropped ? 'DROP' : '';
     const blankFontColor = isDropped ? { argb: 'FF9C0006' } : undefined;
     const weightedRefs = [];
     // Precomputed for this row's EXACT total cell count (every component's
@@ -591,8 +776,8 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
     let dropIdx = 0;
     const dropTailCellCount = isFinals ? 4 : 3;
     // A direct-rate item only ever consumes ONE cell (just Rate, no Score),
-    // not the usual Score+Rate pair — same as everywhere else in this row.
-    const dropTotalCells = comps.reduce((sum, cp) => sum + (cp.items || []).reduce((s, item) => s + (item.is_rate_direct ? 1 : 2), 0) + (cp.show_ave === false ? 1 : 2), 0) + dropTailCellCount;
+    // not the usual Score+Rate pair — same as everywhere else in this row. When show_rate is false, Rate is hidden.
+    const dropTotalCells = comps.reduce((sum, cp) => sum + (cp.items || []).reduce((s, item) => s + (item.is_rate_direct ? (item.show_rate !== false ? 1 : 0) : (item.show_rate !== false ? 2 : 1)), 0) + (cp.show_ave === false ? 1 : 2), 0) + dropTailCellCount;
     const dropSeq = isDropped ? dropSequence(dropTotalCells) : null;
     const DROP_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD64545' } };
     const DROP_FONT = { bold: true, color: { argb: 'FFFFFFFF' } };
@@ -623,66 +808,99 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
 
         // A direct-rate item has just the one Rate column — no Score
         // column at all — so it only ever consumes ONE cell (and one
-        // DROPPED letter), not the usual Score+Rate pair.
+        // DROPPED letter), not the usual Score+Rate pair. When show_rate is false, Rate is hidden.
         if (item.is_rate_direct) {
-          const rateAddr = `${colLetter(c)}${row}`;
-          const rateCell = ws.getCell(row, c);
-          if (isDropped) {
-            setDropCell(rateCell, dropSeq[dropIdx++]);
+          const rawScore = score !== null && score !== undefined && score !== '' ? parseFloat(score) : (isIncomplete ? 0 : null);
+          const exactVal = rawScore !== null ? Math.min(formula.base + formula.range, Math.max(formula.base, rawScore)) : null;
+          if (item.show_rate !== false) {
+            const rateAddr = `${colLetter(c)}${row}`;
+            const rateCell = ws.getCell(row, c);
+            if (isDropped) {
+              setDropCell(rateCell, dropSeq[dropIdx++]);
+            } else {
+              // Rounded (whole-number display) — matches itemRate() in this
+              // file. The item has no other cell to read from, so its own
+              // exact (unrounded) clamp is embedded as a literal below.
+              // Zero-filled when this period is INC and still missing this
+              // score (matches itemRate's own zeroFillMissing) — a genuine 0
+              // clamps to the same formula.base (50 for the default formula)
+              // a real 0 score would.
+              rateCell.value = exactVal !== null ? Math.round(exactVal) : null;
+              rateCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color } };
+              rateCell.font = { color: { argb: 'FFFF0000' } };
+            }
+            rateAddrs.push(rateAddr);
+            c += 1;
+            // When show_rate is true, exactRateExprs references the rateAddr cell so that
+            // edits made directly in Excel recalculate the component average live!
+            const clampedRateRef = isIncomplete
+              ? `IF(ISNUMBER(${rateAddr}),MIN(${formula.base + formula.range},MAX(${formula.base},${rateAddr})),${formula.base})`
+              : `MIN(${formula.base + formula.range},MAX(${formula.base},${rateAddr}))`;
+            exactRateExprs.push(clampedRateRef);
           } else {
-            // Rounded (whole-number display) — matches itemRate() in this
-            // file. The item has no other cell to read from, so its own
-            // exact (unrounded) clamp is embedded as a literal below.
-            const exactVal = score !== null && score !== undefined && score !== '' ? Math.min(formula.base + formula.range, Math.max(formula.base, parseFloat(score))) : null;
-            rateCell.value = exactVal !== null ? Math.round(exactVal) : null;
-            rateCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color } };
-            rateCell.font = { color: { argb: 'FFFF0000' } };
-            if (item.show_rate === false) rateCell.numFmt = ';;;';
-            // '0' placeholder when blank keeps the AVERAGE(...) argument
-            // list syntactically valid — the outer IF(AND(allNumeric),...)
-            // already hides the result whenever any item (including this
-            // one) is actually blank, so this placeholder is never shown.
-            exactRateExprs.push(exactVal !== null ? String(exactVal) : '0');
+            // When Rate is hidden, fallback to exact value or '0'
+            exactRateExprs.push(exactVal !== null ? String(exactVal) : (isIncomplete ? String(formula.base) : '0'));
           }
-          rateAddrs.push(rateAddr);
-          c += 1;
           return;
         }
 
         const maxScore = parseFloat(item.max_score) || 100;
         const scoreAddr = `${colLetter(c)}${row}`;
-        const rateAddr = `${colLetter(c + 1)}${row}`;
-
         const scoreCell = ws.getCell(row, c);
-        const rateCell = ws.getCell(row, c + 1);
+        const hasRate = item.show_rate !== false;
+
+        const effectiveScore = (score !== null && score !== undefined && score !== '') ? parseFloat(score) : (isIncomplete ? 0 : null);
+        const exactItemRate = effectiveScore !== null ? Math.round(((effectiveScore * formula.range) / maxScore) + formula.base) : null;
+
         if (isDropped) {
           // A dropped student has no real scores to show — replacing them
           // with real-looking numbers (or even a blank formula) would read
           // as "this student was graded normally", which is exactly wrong.
           setDropCell(scoreCell, dropSeq[dropIdx++]);
-          setDropCell(rateCell, dropSeq[dropIdx++]);
+          if (hasRate) {
+            const rateCell = ws.getCell(row, c + 1);
+            setDropCell(rateCell, dropSeq[dropIdx++]);
+          }
         } else {
           // The actual SCORE a student earned always shows regardless —
           // show_score only affects the Max header above, not this number.
-          scoreCell.value = score !== null && score !== undefined ? parseFloat(score) : null;
+          // Zero-filled for an incomplete period.
+          scoreCell.value = effectiveScore;
           scoreCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color } };
 
-          // ROUND (whole-number display), matching itemRate() in this same
-          // file. Ave/Weighted below read the exact expression (next
-          // line), not this rounded cell.
-          rateCell.value = { formula: `IF(ISBLANK(${scoreAddr}),"",ROUND((${scoreAddr}*${formula.range})/${maxScore}+${formula.base},0))` };
-          rateCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color } };
-          rateCell.font = { color: { argb: 'FFFF0000' } };
-          if (item.show_rate === false) rateCell.numFmt = ';;;';
-          exactRateExprs.push(`((${scoreAddr}*${formula.range})/${maxScore}+${formula.base})`);
+          if (hasRate) {
+            const rateAddr = `${colLetter(c + 1)}${row}`;
+            const rateCell = ws.getCell(row, c + 1);
+            // ROUND (whole-number display), matching itemRate() in this same
+            // file. Ave/Weighted below read the exact expression (next
+            // line), not this rounded cell. For an INC period still missing
+            // this score, no ISBLANK guard at all — Excel treats a blank
+            // cell as 0 in arithmetic, so this naturally computes to
+            // formula.base (50) exactly like a genuine 0 score would,
+            // matching itemRate's own zeroFillMissing.
+            const rateFormulaStr = isIncomplete
+              ? `ROUND((${scoreAddr}*${formula.range})/${maxScore}+${formula.base},0)`
+              : `IF(ISBLANK(${scoreAddr}),"",ROUND((${scoreAddr}*${formula.range})/${maxScore}+${formula.base},0))`;
+            rateCell.value = effectiveScore !== null
+              ? { formula: rateFormulaStr, result: exactItemRate ?? formula.base }
+              : { formula: rateFormulaStr, result: '' };
+            rateCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color } };
+            rateCell.font = { color: { argb: 'FFFF0000' } };
+            rateAddrs.push(rateAddr);
+          } else {
+            rateAddrs.push(scoreAddr);
+          }
         }
 
-        rateAddrs.push(rateAddr);
-        c += 2;
+        exactRateExprs.push(`((${scoreAddr}*${formula.range})/${maxScore}+${formula.base})`);
+        c += hasRate ? 2 : 1;
       });
 
       const allNumeric = rateAddrs.map((a) => `ISNUMBER(${a})`).join(',');
       const exactAveExpr = `AVERAGE(${exactRateExprs.join(',')})`;
+
+      const compAvg = componentAverage(comp, g.student.id, componentScores, formula, isIncomplete);
+      const aveResult = compAvg !== null ? Math.round(compAvg) : '';
 
       // comp.show_ave === false hides this column — Weighted below still
       // reads exactAveExpr (computed above regardless), just without a
@@ -695,11 +913,18 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
           if (rateAddrs.length > 0) {
             // ROUND — matches componentAverage() in this file, computed
             // from the exact (unrounded) rates above, not from the
-            // rounded Rate cells.
-            aveCell.value = { formula: `IF(AND(${allNumeric}),ROUND(${exactAveExpr},0),"")` };
+            // rounded Rate cells. INC drops the AND(allNumeric) gate — the
+            // exact expression above already reads its own still-blank
+            // Rate cells (now unguarded too) as 0-filled, matching
+            // componentAverage's own zeroFillMissing.
+            aveCell.value = {
+              formula: isIncomplete ? `ROUND(${exactAveExpr},0)` : `IF(AND(${allNumeric}),ROUND(${exactAveExpr},0),"")`,
+              result: aveResult,
+            };
           }
           aveCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color } };
           aveCell.font = { bold: true };
+          aveCell.numFmt = '0';
         }
         c += 1;
       }
@@ -707,21 +932,34 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
       const weight = parseFloat(comp.weight) / 100;
       const weightedAddr = `${colLetter(c)}${row}`;
       const weightedCell = ws.getCell(row, c);
+      const weightedVal = compAvg !== null ? Math.round(compAvg * weight + 1e-9) : null;
+      const weightedResult = weightedVal !== null ? weightedVal : '';
       if (isDropped) {
         setDropCell(weightedCell, dropSeq[dropIdx++]);
       } else {
         if (rateAddrs.length > 0) {
-          // Weighted = exact Ave × weight%, rounded to 1 decimal — reads
-          // the exact average expression directly, not the (rounded) Ave
-          // cell above, matching the live Class Record grid's own Weighted
-          // column.
-          weightedCell.value = { formula: `IF(AND(${allNumeric}),ROUND(${exactAveExpr}*${weight},1),"")` };
+          // Weighted = exact Ave × weight%, rounded to a whole number —
+          // reads the exact average expression directly, not the (rounded)
+          // Ave cell above, matching the live Class Record grid's own
+          // Weighted column. INC drops the gate, same reason as the Ave
+          // cell above.
+          weightedCell.value = {
+            formula: isIncomplete ? `ROUND(${exactAveExpr}*${weight},0)` : `IF(AND(${allNumeric}),ROUND(${exactAveExpr}*${weight},0),"")`,
+            result: weightedResult,
+          };
         }
         weightedCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color } };
         weightedCell.font = { bold: true };
+        weightedCell.numFmt = '0';
       }
       weightedRefs.push(weightedAddr);
-      exactWeightedExprs.push(rateAddrs.length > 0 ? `IF(AND(${allNumeric}),${exactAveExpr}*${weight},0)` : '0');
+      // Feeds Composite's own exact sum below — INC drops the gate here
+      // too, otherwise Composite would still fall back to 0 for this whole
+      // component (not the zero-filled exactAveExpr) the moment any one
+      // item in it is still blank.
+      exactWeightedExprs.push(rateAddrs.length > 0
+        ? (isIncomplete ? `${exactAveExpr}*${weight}` : `IF(AND(${allNumeric}),${exactAveExpr}*${weight},0)`)
+        : '0');
       c += 1;
     });
 
@@ -738,116 +976,219 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
     // actively being graded, just not finished yet.
     const dropTail = (cell) => setDropCell(cell, dropSeq[dropIdx++]);
 
-    // Reused below by GWA, which is computed straight from this — the real
-    // exact composite, never floored/truncated first — not from
-    // compositeAddr (the cell below, itself rounded to a whole number for
-    // display). Half (right after) is the one deliberate exception: it's
-    // meant to always read as exactly the DISPLAYED Composite ÷ 2, so it
-    // keeps referencing compositeAddr instead.
+    // The real exact composite — rounded ONCE, to a whole number, by the
+    // Term Grade cell below (compositeAddr). Half and the grade equivalent
+    // then read that whole-number cell, so every figure in the tail agrees
+    // with the Term Grade shown. Also kept for the Finals side's Overall
+    // Grade (midtermRef.exactComposites).
     const exactCompositeExpr = `SUM(${exactWeightedExprs.join(',')})`;
+    exactComposites.push(exactCompositeExpr);
+
+    const compComposite = periodComposite(comps, g.student.id, componentScores, formula, isIncomplete);
+    const compositeResult = compComposite !== null ? roundedComposite(compComposite) : '';
 
     const compositeAddr = `${colLetter(c)}${row}`;
     const compositeCell = ws.getCell(row, c);
     if (isDropped) {
       dropTail(compositeCell);
     } else {
-      if (isIncomplete) {
-        compositeCell.value = blankLabel;
-      } else if (weightedRefs.length > 0) {
+      if (weightedRefs.length > 0) {
         // Gated on the visible Weighted cells being filled, but SUMS the
         // exact (unrounded) per-component contributions, not those
-        // (1-decimal) Weighted cells, so Composite isn't thrown off by
-        // that display rounding either.
+        // (whole-number) Weighted cells, so Composite isn't thrown off by
+        // that display rounding. ROUNDED to a whole number — the exact
+        // figure the GWA cell's own lookup reads, so the term grade shown
+        // always matches its equivalent. For an INC row, every Weighted
+        // cell above is already unconditionally numeric (no more
+        // blank-guard on them either), so this gate passes through
+        // naturally and Composite shows the zero-filled preview — no
+        // separate isIncomplete branch needed here.
         const allNumeric = weightedRefs.map((a) => `ISNUMBER(${a})`).join(',');
-        compositeCell.value = { formula: `IF(AND(${allNumeric}),ROUND(${exactCompositeExpr},0),"")` };
+        compositeCell.value = {
+          formula: `IF(AND(${allNumeric}),ROUND((${exactCompositeExpr}),0),"")`,
+          result: compositeResult,
+        };
       }
       compositeCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COMPOSITE_DATA } };
-      compositeCell.font = { bold: true, color: blankFontColor };
+      // Amber for an INC row — visually flags this as a zero-filled
+      // preview, not a finalized figure, same treatment the on-screen
+      // Class Record grid gives it.
+      compositeCell.font = { bold: true, color: isIncomplete ? { argb: 'FFD97706' } : blankFontColor };
+      compositeCell.numFmt = '0';
     }
     c += 1;
 
     halfColIdx = c;
     const halfAddr = `${colLetter(c)}${row}`;
     const halfCell = ws.getCell(row, c);
+    const halfVal = compComposite !== null ? Math.round(halfComposite(compComposite) + 1e-9) : null;
+    const halfResult = halfVal !== null ? halfVal : '';
     if (isDropped) {
       dropTail(halfCell);
     } else {
-      if (!isBlank) {
-        // Deliberately reads compositeAddr (the rounded, DISPLAYED
-        // Composite), not the exact composite — Overall 1/2 is meant to
-        // always be exactly half of the number a viewer sees for
-        // Composite, not a value that can drift a few tenths off it.
-        halfCell.value = { formula: `IF(ISNUMBER(${compositeAddr}),ROUND(${compositeAddr}*0.5,1),"")` };
-      }
+      // Half of the TRUE (unrounded) composite, rounded to a whole number
+      // (79.26 → 39.63 → 40) — the Overall Grade itself reads the exact
+      // expressions, not this rounded cell.
+      halfCell.value = {
+        formula: `IF(ISNUMBER(${compositeAddr}),ROUND((${exactCompositeExpr})*0.5,0),"")`,
+        result: halfResult,
+      };
       halfCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HALF_DATA } };
+      if (isIncomplete) halfCell.font = { color: { argb: 'FFD97706' } };
+      halfCell.numFmt = '0';
     }
     c += 1;
 
     if (!isFinals) {
       const gwaCell = ws.getCell(row, c);
+      const midGwaVal = compComposite !== null ? gwaFromComposite(compComposite) : null;
+      const midGwaResult = midGwaVal !== null ? midGwaVal : '';
       if (isDropped) {
         dropTail(gwaCell);
       } else {
-        if (isIncomplete) {
-          gwaCell.value = blankLabel;
-        } else {
-          // GWA reads the exact composite (exactCompositeExpr), not the
-          // rounded compositeAddr cell — only the ISNUMBER gate above
-          // still checks that cell, purely to tell whether this row's
-          // data is complete.
-          gwaCell.value = { formula: `IF(ISNUMBER(${compositeAddr}),ROUND(MIN(5,MAX(1,10.5-0.1*(${exactCompositeExpr}))),1),"")` };
-        }
+        // Midterm Grade = the equivalent of the whole-number Midterm Term
+        // Grade cell right beside it (compositeAddr): (105 − grade) / 10,
+        // kept within 1.0–5.0 — e.g. 79 → 2.6, 75 → 3.0.
+        gwaCell.value = {
+          formula: `IF(ISNUMBER(${compositeAddr}),MIN(5,MAX(1,(105-${compositeAddr})/10)),"")`,
+          result: midGwaResult,
+        };
         gwaCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GWA_DATA } };
-        gwaCell.font = { bold: true, color: blankFontColor };
+        gwaCell.font = { bold: true, color: isIncomplete ? { argb: 'FFD97706' } : blankFontColor };
+        // Always 1 decimal — a whole grade reads "3.0", never bare "3".
+        gwaCell.numFmt = '0.0';
       }
       c += 1;
     } else {
+      const overallAddr = `${colLetter(c)}${row}`;
       const overallCell = ws.getCell(row, c);
+
+      const midCompForOverall = periodComposite(otherComps, g.student.id, componentScores, formula, incMidRow);
+      const finCompForOverall = periodComposite(comps, g.student.id, componentScores, formula, incFinRow);
+      const overallCompVal = overallComposite(midCompForOverall, finCompForOverall);
+      const overallResult = overallCompVal !== null ? roundedComposite(overallCompVal) : '';
+
       if (isDropped) {
         dropTail(overallCell);
       } else {
-        if (isIncomplete) {
-          overallCell.value = blankLabel;
-        } else if (midtermRef) {
-          const midHalfAddr = `${colLetter(midtermRef.halfCol)}${midtermRef.startDataRow + (row - dataStartRow)}`;
-          overallCell.value = { formula: `IF(AND(ISNUMBER(${midHalfAddr}),ISNUMBER(${halfAddr})),ROUND(${midHalfAddr}+${halfAddr},0),"")` };
+        // The Midterm side's own exact composite already zero-fills itself
+        // when IT was the INC period (midtermRef.exactComposites[gi] was
+        // built by that section's own pass, with the same treatment) — so
+        // this combines correctly either way, no separate isIncomplete
+        // branch needed here anymore.
+        if (midtermRef?.exactComposites?.[gi]) {
+          // Overall Grade = the TRUE average of both periods' EXACT
+          // composites (Midterm's Overall 1/2 + Finals' Overall 1/2 before
+          // any rounding), rounded once to a whole number — the figure the
+          // Final Grade's own lookup reads.
+          const midExactExpr = midtermRef.exactComposites[gi];
+          const midHalfAddr = midtermRef.halfCol ? `${colLetter(midtermRef.halfCol)}${row}` : null;
+          const overallGuard = midHalfAddr
+            ? `AND(ISNUMBER(${midHalfAddr}),ISNUMBER(${halfAddr}))`
+            : `ISNUMBER(${halfAddr})`;
+          overallCell.value = {
+            formula: `IF(${overallGuard},ROUND(((${midExactExpr})+(${exactCompositeExpr}))/2,0),"")`,
+            result: overallResult,
+          };
         } else {
-          // Half here is deliberately derived from the DISPLAYED (rounded)
-          // composite, matching compositeAddr's own Half cell above — not
-          // the raw exact composite periodComposite() itself returns.
-          const midComposite = periodComposite(otherComps, g.student.id, componentScores, formula);
-          const fallback = midComposite !== null ? Math.round(midComposite) * 0.5 : null;
-          overallCell.value = fallback !== null ? { formula: `IF(ISNUMBER(${halfAddr}),ROUND(${fallback}+${halfAddr},0),"")` } : null;
+          // No Midterm block loaded to pull an exact composite from —
+          // falls back to the raw (unrounded) composite periodComposite()
+          // itself returns for this specific row. Zero-filled when the
+          // student is INC at all (not just this Finals period) — the
+          // Midterm side might be the one still missing work.
+          const midComposite = periodComposite(otherComps, g.student.id, componentScores, formula, g.status === 'INC');
+          overallCell.value = midComposite !== null
+            ? {
+                formula: `IF(ISNUMBER(${halfAddr}),ROUND((${midComposite}+(${exactCompositeExpr}))/2,0),"")`,
+                result: overallResult,
+              }
+            : null;
         }
         overallCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: OVERALL_DATA } };
-        overallCell.font = { bold: true, color: blankFontColor };
+        overallCell.font = { bold: true, color: isIncomplete ? { argb: 'FFD97706' } : blankFontColor };
+        overallCell.numFmt = '0';
       }
+      const hasOverall = otherComps.length > 0;
       c += 1;
 
-      // Final Grade (GWA) — this Finals period's OWN GWA, graded in
-      // isolation, exactly mirroring how the Midterm side's own GWA cell
-      // above is computed straight from its own composite (compositeAddr)
-      // rather than anything blended with the other period. Matches the
-      // on-screen Class Record's Finals tab GWA column and the stored
-      // Grade.finals value — the Overall Grade cell above stays its own
-      // separate cumulative figure, just not what this GWA is derived from.
+      // Final Grade — the GWA of the Overall Grade cell right above (BOTH
+      // periods' composites combined), not the Finals composite in
+      // isolation — otherwise this can read worse than Overall Grade right
+      // next to it whenever a strong Midterm carried a weak Finals. Falls
+      // back to this period's own GWA only when there's no Midterm block to
+      // combine with at all (otherComps empty). INC only when the Finals
+      // itself is the marked period.
       const gwaCell = ws.getCell(row, c);
+      const finalGwaVal = hasOverall
+        ? (overallCompVal !== null ? gwaFromComposite(overallCompVal) : null)
+        : (finCompForOverall !== null ? gwaFromComposite(finCompForOverall) : null);
+      const finalGwaResult = finalGwaVal !== null ? finalGwaVal : '';
+
       if (isDropped) {
         dropTail(gwaCell);
       } else {
-        if (isIncomplete) {
-          gwaCell.value = blankLabel;
+        if (hasOverall) {
+          // Final Grade = the equivalent of the whole-number Overall Grade
+          // cell right beside it: (105 − grade) / 10, kept within 1.0–5.0.
+          gwaCell.value = {
+            formula: `IF(ISNUMBER(${overallAddr}),MIN(5,MAX(1,(105-${overallAddr})/10)),"")`,
+            result: finalGwaResult,
+          };
         } else {
-          gwaCell.value = { formula: `IF(ISNUMBER(${compositeAddr}),ROUND(MIN(5,MAX(1,10.5-0.1*(FLOOR(${compositeAddr}*10,1)/10))),1),"")` };
+          gwaCell.value = {
+            formula: `IF(ISNUMBER(${compositeAddr}),MIN(5,MAX(1,(105-${compositeAddr})/10)),"")`,
+            result: finalGwaResult,
+          };
         }
+        // INC not completed by its deadline → the recorded 5.0, not a figure
+        // recomputed from the (incomplete) scores.
+        if (isLapsedInc(g)) gwaCell.value = 5;
+        // Final Grade reads INC while the student is INC in either period.
+        if (g.status === 'INC') gwaCell.value = 'INC';
         gwaCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GWA_DATA } };
-        gwaCell.font = { bold: true, color: blankFontColor };
+        gwaCell.font = { bold: true, color: isIncomplete ? { argb: 'FFD97706' } : blankFontColor };
+        // Always 1 decimal — a whole grade reads "3.0", never bare "3".
+        gwaCell.numFmt = '0.0';
       }
       c += 1;
 
-      const rStyle = remarksExcelStyle(g.status);
+      // Checked live off the same composite/GWA the Final Grade cell above
+      // just computed (periodComposite/gwaFromComposite against the CURRENT
+      // componentScores) instead of the stored Grade.status — Grade.status
+      // only reflects whatever was last actually saved, so exporting right
+      // after changing scores (without saving first) was showing a
+      // Passed/Failed left over from before the edit instead of matching the
+      // fresh Final Grade already printed in the same row. DRP/INC aren't
+      // derived from a grade at all, so those two stay off Grade.status —
+      // and INC never gets a Passed/Failed verdict regardless of whether the
+      // Finals itself is the flagged period (a Midterm-only INC still leaves
+      // the student INC overall even once Finals is done), same as the Class
+      // Record and Grade Sheet.
+      const remarksGrade = isLapsedInc(g) ? 5 : finalGwaVal;
+      const remarksStatus = (isDropped || g.status === 'DRP')
+        ? 'DRP'
+        : (g.status === 'INC' || g.inc_midterm || g.inc_finals)
+          ? 'INC'
+          : (remarksGrade !== null
+            ? (remarksGrade >= 1.0 && remarksGrade <= 3.01 ? 'Passed' : 'Failed')
+            : '');
+      const rStyle = remarksExcelStyle(remarksStatus);
       const remarksCell = ws.getCell(row, c);
-      remarksCell.value = remarksFor(g.status);
+      const finalGwaAddr = `${colLetter(c - 1)}${row}`;
+      if (isDropped || g.status === 'DRP') {
+        remarksCell.value = 'DROP';
+      } else if (g.status === 'INC' || g.inc_midterm || g.inc_finals) {
+        // The faculty's own INC reason, when one was given.
+        remarksCell.value = remarksText('INC', g);
+      } else if (isLapsedInc(g)) {
+        // INC lapsed to 5.0 — the faculty's own INC reason.
+        remarksCell.value = remarksText('Failed', g);
+      } else {
+        remarksCell.value = {
+          formula: `IF(ISNUMBER(${finalGwaAddr}),IF(${finalGwaAddr}<=3.01,"PASSED","FAILED"),"")`,
+          result: remarksStatus ? remarksFor(remarksStatus) : '',
+        };
+      }
       remarksCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: rStyle.bg } };
       // No explicit size before — it fell back to Excel's default (11pt),
       // wider than the column, so "FAILED"/"PASSED" spilled out over the
@@ -871,6 +1212,8 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
         cell.font = { size: 10, ...cell.font, name: 'Arial Narrow' };
       } else if (cc === startCol) {
         cell.font = { bold: true, size: 9, ...cell.font, name: 'Arial' };
+      } else if (isFinals && cc === colOffset + totalCols) {
+        // Remarks cell in Finals already has its bold font, color and fill set above; leave untouched.
       } else {
         cell.font = { size: 9, ...cell.font, name: 'Arial' };
       }
@@ -878,7 +1221,43 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
     row++;
   });
 
-  return { nextRow: row + 1, startDataRow: dataStartRow, halfCol: halfColIdx, endCol: colOffset + totalCols, tailColStart };
+  // Dynamic Excel Conditional Formatting for Remarks:
+  // Automatically renders "PASSED" as Green (light green fill + dark green text)
+  // and "FAILED" as Red (light red fill + dark red text) in Excel.
+  if (isFinals && studentGrades.length > 0) {
+    try {
+      const remarksCol = colOffset + totalCols;
+      const remarksColLtr = colLetter(remarksCol);
+      const dataEndRow = dataStartRow + studentGrades.length - 1;
+      ws.addConditionalFormatting({
+        ref: `${remarksColLtr}${dataStartRow}:${remarksColLtr}${dataEndRow}`,
+        rules: [
+          {
+            type: 'cellIs',
+            operator: 'equal',
+            formulae: ['"PASSED"'],
+            style: {
+              fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFC6EFCE' }, fgColor: { argb: 'FFC6EFCE' } },
+              font: { color: { argb: 'FF006100' }, bold: true }
+            }
+          },
+          {
+            type: 'cellIs',
+            operator: 'equal',
+            formulae: ['"FAILED"'],
+            style: {
+              fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFFC7CE' }, fgColor: { argb: 'FFFFC7CE' } },
+              font: { color: { argb: 'FF9C0006' }, bold: true }
+            }
+          }
+        ]
+      });
+    } catch (cfErr) {
+      console.warn('Conditional formatting could not be attached, falling back to static styling:', cfErr);
+    }
+  }
+
+  return { nextRow: row + 1, startDataRow: dataStartRow, halfCol: halfColIdx, endCol: colOffset + totalCols, tailColStart, exactComposites };
 };
 
 // ====== Excel Export — generated from this class's own actual components ======
@@ -894,30 +1273,21 @@ async function exportUsingGeneratedLayout(classData, components, studentGrades, 
   try {
     const workbook = new ExcelJS.Workbook();
     workbook.creator = 'AGMS';
+    workbook.calcProperties.fullCalcOnLoad = true;
     const ws = workbook.addWorksheet('Class Record');
+    ws.properties.pageSetUpPr = { fitToPage: true };
     ws.pageSetup = {
       orientation: 'landscape',
+      paperSize: 5, // Legal (8.5 x 14 in) - official SSU landscape format
       fitToPage: true,
       fitToWidth: 1,
-      fitToHeight: 1,
-      margins: { left: 0.2, right: 0.2, top: 0.2, bottom: 0.2, header: 0, footer: 0 },
+      fitToHeight: 0,
+      horizontalCentered: true,
+      margins: { left: 0.25, right: 0.25, top: 0.3, bottom: 0.3, header: 0, footer: 0 },
     };
     ws.views = [{ showGridLines: false }];
 
-    const midTotalCols = midComps.length > 0 ? 3 + buildPeriodColumns(midComps).length + 3 : 0;
-    const finTotalCols = finComps.length > 0 ? 3 + buildPeriodColumns(finComps).length + 5 : 0;
     const sideBySide = midComps.length > 0 && finComps.length > 0;
-    // No spacer at all — Finals' own "No." column starts in the very next
-    // column after Midterm's last tail column, the two blocks flush against
-    // each other. Matches the real official spreadsheet exactly (confirmed
-    // by downloading it directly and inspecting its own column widths — its
-    // Finals block's first column sits immediately adjacent to Midterm's
-    // last one, no gap column in between).
-    const finStartCol = sideBySide ? midTotalCols + 1 : 1;
-    const maxCols = Math.max(
-      sideBySide ? midTotalCols + finTotalCols : Math.max(midTotalCols, finTotalCols),
-      6
-    );
 
     // Row order verified cell-by-cell against the real spreadsheet: seal/
     // university text (1-3) → blank (4) → the period TITLE (5) → blank (6) →
@@ -1083,69 +1453,69 @@ async function exportUsingGeneratedLayout(classData, components, studentGrades, 
         if (endC > col) ws.mergeCells(r, col, r, endC);
         const cell = ws.getCell(r, col);
         cell.value = value;
-        cell.font = { size: 10, name: 'Arial', bold: true };
-        cell.alignment = { horizontal: align, vertical: 'middle', wrapText: true };
+        cell.font = { size: 9, name: 'Arial', bold: true };
+        cell.alignment = { horizontal: align, vertical: 'middle', wrapText: false, shrinkToFit: false };
       };
-      const courseYearParts = [programShortLabel(classData?.subject?.program), classData?.year_level ? String(classData.year_level) : null].filter(Boolean);
+      // The official Class Record writes the year level in Roman numerals
+      // ("BSIT I-Z"), not the plain digit this system stores (1-4).
+      const ROMAN_YEARS = { 1: 'I', 2: 'II', 3: 'III', 4: 'IV', 5: 'V' };
+      const yearLabel = classData?.year_level ? (ROMAN_YEARS[parseInt(classData.year_level, 10)] || String(classData.year_level)) : null;
+      const courseYearParts = [programShortLabel(classData?.subject?.program), yearLabel].filter(Boolean);
       let courseYearSection = courseYearParts.join(' ');
       if (classData?.section) courseYearSection += (courseYearSection ? '-' : '') + classData.section;
       const academicYear = classData?.academic_year || (classData?.semester || '').match(/\d{4}-\d{4}/)?.[0] || '';
       const row7Fields = [
-        `Name of Faculty:  ${(classData?.instructor?.name || '').toUpperCase()}`,
+        `Name of Faculty: ${formatPersonNameFirstLast(classData?.instructor?.name).toUpperCase()}`,
         `Course, Year and Section: ${courseYearSection || '—'}`,
       ];
       const row8Fields = [
         `Subject: ${classData?.subject?.code || ''} (${classData?.subject?.name || ''})`,
-        classData?.schedule ? `Schedule: ${classData.schedule}` : '',
+        classData?.schedule ? `Schedule: ${classData.schedule}` : 'Schedule: —',
       ];
       const colWidthUnits = (c) => ws.getColumn(c).width || 8.43;
-      // AY / Semester now live in their own dedicated spot — stacked over the
-      // tail columns (the same "Overall 1/2" / "Midterm Grade" / "Final
-      // Grade" / "Remarks" columns the header row below rotates vertically),
-      // instead of sharing a proportional split with Faculty/Course info.
-      // Name of Faculty and Course, Year and Section split only the columns
-      // BEFORE the tail block now, so they no longer compete with AY/
-      // Semester for width at all.
-      const infoEndCol = Math.max(startCol, tailColStart - 1);
-      const totalWidthUnits = (() => {
-        let sum = 0;
-        for (let c = startCol; c <= infoEndCol; c++) sum += colWidthUnits(c);
-        return sum;
-      })();
-      // Each row gets its OWN column split, sized off its OWN two fields'
-      // actual lengths — not a single split shared across both rows. Row 8's
-      // "Subject: ..." is routinely much longer than anything on row 7 (it
-      // carries the full course description), and sharing one split meant
-      // row 7's "Course, Year and Section" got squeezed into whatever
-      // leftover width row 8's long Subject text happened to leave it,
-      // wrapping/cramping it even though it's a short value on its own row.
-      const boundsFor = (fields) => {
-        const fieldLengths = [Math.max(fields[0].length, 1), Math.max(fields[1].length, 1)];
-        const totalChars = fieldLengths[0] + fieldLengths[1];
-        const bounds = [];
-        let cursor = startCol;
-        [0, 1].forEach((i) => {
-          const targetWidth = (fieldLengths[i] / totalChars) * totalWidthUnits;
-          let acc = 0;
-          let c = cursor;
-          while (c < infoEndCol && acc < targetWidth) {
-            acc += colWidthUnits(c);
-            c++;
-          }
-          const endC = Math.max(cursor, i === 0 ? Math.min(infoEndCol - 1, c - 1) : infoEndCol);
-          bounds.push([cursor, endC]);
-          cursor = endC + 1;
-        });
-        return bounds;
-      };
-      const row7Bounds = boundsFor(row7Fields);
-      const row8Bounds = boundsFor(row8Fields);
-      row7Fields.forEach((value, i) => infoField(7, row7Bounds[i][0], row7Bounds[i][1], value));
-      row8Fields.forEach((value, i) => infoField(8, row8Bounds[i][0], row8Bounds[i][1], value));
-      infoField(7, tailColStart, endCol, `AY ${academicYear}`, 'right');
-      infoField(8, tailColStart, endCol, stripYearFromSemester(classData?.semester, academicYear), 'right');
-      ws.getRow(7).height = 30;
-      ws.getRow(8).height = 30;
+
+      // In the Finals section (when side-by-side with Midterm, startCol > 1),
+      // Name of Faculty and Subject start at the "Student No." column (startCol + 1),
+      // leaving the "No." column (startCol) blank as a clean spacer after Midterm's tail.
+      const infoStartCol = startCol > 1 ? startCol + 1 : startCol;
+
+      // Column 3 (A.Y. / Semester) needs ~12-14 width units; allocate at least 12 width units and 2 columns
+      let col3W = 0;
+      let c3 = endCol;
+      while (c3 > infoStartCol + 6 && (col3W < 12 || (endCol - c3 + 1) < 2)) {
+        col3W += colWidthUnits(c3);
+        c3--;
+      }
+      const col3StartCol = Math.max(infoStartCol + 4, c3 + 1);
+      const infoEndCol = col3StartCol - 1;
+
+      let totalW = 0;
+      for (let i = infoStartCol; i <= infoEndCol; i++) totalW += colWidthUnits(i);
+
+      // Target Column 1 (Faculty / Subject) with ~58-60 width units (or ~58% of available width)
+      // so long subject descriptions fit cleanly without truncation
+      const targetCol1W = Math.max(58, 0.58 * totalW);
+      let acc = 0;
+      let sc = startCol;
+      while (sc < infoEndCol && acc < targetCol1W) {
+        acc += colWidthUnits(sc);
+        sc++;
+      }
+      const midSplitCol = Math.min(infoEndCol - 3, Math.max(infoStartCol + 3, sc - 1));
+
+      infoField(7, infoStartCol, midSplitCol, row7Fields[0]);
+      infoField(7, midSplitCol + 1, infoEndCol, row7Fields[1]);
+      infoField(7, col3StartCol, endCol, `${classData?.yearAbbr || 'A.Y.'} ${academicYear}`);
+
+      infoField(8, infoStartCol, midSplitCol, row8Fields[0]);
+      infoField(8, midSplitCol + 1, infoEndCol, row8Fields[1]);
+      infoField(8, col3StartCol, endCol, stripYearFromSemester(classData?.semester, academicYear));
+
+      ws.getRow(7).height = 18;
+      ws.getRow(8).height = 18;
+      // Row 9 is the spacer between the info lines and the table header —
+      // kept thin so the table sits right under Subject/Schedule.
+      ws.getRow(9).height = 5;
     };
 
     // "Prepared by:" signature block, directly under a period block's own
@@ -1154,12 +1524,21 @@ async function exportUsingGeneratedLayout(classData, components, studentGrades, 
     // the real spreadsheet's own signature block (label sits under the NAME
     // column, not the No. column; two blank rows between the label and the
     // typed name, not one).
-    const writeSignature = (startCol, afterRow) => {
+    const writeSignature = (startCol, endCol, afterRow) => {
       // +2, not +1 — Name now sits at startCol+2 (No./Student No./Name), so
       // this still lands the label under the NAME column specifically.
       const sigCol = startCol + 2;
-      ws.getCell(afterRow - 1, sigCol).value = '***Nothing Follows***';
-      ws.getCell(afterRow - 1, sigCol).font = { italic: true, size: 9, name: 'Arial' };
+      // "***Nothing Follows***" is the table's own last row — bordered across
+      // the full block like every student row, with only the Name cell filled
+      // in — rather than a loose line hanging under the table.
+      const nothingRow = afterRow - 1;
+      for (let cc = startCol; cc <= endCol; cc++) {
+        ws.getCell(nothingRow, cc).border = DATA_BORDER;
+      }
+      const nothingCell = ws.getCell(nothingRow, sigCol);
+      nothingCell.value = '***Nothing Follows***';
+      nothingCell.font = { italic: true, size: 9, name: 'Arial' };
+      nothingCell.alignment = { horizontal: 'left', vertical: 'middle', shrinkToFit: true };
 
       const row = afterRow + 1;
       ws.getCell(row, sigCol).value = 'Prepared by:';
@@ -1169,12 +1548,12 @@ async function exportUsingGeneratedLayout(classData, components, studentGrades, 
       const sigEndCol = sigCol + 5;
       ws.mergeCells(nameRow, sigCol, nameRow, sigEndCol);
       const nameCell = ws.getCell(nameRow, sigCol);
-      nameCell.value = (classData?.instructor?.name || '').toUpperCase();
+      nameCell.value = formatPersonNameFirstLast(classData?.instructor?.name).toUpperCase();
       nameCell.font = { bold: true, size: 10, name: 'Arial' };
 
       ws.mergeCells(nameRow + 1, sigCol, nameRow + 1, sigEndCol);
       const titleCell = ws.getCell(nameRow + 1, sigCol);
-      titleCell.value = 'Instructor';
+      titleCell.value = 'Faculty';
       titleCell.font = { bold: true, size: 9, name: 'Arial' };
     };
 
@@ -1184,29 +1563,33 @@ async function exportUsingGeneratedLayout(classData, components, studentGrades, 
     let midResult = null;
     if (midComps.length > 0) {
       ws.getColumn(1).width = 4;
-      ws.getColumn(2).width = 12;
-      ws.getColumn(3).width = 22;
+      ws.getColumn(2).width = 13;
+      ws.getColumn(3).width = 25;
       midResult = writePeriodSection(ws, startRow, midComps, studentGrades, componentScores, 'midterm', finComps, null, 1, formula);
-      midtermRef = { startDataRow: midResult.startDataRow, halfCol: midResult.halfCol };
-      await writeLetterhead(1, midTotalCols, 'MIDTERM GRADE', midResult.tailColStart);
-      writeSignature(1, midResult.nextRow);
+      // Midterm's own GWA cell sits right after its Overall 1/2 column —
+      // Finals' Final Grade reads it to average the two periods.
+      midtermRef = { startDataRow: midResult.startDataRow, halfCol: midResult.halfCol, gwaCol: midResult.halfCol + 1, exactComposites: midResult.exactComposites };
+      await writeLetterhead(1, midResult.endCol, 'MIDTERM GRADE', midResult.tailColStart);
+      writeSignature(1, midResult.endCol, midResult.nextRow);
     }
     if (finComps.length > 0) {
+      const actualFinStartCol = sideBySide ? midResult.endCol + 1 : 1;
       if (sideBySide) {
-        ws.getColumn(finStartCol).width = 4;
-        ws.getColumn(finStartCol + 1).width = 12;
-        ws.getColumn(finStartCol + 2).width = 22;
+        ws.getColumn(actualFinStartCol).width = 4;
+        ws.getColumn(actualFinStartCol + 1).width = 13;
+        ws.getColumn(actualFinStartCol + 2).width = 25;
       }
-      const finResult = writePeriodSection(ws, startRow, finComps, studentGrades, componentScores, 'finals', midComps, midtermRef, finStartCol, formula);
-      await writeLetterhead(finStartCol, maxCols, 'FINALS GRADE', finResult.tailColStart);
-      writeSignature(finStartCol, finResult.nextRow);
+      const finResult = writePeriodSection(ws, startRow, finComps, studentGrades, componentScores, 'finals', midComps, midtermRef, actualFinStartCol, formula);
+      await writeLetterhead(actualFinStartCol, finResult.endCol, 'FINALS GRADE', finResult.tailColStart);
+      writeSignature(actualFinStartCol, finResult.endCol, finResult.nextRow);
 
       if (sideBySide && midResult) {
-        const lastDataRow = midResult.startDataRow + studentGrades.length - 1;
+        // +1 covers the bordered "Nothing Follows" row under the last student.
+        const lastDataRow = midResult.startDataRow + studentGrades.length;
         for (let r = startRow; r <= lastDataRow; r++) {
-          const midEdgeCell = ws.getCell(r, midTotalCols);
+          const midEdgeCell = ws.getCell(r, midResult.endCol);
           midEdgeCell.border = { top: midEdgeCell.border?.top, bottom: midEdgeCell.border?.bottom, left: midEdgeCell.border?.left };
-          const finEdgeCell = ws.getCell(r, finStartCol);
+          const finEdgeCell = ws.getCell(r, actualFinStartCol);
           finEdgeCell.border = { top: finEdgeCell.border?.top, bottom: finEdgeCell.border?.bottom, right: finEdgeCell.border?.right };
         }
       }
@@ -1235,6 +1618,12 @@ export async function exportClassRecordToExcel({ classData, components, studentG
     toast.error('This class has no Class Record components set up yet.');
     return;
   }
-  await exportUsingGeneratedLayout(classData, components, studentGrades, componentScores);
+  // Alphabetical by surname — same order the on-screen Class Record
+  // (ClassRecordView.js) and the Grade Sheet export already use, so the
+  // exported file never lists students in whatever order they were enrolled.
+  const sortedGrades = studentGrades.slice().sort((a, b) => comparePeopleNames(a.student, b.student));
+  // "A.Y." or "S.Y." — this class's own semester label (Semester Management).
+  const yearAbbr = yearAbbrOf(await getSemesterFor(classData?.semester));
+  await exportUsingGeneratedLayout({ ...classData, yearAbbr }, components, sortedGrades, componentScores);
 }
 

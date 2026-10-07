@@ -44,6 +44,11 @@ const wrap = (title, bodyHtml) => `
 // rest of the app (registration, approval, password reset) keeps working in
 // development without real credentials.
 const sendEmail = async ({ to, subject, html }) => {
+  // Offline mode: never touch the network (utils/offline.js).
+  if (require('./offline').isOffline()) {
+    console.log(`📧 [OFFLINE MODE — e-mail not sent] To: ${to} · ${subject}`);
+    return { offline: true };
+  }
   if (!isConfigured) {
     console.log(`\n📧 [DEV MODE — email not sent, no EMAIL_USER/EMAIL_PASS configured]\nTo: ${to}\nSubject: ${subject}\n${html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()}\n`);
     return { simulated: true };
@@ -92,6 +97,26 @@ const sendVerificationCodeEmail = async (toEmail, name, code) => {
   return sendEmail({ to: toEmail, subject: 'AGMS — Your Verification Code', html });
 };
 
+// First-login account setup (accountSetupController) — confirms the email (Gmail or SSU) a
+// student is adding to their account is really theirs before it's trusted
+// for Forgot Password.
+const sendAccountSetupCodeEmail = async (toEmail, name, code) => {
+  const html = wrap('Verify Your Email', `
+    <p style="color:#374151;font-size:14px;line-height:1.6;">Hi ${name},</p>
+    <p style="color:#374151;font-size:14px;line-height:1.6;">
+      You're setting up your AGMS account. Enter this code to confirm this email address is yours — it's the
+      address we'll use if you ever forget your password. It expires in <strong>10 minutes</strong>.
+    </p>
+    <p style="text-align:center;margin:26px 0;">
+      <span style="background:#060d1c;color:#c9a84c;font-weight:700;font-size:28px;letter-spacing:8px;padding:14px 24px;border-radius:8px;display:inline-block;">${code}</span>
+    </p>
+    <p style="color:#9ca3af;font-size:12px;line-height:1.6;">
+      If you didn't sign in to AGMS, someone may be using your Student ID Number — tell your adviser.
+    </p>
+  `);
+  return sendEmail({ to: toEmail, subject: 'AGMS — Your Account Setup Code', html });
+};
+
 const sendAccountApprovedEmail = async (toEmail, name, loginUrl) => {
   const html = wrap('Your Account Has Been Approved', `
     <p style="color:#374151;font-size:14px;line-height:1.6;">Hi ${name},</p>
@@ -125,4 +150,4 @@ const sendAccountRejectedEmail = async (toEmail, name) => {
   return sendEmail({ to: toEmail, subject: 'AGMS — Registration Rejected', html });
 };
 
-module.exports = { sendEmail, sendPasswordResetEmail, sendVerificationCodeEmail, sendAccountApprovedEmail, sendAccountRejectedEmail, isEmailConfigured: isConfigured };
+module.exports = { sendEmail, sendPasswordResetEmail, sendVerificationCodeEmail, sendAccountSetupCodeEmail, sendAccountApprovedEmail, sendAccountRejectedEmail, isEmailConfigured: isConfigured };

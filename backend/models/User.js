@@ -1,5 +1,7 @@
 const { DataTypes } = require('sequelize');
-const bcrypt = require('bcryptjs');
+const bcrypt = require('../utils/bcrypt');
+const userCache = require('../utils/userCache');
+const { USER_SECRET_FIELDS } = require('../utils/userFields');
 const { sequelize } = require('../config/database');
 
 const User = sequelize.define('User', {
@@ -24,6 +26,10 @@ const User = sequelize.define('User', {
     allowNull: true,
     unique: true,
     validate: { isEmail: true },
+    set(value) {
+      const trimmed = value ? String(value).trim().toLowerCase() : null;
+      this.setDataValue('email', trimmed || null);
+    },
   },
   // Login credential for Admin/Chairperson/Faculty. Always stored lowercase so
   // lookups/uniqueness are case-insensitive regardless of which controller writes it.
@@ -89,6 +95,19 @@ const User = sequelize.define('User', {
     type: DataTypes.STRING(20),
     allowNull: true,
   },
+  // What the student answered (Regular / Irregular) in this semester's
+  // declaration — the system may still make them Irregular automatically.
+  declared_status: {
+    type: DataTypes.STRING(20),
+    allowNull: true,
+  },
+  // Who created this account (the faculty / adviser whose class list brought
+  // the student in) — shown to the student on first login as who to tell if
+  // their details are wrong.
+  created_by: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+  },
   // The exact Semester.name string (e.g. "First Semester 2026-2027") this
   // student was last cleared/promoted for by promotionController.promoteStudents.
   // 1st-semester clearing doesn't change year_level (and even a 2nd-semester
@@ -98,6 +117,27 @@ const User = sequelize.define('User', {
   // Promoted" instead and Promotion Management hides them from Review.
   // Students only.
   last_promoted_semester: {
+    type: DataTypes.STRING(100),
+    allowNull: true,
+  },
+  // Set when a 4th-year student passes their final (2nd) semester through
+  // Promotions. A graduated student is ARCHIVED, never deleted: the account,
+  // grades and class records all stay (they can still sign in to view
+  // them), but they drop out of every "current student" list — enrollment,
+  // promotion runs, active counts — and show under User Management's own
+  // Graduated section instead. Students only.
+  graduated_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  // Accounts are never deleted — an archived account is deactivated (can't
+  // sign in) and listed under User Management's Archived section, from where
+  // it can be restored. Its records all stay.
+  archived_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  graduated_semester: {
     type: DataTypes.STRING(100),
     allowNull: true,
   },
@@ -165,6 +205,50 @@ const User = sequelize.define('User', {
     allowNull: true,
     defaultValue: 'Full Time',
   },
+  // Students only — first-login account setup (accountSetupController).
+  // Students are created/imported with the default password, so until
+  // account_setup_at is set the app shows nothing but the setup wizard:
+  // replace the default password (password_changed_at), then add and verify
+  // a Gmail (which sets account_setup_at).
+  password_changed_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  account_setup_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  // Students only — the Semester.name this student last declared their
+  // Regular/Irregular status for (studentEnrollmentController.declare). Not
+  // equal to the current semester's name = the dashboard shows the
+  // declaration card again. Cleared by their adviser to let them redo it.
+  status_declared_semester: {
+    type: DataTypes.STRING(100),
+    allowNull: true,
+  },
+  status_declared_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  // Students only — the Subject IDs they're taking in status_declared_semester
+  // ([12, 15, ...]). A subject with an open class is also an Enrollment; one
+  // with no class yet waits here and is enrolled automatically once a class
+  // for it is created (utils/autoEnroll.enrollDeclaredStudents).
+  declared_subjects: {
+    type: DataTypes.JSONB,
+    allowNull: true,
+  },
+  // Faculty only: every Program / Year / Section this faculty member advises —
+  // [{ program, year_level, section }, ...] (e.g. BSIT 4-D and BSIT 3-A), set
+  // by a Chairperson of that program (userController.setAdvisory). Drives the
+  // faculty's own "My Advisory" page — the students of those sections and
+  // their grade records. null / [] = no advisory. (The older single
+  // advisory_program/_year_level/_section columns are migrated into this by
+  // utils/ensureIndexes.js.)
+  advisories: {
+    type: DataTypes.JSONB,
+    allowNull: true,
+  },
   // Cosmetic label for Chairperson-role accounts — a "Dean" is a Chairperson
   // account with this label set; permissions are identical either way.
   position: {
@@ -173,6 +257,13 @@ const User = sequelize.define('User', {
   },
   // Only one Chairperson account should be flagged true at a time in practice —
   // Admin sets this manually. Gates who may create/edit/set-current a Semester.
+  // Admin / Chairperson / Faculty only — minutes of inactivity before the
+  // screen locks (AppLayout's idle lock), chosen in their own Settings.
+  // null = the default (5); 0 = never lock.
+  idle_lock_minutes: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+  },
   can_manage_semester: {
     type: DataTypes.BOOLEAN,
     allowNull: false,
@@ -290,6 +381,18 @@ const User = sequelize.define('User', {
         user.password = await bcrypt.hash(user.password, salt);
       }
     },
+    // Keep the auth cache (utils/userCache.js) honest: a saved/deleted user
+    // drops out of it immediately. Bulk updates can't say WHICH rows changed,
+    // so they clear it — except the presence stamp (last_seen_at) that fires
+    // on every disconnect, which never affects who's allowed in.
+    afterSave: (user) => userCache.invalidate(user.id),
+    afterDestroy: (user) => userCache.invalidate(user.id),
+    afterBulkUpdate: (options) => {
+      const fields = options.fields || Object.keys(options.attributes || {});
+      if (fields.every((f) => f === 'last_seen_at' || f === 'updated_at')) return;
+      userCache.clear();
+    },
+    afterBulkDestroy: () => userCache.clear(),
   },
 });
 
@@ -299,7 +402,7 @@ User.prototype.comparePassword = async function (candidatePassword) {
 
 User.prototype.toSafeJSON = function () {
   const values = { ...this.get() };
-  delete values.password;
+  USER_SECRET_FIELDS.forEach((field) => { delete values[field]; });
   return values;
 };
 

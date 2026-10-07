@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Icons, Avatar, Badge, SearchBar, Modal, LoadingSpinner, ProgramBadge, FacultyProgramTags, roleLabel, StatCard, EmptyState, ConfirmDialog, STUDENT_TYPES, studentTypeLabel, StudentTypeBadge, REGULARITY_OPTIONS, RegularityBadge, PresenceDot, PresenceLabel, formatStudentName, compareStudentNames, ProgramDot, programShortLabel } from '../../components/common';
+import { Icons, Avatar, Badge, SearchBar, Modal, LoadingSpinner, ProgramBadge, FacultyProgramTags, roleLabel, StatCard, EmptyState, ConfirmDialog, STUDENT_TYPES, studentTypeLabel, REGULARITY_OPTIONS, PresenceDot, PresenceLabel, formatStudentName, compareStudentNames, ProgramDot, programShortLabel } from '../../components/common';
+import AdviserImportModal from '../../components/admin/AdviserImportModal';
 import StudentGradeRecordModal from '../../components/common/StudentGradeRecordModal';
 import { userService } from '../../services';
 import { useAuth } from '../../context/AuthContext';
@@ -23,11 +24,11 @@ const PROGRAMS = [
 ];
 const GE_OPTION = 'General Education (GE)';
 const FACULTY_PROGRAMS = [...PROGRAMS, GE_OPTION];
-const SECTIONS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+const SECTIONS = Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i)); // A-Z
 
 // Default password for a new account — Faculty/Chairperson can change it
 // afterward from their own Settings page (Change Password, calling PUT /auth/password).
-const DEFAULT_PASSWORD = '123456';
+const DEFAULT_PASSWORD = '12345678';
 const EMPLOYMENT_TYPES = ['Full Time', 'Part Time'];
 
 const emptyForm = {
@@ -35,6 +36,14 @@ const emptyForm = {
   program: '', programs: [], department: '', student_no: '', year_level: 1, section: '',
   student_status: 'Regular', student_type: '', position: 'Chairperson', is_teaching: false, employment_type: 'Full Time',
 };
+
+// Faculty and Chairpersons can both be advisers.
+const ADVISER_ROLES = ['Faculty', 'Chairperson'];
+// An adviser's advisory sections (User.advisories) — "BSIT 4-D" each.
+const advisoriesOf = (u) => (Array.isArray(u?.advisories) ? u.advisories : []);
+const advisoryLabel = (a) => `${programShortLabel(a.program)} ${a.year_level}-${a.section}`;
+const advisoriesLabel = (u) => advisoriesOf(u).map(advisoryLabel).join(', ');
+const sameAdvisory = (a, b) => a.program === b.program && String(a.year_level) === String(b.year_level) && a.section === b.section;
 
 const statusBadge = (status) => {
   if (status === 'Active') return <Badge variant="green"><span className="w-1.5 h-1.5 rounded-full inline-block bg-green-500" /> Active</Badge>;
@@ -77,30 +86,6 @@ const groupFaculty = (faculty) => {
   return grouped;
 };
 
-// Regular vs. Irregular split for any list of students — shared by the
-// Program/Year/Section header rows below so all three levels break the same
-// count down the same way, not just the program's own top-line total.
-const regIrregCounts = (list) => ({
-  regular: list.filter((s) => s.student_status !== 'Irregular').length,
-  irregular: list.filter((s) => s.student_status === 'Irregular').length,
-});
-
-// Fixed widths on the two badges (instead of letting each hug its own digit
-// count) so "Regular"/"Irregular" line up in their own column across every
-// row of a table, no matter how many digits that row's own counts happen to
-// have — otherwise a "608 Regular" row and a "26 Regular" row land their
-// badges at different x-positions and the whole block reads as scattered
-// rather than tabular.
-function RegIrregBadges({ list, className = '' }) {
-  const { regular, irregular } = regIrregCounts(list);
-  return (
-    <span className={`flex items-center gap-2 flex-shrink-0 whitespace-nowrap ${className}`}>
-      <Badge variant="green" className="whitespace-nowrap justify-center w-[92px] tabular-nums">{regular} Regular</Badge>
-      <Badge variant="red" className="whitespace-nowrap justify-center w-[92px] tabular-nums">{irregular} Irregular</Badge>
-    </span>
-  );
-}
-
 function StudentGroupedView({ students, expanded, toggle, actions, presence }) {
   const grouped = groupStudents(students);
   if (Object.keys(grouped).length === 0) {
@@ -124,7 +109,6 @@ function StudentGroupedView({ students, expanded, toggle, actions, presence }) {
                 student_status), so this is visible at the Program, Year, and
                 Section levels alike instead of only after drilling all the
                 way down. */}
-            <RegIrregBadges list={progStudents} />
             <span className="w-4 flex justify-center flex-shrink-0">
               {expanded[key] ? <Icons.ChevronUp className="w-4 h-4 text-gray-400" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400" />}
             </span>
@@ -143,7 +127,6 @@ function StudentGroupedView({ students, expanded, toggle, actions, presence }) {
                   <span className="text-xs text-gray-400 flex-shrink-0">({yearCount})</span>
                 </div>
                 <div className="flex items-center gap-3 flex-shrink-0">
-                  <RegIrregBadges list={yearStudents} />
                   <span className="w-4 flex justify-center flex-shrink-0">
                     {expanded[yearKey] ? <Icons.ChevronUp className="w-3 h-3 text-gray-400" /> : <Icons.ChevronDown className="w-3 h-3 text-gray-400" />}
                   </span>
@@ -154,15 +137,13 @@ function StudentGroupedView({ students, expanded, toggle, actions, presence }) {
                 return (
                   <div key={sec}>
                     <button onClick={() => toggle(secKey)} className="w-full flex items-center justify-between gap-3 pl-14 pr-5 py-1.5 cursor-pointer border-none border-t border-gray-50 bg-white hover:bg-green-50/40 font-sans transition-colors">
-                      <span className="text-[13px] text-gray-600 flex-shrink-0">Section {sec}</span>
+                      <span className="text-[13px] text-gray-600 flex-shrink-0">
+                        {sec === 'No Section' ? sec : `Section ${sec}`}
+                      </span>
                       <div className="flex items-center gap-3 flex-shrink-0">
-                        <RegIrregBadges list={secStudents} />
-                        {/* Section's own grand total — otherwise a bare
-                            number sitting next to "Regular"/"Irregular" reads
-                            as a third, unlabeled count instead of their sum. */}
                         <Badge variant="blue" className="whitespace-nowrap tabular-nums w-[104px] justify-center">{secStudents.length} Total</Badge>
                         <span className="w-4 flex justify-center flex-shrink-0">
-                          {expanded[secKey] ? <Icons.ChevronUp className="w-3 h-3 text-gray-400" /> : <Icons.ChevronDown className="w-3 h-3 text-gray-400" />}
+                          {expanded[secKey] ? <Icons.ChevronUp className="w-4 h-4 text-gray-400" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400" />}
                         </span>
                       </div>
                     </button>
@@ -187,8 +168,6 @@ function StudentGroupedView({ students, expanded, toggle, actions, presence }) {
                                   <div>
                                     <div className="flex items-center gap-2">
                                       <p className="text-[13px] font-medium">{formatStudentName(s.name)}</p>
-                                      <RegularityBadge status={s.student_status} />
-                                      <StudentTypeBadge status={s.student_type} />
                                     </div>
                                     <PresenceLabel presence={presence?.[s.id]} />
                                   </div>
@@ -231,7 +210,7 @@ function FacultyRow({ role, u, actions, presence }) {
             <PresenceDot presence={presence?.[u.id]} className="absolute -bottom-0.5 -right-0.5 ring-2 ring-white" />
           </div>
           <div>
-            <p className="text-[13px] font-medium">{u.name}</p>
+            <p className="text-[13px] font-medium">{formatStudentName(u.name)}</p>
             <p className="text-[11px] text-gray-400">@{u.username}</p>
             <PresenceLabel presence={presence?.[u.id]} />
           </div>
@@ -240,6 +219,7 @@ function FacultyRow({ role, u, actions, presence }) {
       <td className="px-2 py-2.5 text-[13px] text-gray-500">
         {u.position === 'Dean' ? 'Dean' : roleLabel(role)}{u.is_teaching ? ' · Also Teaching' : ''}
         {(u.programs || []).includes(GE_OPTION) && <Badge variant="gray" className="ml-1.5">GE</Badge>}
+        {advisoriesOf(u).length > 0 && <Badge variant="purple" className="ml-1.5">Adviser · {advisoriesLabel(u)}</Badge>}
       </td>
       <td className="px-2 py-2.5">{statusBadge(u.status)}</td>
       <td className="px-2 py-2.5 text-right pr-5">{actions(u)}</td>
@@ -291,9 +271,9 @@ function FacultyGroupedView({ role, faculty, expanded, toggle, actions, presence
 
       {partTime.length > 0 && (
         <div className="border-b border-gray-100 last:border-0">
-          <button onClick={() => toggle('faculty-parttime')} className="w-full flex items-center justify-between px-5 py-3 cursor-pointer border-none bg-amber-50/60 hover:bg-amber-100 font-sans transition-colors">
+          <button onClick={() => toggle('faculty-parttime')} className="w-full flex items-center justify-between px-5 py-3 cursor-pointer border-none bg-gray-50/60 hover:bg-gray-100 font-sans transition-colors">
             <div className="flex items-center gap-2.5">
-              <Badge variant="yellow" className="text-base px-4 py-1.5 font-bold">Part-Time Faculty</Badge>
+              <span className="text-base font-semibold text-gray-800 dark:text-gray-100">Part-Time Faculty</span>
               <span className="text-xs text-gray-400">({partTime.length})</span>
             </div>
             {expanded['faculty-parttime'] ? <Icons.ChevronUp className="w-4 h-4 text-gray-400" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400" />}
@@ -319,20 +299,18 @@ function FacultyGroupedView({ role, faculty, expanded, toggle, actions, presence
 // Reactivate — just search, filters, and View / View Grades on each student.
 export default function UserManagement({ chairpersonMode = false, facultyMode = false }) {
   const { user: currentUser } = useAuth();
+  const isAdmin = currentUser?.role === 'Admin';
   // Both staff modes are scoped to the caller's own programs (the backend
   // already enforces it) — Admin is the only one who sees everything.
   const programScoped = chairpersonMode || facultyMode;
-  // Viewing/editing still covers Student + Faculty (+ Chairperson for Admin) —
-  // only *creation* is narrowed below. Students self-register (see
-  // authController.register) and are verified rather than manually created, so
-  // neither side ever creates one here: Admins seed the Chairperson for each
-  // program, and each Chairperson in turn staffs their own program(s) with Faculty.
+  // Viewing/editing covers Student + Faculty (+ Chairperson for Admin).
+  // Students can be created or imported from Word by Admin only.
   const ROLES = facultyMode ? ['Student'] : chairpersonMode ? ['Student', 'Faculty'] : ALL_ROLES;
   const ROLE_ORDER = facultyMode ? ['Student'] : chairpersonMode ? ['Student', 'Faculty'] : ALL_ROLES;
-  // Faculty's Students List covers every program (see userController.getUsers),
-  // so its Program filter offers all of them — only Chairperson is narrowed
-  // to their own program(s).
-  const myPrograms = chairpersonMode ? (currentUser?.programs || []) : PROGRAMS;
+  // Both staff modes' Program filter offers only the caller's own program(s)
+  // — matches userController.getUsers' own scoping, so there's never an
+  // option here that's guaranteed to show zero results.
+  const myPrograms = programScoped ? (currentUser?.programs || []) : PROGRAMS;
   // Chairpersons may also tag a new Faculty account as teaching General Education —
   // GE spans every program, so it's offered alongside their own program(s) rather
   // than being scoped to them like a real program would be.
@@ -351,25 +329,46 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
   const [yearFilter, setYearFilter] = usePageState(`${pk}.yearFilter`, '');
   const [sectionFilter, setSectionFilter] = usePageState(`${pk}.sectionFilter`, '');
   const [activeRole, setActiveRole] = usePageState(`${pk}.activeRole`, ROLE_ORDER[0]);
-  // Admin used to be limited to creating Chairperson accounts only — now
-  // follows whichever tab (Faculty/Chairperson) is active, same as
-  // Chairperson mode already follows its own single tab. Students are never
-  // created here either way (self-registration), so this only matters when
-  // the Student tab isn't the active one — see the "Add New" button below.
-  const CREATE_ROLE = chairpersonMode ? 'Faculty' : (activeRole === 'Student' ? 'Faculty' : activeRole);
+  // When Admin is on the Student tab, Admin creates Student accounts or imports from Word.
+  // When on Faculty/Chairperson tabs, CREATE_ROLE creates that staff role.
+  const CREATE_ROLE = chairpersonMode ? 'Faculty' : (activeRole === 'Student' ? (isAdmin ? 'Student' : 'Faculty') : activeRole);
   const [showModal, setShowModal] = useState(false);
   const [editUser, setEditUser] = useState(null);
   const [viewUser, setViewUser] = useState(null);
+  // A student's prospectus with grades — their adviser (My Advisory) and the
+  // Chairperson of their program can open it; Admin cannot.
   const [gradesTarget, setGradesTarget] = useState(null);
-  const [deleteTarget, setDeleteTarget] = useState(null);
-  const [deleting, setDeleting] = useState(false);
+  // Chairperson-only: the Faculty account whose advisory section is being set.
+  const [advisoryTarget, setAdvisoryTarget] = useState(null);
+  // The section being picked to add, and the list being edited.
+  const [advisoryForm, setAdvisoryForm] = useState({ program: '', year_level: 1, section: 'A' });
+  const [advisoryList, setAdvisoryList] = useState([]);
+  const [showAdviserImport, setShowAdviserImport] = useState(false);
+  const [savingAdvisory, setSavingAdvisory] = useState(false);
+  const [archiveTarget, setArchiveTarget] = useState(null);
+  const [archivedOpen, setArchivedOpen] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  // Reactivate/Deactivate — same status toggle, opposite directions. Both
+  // confirmed first: Deactivate locks someone out immediately, and
+  // Reactivate isn't harmless either — it can let a Rejected/Deactivated
+  // account (possibly deactivated for a real reason) straight back in, so
+  // it's not just a one-click undo anymore.
+  const [reactivateTarget, setReactivateTarget] = useState(null);
+  const [reactivating, setReactivating] = useState(false);
+  const [deactivateTarget, setDeactivateTarget] = useState(null);
+  const [deactivating, setDeactivating] = useState(false);
   const [formData, setFormData] = useState({ ...emptyForm });
   const [saving, setSaving] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
-  const [pagination, setPagination] = usePageState(`${pk}.pagination`, { page: 1, pages: 1, total: 0 });
+  const [, setPagination] = usePageState(`${pk}.pagination`, { page: 1, pages: 1, total: 0 });
   const [expanded, setExpanded] = usePageState(`${pk}.expanded`, {});
 
   const toggle = (key) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
+  // Graduated section's own collapse state — separate from `expanded` so its
+  // Program/Year/Section groups don't toggle together with the active list's.
+  const [graduatedOpen, setGraduatedOpen] = usePageState(`${pk}.graduatedOpen`, false);
+  const [graduatedExpanded, setGraduatedExpanded] = usePageState(`${pk}.graduatedExpanded`, {});
+  const toggleGraduated = (key) => setGraduatedExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
 
   // Fetches every user in one go (not paginated) — needed since users are now
   // grouped into role boxes (each with its own Program/Year/Section sub-grouping)
@@ -378,10 +377,14 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
     try {
       setLoading(true);
       const params = { all: true };
-      // Faculty's / a teaching Chairperson's Students List spans every program;
-      // Chairperson's own User Management (no facultyMode) stays program-scoped.
-      if (facultyMode) params.all_programs = true;
+      // Both facultyMode's Students List and Chairperson's own User
+      // Management are scoped server-side to the caller's own program(s) —
+      // nothing extra to request here.
       if (search) params.search = search;
+      // Graduated students (archived, never deleted) — pulled in too so they
+      // can show in their own Graduated section below the active list.
+      // Faculty's Students List only ever shows current students.
+      if (!facultyMode) params.include_graduated = true;
       const { data } = await userService.getAll(params);
       setUsers(data.users);
       setPagination(data.pagination);
@@ -390,13 +393,20 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
     } finally {
       setLoading(false);
     }
-  }, [search]);
+  }, [search, facultyMode, setPagination]);
 
   useEffect(() => { loadUsers(); }, [loadUsers]);
 
-  const openCreate = () => {
+  const openCreate = (roleOverride) => {
     setEditUser(null);
-    setFormData({ ...emptyForm, role: CREATE_ROLE });
+    const role = roleOverride || (isAdmin && activeRole === 'Student' ? 'Student' : CREATE_ROLE);
+    setFormData({
+      ...emptyForm,
+      role,
+      program: programFilter || (role === 'Student' ? (myPrograms[0] || PROGRAMS[0]) : ''),
+      year_level: yearFilter ? parseInt(yearFilter, 10) : 1,
+      section: sectionFilter || 'A',
+    });
     setShowModal(true);
   };
 
@@ -444,9 +454,14 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
       toast.error('Name and role are required');
       return;
     }
-    if (!formData.email || !formData.email.trim()) {
-      toast.error('Email is required — it\'s how they\'ll recover a forgotten password.');
-      return;
+    // Email is optional here — each faculty member adds their own Gmail from
+    // their Settings page.
+    if (formData.email && formData.email.trim()) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(formData.email.trim())) {
+        toast.error('Please enter a valid email address.');
+        return;
+      }
     }
     if (formData.role === 'Student') {
       if (!formData.student_no) {
@@ -477,7 +492,8 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
     }
     try {
       setSaving(true);
-      const saveData = { ...formData, department: 'College of Arts and Sciences' };
+      const cleanEmail = formData.email && formData.email.trim() ? formData.email.trim().toLowerCase() : null;
+      const saveData = { ...formData, email: cleanEmail, department: 'College of Arts and Sciences' };
       if (editUser) {
         // Password is set once at creation and afterward is only ever changed
         // by the account owner themselves, from their own Settings page — never
@@ -501,28 +517,103 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
     }
   };
 
-  const handleDelete = async () => {
-    if (!deleteTarget) return;
+  // Every real program (GE is a bonus tag, not a section's program).
+  const advisoryPrograms = PROGRAMS;
+
+  // Admin assigns faculty advisory sections (any program).
+  const openAdvisory = (u) => {
+    setAdvisoryTarget(u);
+    setAdvisoryList(advisoriesOf(u));
+    setAdvisoryForm({ program: advisoryPrograms[0] || '', year_level: 1, section: 'A' });
+  };
+
+  // Which faculty (other than the one being edited) already advises the
+  // chosen Program + Year + a given section — those sections are disabled in
+  // the picker (the backend refuses a second adviser for a section too).
+  const sectionAdviser = (section) => {
+    const candidate = { program: advisoryForm.program, year_level: advisoryForm.year_level, section };
+    return users.find((f) => ADVISER_ROLES.includes(f.role) && f.id !== advisoryTarget?.id
+      && advisoriesOf(f).some((a) => sameAdvisory(a, candidate)));
+  };
+  const alreadyListed = (section) => advisoryList.some((a) => sameAdvisory(a, { program: advisoryForm.program, year_level: advisoryForm.year_level, section }));
+
+  const addAdvisory = () => {
+    if (!advisoryForm.program || sectionAdviser(advisoryForm.section) || alreadyListed(advisoryForm.section)) return;
+    setAdvisoryList((list) => [...list, { program: advisoryForm.program, year_level: parseInt(advisoryForm.year_level, 10), section: advisoryForm.section }]);
+  };
+  const removeAdvisory = (idx) => setAdvisoryList((list) => list.filter((_, i) => i !== idx));
+
+  const saveAdvisory = async (clear = false) => {
+    if (!advisoryTarget) return;
     try {
-      setDeleting(true);
-      await userService.delete(deleteTarget.id);
-      toast.success('Account permanently deleted');
-      setDeleteTarget(null);
+      setSavingAdvisory(true);
+      const advisories = clear ? [] : advisoryList;
+      await userService.setAdvisory(advisoryTarget.id, { advisories });
+      toast.success(advisories.length
+        ? `${formatStudentName(advisoryTarget.name)} is now the adviser of ${advisories.map(advisoryLabel).join(', ')}`
+        : 'Advisory cleared');
+      setAdvisoryTarget(null);
       loadUsers();
     } catch (err) {
-      toast.error(err.response?.data?.message || 'Failed to delete account');
+      toast.error(err.response?.data?.message || 'Failed to save advisory');
     } finally {
-      setDeleting(false);
+      setSavingAdvisory(false);
     }
   };
 
-  const handleReactivate = async (user) => {
+  // Accounts are never deleted — archived (can't sign in, out of the active
+  // list, every record kept) and restorable from the Archived section.
+  const handleArchive = async () => {
+    if (!archiveTarget) return;
     try {
-      await userService.update(user.id, { status: 'Active' });
-      toast.success('User reactivated');
+      setArchiving(true);
+      const { data } = await userService.archive(archiveTarget.id);
+      toast.success(data.message || 'Account archived');
+      setArchiveTarget(null);
       loadUsers();
     } catch (err) {
-      toast.error('Failed to reactivate');
+      toast.error(err.response?.data?.message || 'Failed to archive account');
+    } finally {
+      setArchiving(false);
+    }
+  };
+  const handleRestore = async (u) => {
+    try {
+      const { data } = await userService.restore(u.id);
+      toast.success(data.message || 'Account restored');
+      loadUsers();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to restore account');
+    }
+  };
+
+  const handleReactivate = async () => {
+    if (!reactivateTarget) return;
+    setReactivating(true);
+    try {
+      await userService.update(reactivateTarget.id, { status: 'Active' });
+      toast.success(`${reactivateTarget.name} reactivated`);
+      setReactivateTarget(null);
+      loadUsers();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to reactivate');
+    } finally {
+      setReactivating(false);
+    }
+  };
+
+  const handleDeactivate = async () => {
+    if (!deactivateTarget) return;
+    setDeactivating(true);
+    try {
+      await userService.update(deactivateTarget.id, { status: 'Deactivated' });
+      toast.success(`${deactivateTarget.name} deactivated`);
+      setDeactivateTarget(null);
+      loadUsers();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to deactivate');
+    } finally {
+      setDeactivating(false);
     }
   };
 
@@ -531,6 +622,8 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
   // staffed to any one Chairperson's program, so they don't belong in the
   // Chairperson's own Faculty list at all (only Admin manages them).
   const allUsers = users.filter((u) =>
+    !u.graduated_at &&
+    !u.archived_at &&
     u.role !== 'Admin' &&
     u.status !== 'Pending' &&
     u.status !== 'Rejected' &&
@@ -561,20 +654,45 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
   // doesn't balloon into a request for the whole account list at once.
   const presence = usePresence((usersByRole[activeRole] || []).map((u) => u.id));
 
-  // Admin and Chairperson both lose edit rights over a Student's info once
-  // they're verified (status Active) — matches the same rule the backend
-  // enforces in userController.updateUser.
-  const editLocked = (u) => u.role === 'Student' && u.status === 'Active';
+  // Admin loses edit rights over a Student's info once they're verified
+  // (status Active) — Chairperson is exempt (they still deal with a
+  // verified student's record day to day) — matches the same rule the
+  // backend enforces in userController.updateUser.
+  const editLocked = (u) => !chairpersonMode && u.role === 'Student' && u.status === 'Active';
 
-  const renderActions = (u) => (
+  // Graduated (archived) students — kept for good, just out of the active
+  // list. Same Program filter as the active list; view-only actions.
+  const graduatedStudents = users.filter((u) =>
+    u.role === 'Student' && u.graduated_at && !u.archived_at && (!programFilter || u.program === programFilter)
+  );
+  // Archived accounts of the role on screen.
+  const archivedUsers = users.filter((u) => u.archived_at && u.role === activeRole
+    && (!programFilter || (u.role === 'Student' ? u.program === programFilter : (u.programs || []).includes(programFilter))));
+  const renderGraduatedActions = (u) => (
+    <div className="flex gap-1.5 justify-end items-center">
+      <span className="text-[11px] text-gray-400 whitespace-nowrap mr-1" title={u.graduated_semester || ''}>
+        Graduated {u.graduated_semester || new Date(u.graduated_at).getFullYear()}
+      </span>
+      <button className="btn-icon" onClick={() => openView(u)} title="View"><Icons.Eye /></button>
+    </div>
+  );
+
+  // Student accounts are view-only for Admin and Chairperson — the student's
+  // adviser edits / deactivates them from My Advisory.
+  const renderActions = (u) => (u.role === 'Student' ? (
     <div className="flex gap-1.5 justify-end">
       <button className="btn-icon" onClick={() => openView(u)} title="View"><Icons.Eye /></button>
-      {u.role === 'Student' && (
-        // A read-only copy of this student's full curriculum record — every
-        // subject, Year 1 through 4, with their overall GWA — the same view
-        // the student themselves sees on My Grades, pulled up here so Admin/
-        // Chairperson don't have to go looking for it separately.
-        <button className="btn-icon" onClick={() => setGradesTarget(u)} title="View Grades (1st-4th Year + GWA)"><Icons.FileText /></button>
+      {chairpersonMode && (
+        <button className="btn-icon" onClick={() => setGradesTarget(u)} title="View Prospectus (grades, 1st-4th Year + GWA)"><Icons.FileText /></button>
+      )}
+    </div>
+  ) : (
+    <div className="flex gap-1.5 justify-end">
+      <button className="btn-icon" onClick={() => openView(u)} title="View"><Icons.Eye /></button>
+      {isAdmin && !programScoped && ADVISER_ROLES.includes(u.role) && (
+        <button className="btn-icon hover:!bg-purple-50 hover:!text-purple-600" onClick={() => openAdvisory(u)} title={advisoriesOf(u).length ? `Advisory: ${advisoriesLabel(u)} — change` : 'Set Advisory'}>
+          <Icons.Award />
+        </button>
       )}
       {!facultyMode && (editLocked(u) ? (
         <button className="btn-icon opacity-40 cursor-not-allowed" disabled title="Verified — info can no longer be edited">
@@ -584,17 +702,26 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
         <button className="btn-icon" onClick={() => openEdit(u)} title="Edit"><Icons.Edit /></button>
       ))}
       {!facultyMode && u.status !== 'Active' && (
-        <button className="btn-icon hover:!bg-green-50 hover:!text-green-500" onClick={() => handleReactivate(u)} title="Reactivate">
+        <button className="btn-icon hover:!bg-green-50 hover:!text-green-500" onClick={() => setReactivateTarget(u)} title="Reactivate">
           <Icons.Check />
         </button>
       )}
-      {!facultyMode && u.role !== 'Student' && (
-        <button className="btn-icon hover:!bg-red-50 hover:!text-red-500" onClick={() => setDeleteTarget(u)} title="Delete permanently">
-          <Icons.Trash />
+      {/* Deactivate — the other direction of Reactivate above. Never offered
+          on your own account (locking yourself out this way has no way back
+          except another Admin/Chairperson doing it for you). */}
+      {!facultyMode && u.status === 'Active' && u.id !== currentUser?.id && (
+        <button className="btn-icon hover:!bg-amber-50 hover:!text-amber-600" onClick={() => setDeactivateTarget(u)} title="Deactivate">
+          <Icons.Ban />
+        </button>
+      )}
+      {/* Archive (never delete) — not on your own account. */}
+      {!facultyMode && u.id !== currentUser?.id && (
+        <button className="btn-icon hover:!bg-amber-50 hover:!text-amber-600" onClick={() => setArchiveTarget(u)} title="Archive account">
+          <Icons.Archive />
         </button>
       )}
     </div>
-  );
+  ));
 
   return (
     <>
@@ -605,14 +732,30 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
             {facultyMode
               ? `View the students in all programs and their grade records (${usersByRole.Student?.length || 0} total)`
               : chairpersonMode
-                ? `View students and faculty, and create Faculty accounts in your program(s) (${pagination.total} total)`
-                : `View students and faculty, and create Chairperson or Faculty accounts (${pagination.total} total)`}
+                ? `View students and faculty, and create Faculty accounts in your program(s) (${allUsers.length} total)`
+                : `Manage accounts: view students (added by their faculty's class lists), and create Chairperson or Faculty accounts (${allUsers.length} total)`}
           </p>
         </div>
+        {/* Students aren't added here — each Faculty member imports the class
+            list of the classes they teach (My Classes → Import Class List),
+            and those students appear in this list on their own. */}
+        {activeRole === 'Student' && isAdmin && (
+          <p className="text-[11px] text-gray-400 max-w-xs sm:text-right">
+            Students are added by their faculty through <b>Import Class List</b> and appear here automatically.
+          </p>
+        )}
+        {/* Staff Tab Action Buttons */}
         {activeRole !== 'Student' && (
-          <button className="btn btn-gold" onClick={openCreate}>
-            <Icons.Plus /> Add New {CREATE_ROLE}
-          </button>
+          <div className="flex flex-wrap gap-2">
+            {isAdmin && !programScoped && (
+              <button className="btn btn-outline" onClick={() => setShowAdviserImport(true)} title="Set every section's adviser from the Room Assignment list">
+                <Icons.Upload /> Import Advisers
+              </button>
+            )}
+            <button className="btn btn-gold" onClick={() => openCreate()}>
+              <Icons.Plus /> Add New {CREATE_ROLE}
+            </button>
+          </div>
         )}
       </div>
 
@@ -623,7 +766,7 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
         // jump straight to one: clicking a tile filters to that program (click
         // again to clear), same as picking it from the Program dropdown.
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-          {PROGRAMS.map((p) => {
+          {myPrograms.map((p) => {
             const count = allUsers.filter((u) => u.role === 'Student' && u.program === p).length;
             const active = programFilter === p;
             return (
@@ -740,10 +883,88 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
         </div>
       )}
 
+      {/* GRADUATED — 4th-year students who passed their final semester
+          (marked on Promote). Archived, never deleted: account, grades and
+          class records all stay; they're just out of the active list above,
+          enrollment and future promotion runs. Collapsed by default. */}
+      {!loading && activeRole === 'Student' && graduatedStudents.length > 0 && (
+        <div className="card overflow-hidden mt-5">
+          <button
+            onClick={() => setGraduatedOpen((o) => !o)}
+            className="w-full px-5 py-3.5 flex items-center justify-between border-none cursor-pointer font-sans text-white transition-colors bg-purple-500 hover:bg-purple-600"
+          >
+            <div className="flex items-center gap-3">
+              <span className="text-sm font-bold bg-white/20 rounded-full min-w-[26px] h-[26px] px-2 flex items-center justify-center">{graduatedStudents.length}</span>
+              <div className="text-left">
+                <p className="text-sm font-bold flex items-center gap-1.5"><Icons.Award className="w-3.5 h-3.5" /> Graduated (Archived)</p>
+                <p className="text-[11px] text-white/75">Kept for good — accounts, grades and class records are never deleted.</p>
+              </div>
+            </div>
+            {graduatedOpen ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
+          </button>
+          {graduatedOpen && (
+            <div className="max-h-[70vh] overflow-y-auto border-t border-gray-100">
+              <StudentGroupedView students={graduatedStudents} expanded={graduatedExpanded} toggle={toggleGraduated} actions={renderGraduatedActions} presence={{}} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ARCHIVED ACCOUNTS — never deleted. Deactivated (can't sign in) and
+          kept with all their records; Restore brings one back. */}
+      {!loading && !facultyMode && archivedUsers.length > 0 && (
+        <div className="card overflow-hidden mt-5">
+          <button
+            onClick={() => setArchivedOpen((o) => !o)}
+            className="w-full px-5 py-3.5 flex items-center justify-between border-none cursor-pointer font-sans text-white transition-colors bg-gray-500 hover:bg-gray-600"
+          >
+            <div className="flex items-center gap-3">
+              <span className="text-sm font-bold bg-white/20 rounded-full min-w-[26px] h-[26px] px-2 flex items-center justify-center">{archivedUsers.length}</span>
+              <div className="text-left">
+                <p className="text-sm font-bold flex items-center gap-1.5"><Icons.Archive className="w-3.5 h-3.5" /> Archived {activeRole === 'Faculty' ? 'Faculty' : `${activeRole}s`}</p>
+                <p className="text-[11px] text-white/75">Can't sign in. Their grades, classes and records are all kept — restore to bring an account back.</p>
+              </div>
+            </div>
+            {archivedOpen ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
+          </button>
+          {archivedOpen && (
+            <div className="max-h-[60vh] overflow-y-auto border-t border-gray-100">
+              <table className="w-full text-[13px]">
+                <thead className="bg-gray-50 text-[11px] uppercase text-gray-500 sticky top-0">
+                  <tr>
+                    <th className="px-4 py-2 text-left">Name</th>
+                    <th className="px-4 py-2 text-left">{activeRole === 'Student' ? 'Student ID · Program' : 'Program(s)'}</th>
+                    <th className="px-4 py-2 text-center">Archived</th>
+                    <th className="px-4 py-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {archivedUsers.map((u) => (
+                    <tr key={u.id} className="border-t border-gray-100 text-gray-600">
+                      <td className="px-4 py-2 font-medium">{formatStudentName(u.name)}</td>
+                      <td className="px-4 py-2 text-[12px]">{u.role === 'Student' ? `${u.student_no || '—'} · ${u.program || '—'}` : (u.programs || []).join(', ') || '—'}</td>
+                      <td className="px-4 py-2 text-center text-[12px]">{new Date(u.archived_at).toLocaleDateString()}</td>
+                      <td className="px-4 py-2">
+                        <div className="flex gap-1.5 justify-end">
+                          <button className="btn-icon" onClick={() => openView(u)} title="View"><Icons.Eye /></button>
+                          <button className="btn btn-outline btn-sm" onClick={() => handleRestore(u)} title="Restore this account">
+                            <Icons.RotateCw className="w-3.5 h-3.5" /> Restore
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* CREATE / EDIT MODAL */}
       {showModal && (
         <Modal
-          title={editUser ? `Edit User — ${editUser.name}` : `Add New ${CREATE_ROLE}`}
+          title={editUser ? `Edit User — ${editUser.name}` : `Add New ${formData.role || CREATE_ROLE}`}
           onClose={() => { setShowModal(false); setEditUser(null); }}
           size="max-w-xl"
           footer={
@@ -761,7 +982,11 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
               <input className="form-input" value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} placeholder="Enter full name" />
             </div>
             <div className="sm:col-span-2">
-              <label className="form-label">Email Address <span className="text-red-500">*</span></label>
+              <label className="form-label">
+                Email Address {formData.role === 'Student'
+                  ? <span className="text-xs text-gray-400 font-normal">(Optional — required in student's account)</span>
+                  : <span className="text-xs text-gray-400 font-normal">(Optional — they add their own Gmail in Settings)</span>}
+              </label>
               {editUser ? (
                 // Same reasoning as the locked Password field below — once an
                 // account exists, only its owner changes their own email
@@ -772,8 +997,19 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
                 </p>
               ) : (
                 <>
-                  <input className="form-input" type="email" value={formData.email} onChange={(e) => setFormData({ ...formData, email: e.target.value })} placeholder="e.g. jdelacruz@gmail.com" autoComplete="off" />
-                  <p className="text-[11px] text-gray-400 mt-1">Needed for the "Forgot password" self-service link on the login page to work.</p>
+                  <input
+                    className="form-input"
+                    type="email"
+                    value={formData.email}
+                    onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+                    placeholder={formData.role === 'Student' ? 'e.g. jdelacruz@gmail.com (Optional)' : 'e.g. jdelacruz@gmail.com'}
+                    autoComplete="off"
+                  />
+                  <p className="text-[11px] text-gray-400 mt-1">
+                    {formData.role === 'Student'
+                      ? 'Optional when adding students. The student will be required to provide/confirm their email in their own account.'
+                      : 'Needed for the "Forgot password" self-service link on the login page to work.'}
+                  </p>
                 </>
               )}
             </div>
@@ -822,11 +1058,13 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
                 )
               ) : (
                 <>
-                  <div className="form-input bg-gray-50 text-gray-600 flex items-center">{CREATE_ROLE}</div>
+                  <div className="form-input bg-gray-50 text-gray-600 flex items-center">{formData.role || CREATE_ROLE}</div>
                   <p className="text-[11px] text-gray-400 mt-1">
                     {chairpersonMode
                       ? 'Chairpersons can only create Faculty accounts.'
-                      : `Matches the tab you're on — switch to "${CREATE_ROLE === 'Chairperson' ? 'Faculty' : 'Chairperson'}" to create that instead.`}
+                      : formData.role === 'Student'
+                        ? 'Admin creating a new Student account.'
+                        : `Matches the tab you're on — switch to "${CREATE_ROLE === 'Chairperson' ? 'Faculty' : 'Chairperson'}" to create that instead.`}
                   </p>
                 </>
               )}
@@ -916,8 +1154,15 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
                 {formData.role === 'Faculty' && (
                   <div>
                     <label className="form-label">Employment Type</label>
-                    <select className="form-select" value={formData.employment_type} onChange={(e) => setFormData({ ...formData, employment_type: e.target.value })}>
-                      {EMPLOYMENT_TYPES.map((t) => <option key={t}>{t}</option>)}
+                    {/* Part-Time faculty are tagged with every program purely
+                        so Admin can find them from one "Part-Time Faculty"
+                        container — they're not really staffed to any one
+                        Chairperson's program, and don't even show up in a
+                        Chairperson's own Faculty list (see allUsers' own
+                        filter above). So a Chairperson only ever creates
+                        Full Time faculty here — Part-Time stays Admin-only. */}
+                    <select className="form-select" value={formData.employment_type} onChange={(e) => setFormData({ ...formData, employment_type: e.target.value })} disabled={chairpersonMode}>
+                      {(chairpersonMode ? ['Full Time'] : EMPLOYMENT_TYPES).map((t) => <option key={t}>{t}</option>)}
                     </select>
                   </div>
                 )}
@@ -978,10 +1223,9 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
             {viewUser.role === 'Chairperson' && viewUser.is_teaching && (
               <div className="col-span-2"><Badge variant="purple">Also teaches classes</Badge></div>
             )}
-            {viewUser.role === 'Student' && <div><span className="text-gray-500">Status:</span> <span className="ml-1"><RegularityBadge status={viewUser.student_status} /></span></div>}
             {viewUser.student_no && <div><span className="text-gray-500">Student No:</span> <span className="font-medium ml-1">{viewUser.student_no}</span></div>}
             {viewUser.year_level && <div><span className="text-gray-500">Year Level:</span> <span className="font-medium ml-1">Year {viewUser.year_level}</span></div>}
-            {viewUser.section && <div><span className="text-gray-500">Section:</span> <span className="font-medium ml-1">Section {viewUser.section}</span></div>}
+            {viewUser.section && <div><span className="text-gray-500">Section:</span> <span className="font-medium ml-1">{viewUser.section === 'No Section' ? viewUser.section : `Section ${viewUser.section}`}</span></div>}
             {viewUser.irregular_sections && viewUser.irregular_sections.length > 0 && (
               <div className="col-span-2">
                 <span className="text-gray-500">Taking Classes In:</span>{' '}
@@ -992,6 +1236,7 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
                 </span>
               </div>
             )}
+            {ADVISER_ROLES.includes(viewUser.role) && <div><span className="text-gray-500">Advisory:</span> <span className="font-medium ml-1">{advisoriesOf(viewUser).length ? advisoriesLabel(viewUser) : 'None'}</span></div>}
             {viewUser.role === 'Faculty' && viewUser.employment_type && <div><span className="text-gray-500">Employment Type:</span> <span className="font-medium ml-1">{viewUser.employment_type}</span></div>}
             {viewUser.academic_rank && <div><span className="text-gray-500">Academic Rank:</span> <span className="font-medium ml-1">{viewUser.academic_rank}</span></div>}
             {viewUser.specialization && <div className="col-span-2"><span className="text-gray-500">Specialization:</span> <span className="font-medium ml-1">{viewUser.specialization}</span></div>}
@@ -1000,22 +1245,131 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
         </Modal>
       )}
 
-      {/* STUDENT GRADE RECORD */}
-      {gradesTarget && (
-        <StudentGradeRecordModal studentId={gradesTarget.id} onClose={() => setGradesTarget(null)} />
+      {/* SET ADVISORY (Chairperson, Faculty accounts only) */}
+      {advisoryTarget && (
+        <Modal
+          title={`Advisory — ${formatStudentName(advisoryTarget.name)}`}
+          onClose={() => setAdvisoryTarget(null)}
+          footer={
+            <>
+              {advisoriesOf(advisoryTarget).length > 0 && (
+                <button className="btn btn-outline mr-auto text-red-600" onClick={() => saveAdvisory(true)} disabled={savingAdvisory}>Clear All</button>
+              )}
+              <button className="btn btn-outline" onClick={() => setAdvisoryTarget(null)} disabled={savingAdvisory}>Cancel</button>
+              <button className="btn btn-primary" onClick={() => saveAdvisory(false)} disabled={savingAdvisory}>
+                {savingAdvisory ? 'Saving...' : 'Save Advisory'}
+              </button>
+            </>
+          }
+        >
+          <p className="text-[13px] text-gray-500 mb-4">
+            Choose the sections this faculty member advises — add as many as needed. They'll see each section's students and their grade records under <b>My Advisory</b>.
+          </p>
+
+          <label className="form-label">Advisory Sections</label>
+          {advisoryList.length === 0 ? (
+            <p className="text-[13px] text-gray-400 italic mb-4">No advisory sections yet — add one below.</p>
+          ) : (
+            <div className="flex flex-wrap gap-2 mb-4">
+              {advisoryList.map((a, idx) => (
+                <span key={`${a.program}|${a.year_level}|${a.section}`} className="inline-flex items-center gap-1.5 pl-3 pr-1.5 py-1 rounded-full bg-purple-50 text-purple-700 border border-purple-200 text-[13px] font-semibold">
+                  {advisoryLabel(a)}
+                  <button type="button" className="w-5 h-5 rounded-full flex items-center justify-center hover:bg-purple-200 cursor-pointer border-none bg-transparent text-purple-700" onClick={() => removeAdvisory(idx)} title="Remove this section">
+                    <Icons.X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+
+          <div className="rounded-lg border border-gray-200 p-3">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="sm:col-span-3">
+                <label className="form-label">Program</label>
+                <select className="form-select" value={advisoryForm.program} onChange={(e) => setAdvisoryForm({ ...advisoryForm, program: e.target.value })}>
+                  {advisoryPrograms.map((p) => <option key={p} value={p}>{p}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="form-label">Year Level</label>
+                <select className="form-select" value={advisoryForm.year_level} onChange={(e) => setAdvisoryForm({ ...advisoryForm, year_level: e.target.value })}>
+                  {[1, 2, 3, 4].map((y) => <option key={y} value={y}>Year {y}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="form-label">Section</label>
+                <select className="form-select" value={advisoryForm.section} onChange={(e) => setAdvisoryForm({ ...advisoryForm, section: e.target.value })}>
+                  {SECTIONS.map((sec) => {
+                    const adviser = sectionAdviser(sec);
+                    const listed = alreadyListed(sec);
+                    return <option key={sec} value={sec} disabled={!!adviser || listed}>Section {sec}{adviser ? ` — adviser: ${formatStudentName(adviser.name)}` : listed ? ' — added' : ''}</option>;
+                  })}
+                </select>
+              </div>
+              <div className="flex items-end">
+                <button
+                  type="button"
+                  className="btn btn-outline w-full justify-center"
+                  onClick={addAdvisory}
+                  disabled={!advisoryForm.program || !!sectionAdviser(advisoryForm.section) || alreadyListed(advisoryForm.section)}
+                >
+                  <Icons.Plus className="w-4 h-4" /> Add Section
+                </button>
+              </div>
+            </div>
+            {sectionAdviser(advisoryForm.section) && (
+              <p className="text-xs text-red-600 mt-3">That section already has an adviser — remove it from theirs first or pick another section.</p>
+            )}
+          </div>
+        </Modal>
       )}
 
+      {/* IMPORT ADVISERS (Admin) */}
+      {showAdviserImport && (
+        <AdviserImportModal users={allUsers} onClose={() => setShowAdviserImport(false)} onImported={loadUsers} />
+      )}
+
+      {gradesTarget && <StudentGradeRecordModal studentId={gradesTarget.id} onClose={() => setGradesTarget(null)} />}
+
       {/* DELETE CONFIRMATION */}
-      {deleteTarget && (
+      {archiveTarget && (
         <ConfirmDialog
-          title="Delete Account"
-          message={`Are you sure you want to delete this account? "${deleteTarget.name}" and all of their account data will be permanently removed. This action cannot be undone.`}
-          confirmText={deleting ? 'Deleting...' : 'Delete Permanently'}
-          confirmDisabled={deleting}
-          onConfirm={handleDelete}
-          onCancel={() => setDeleteTarget(null)}
+          title="Archive Account"
+          message={`Archive ${archiveTarget.name}'s account${archiveTarget.student_no ? ` (${archiveTarget.student_no})` : ''}? They won't be able to sign in and the account leaves this list, but nothing is deleted — their grades, classes and records are all kept. You can restore it any time from the Archived section.`}
+          confirmText={archiving ? 'Archiving...' : 'Archive'}
+          confirmDisabled={archiving}
+          variant="gold"
+          onConfirm={handleArchive}
+          onCancel={() => setArchiveTarget(null)}
         />
       )}
+
+      {/* REACTIVATE CONFIRMATION */}
+      {reactivateTarget && (
+        <ConfirmDialog
+          title="Reactivate Account"
+          message={`Reactivate ${reactivateTarget.name}'s account? They'll be able to sign in again right away — make sure that's actually intended (especially if this account was Deactivated or Rejected for a specific reason).`}
+          confirmText={reactivating ? 'Reactivating...' : 'Reactivate'}
+          variant="green"
+          confirmDisabled={reactivating}
+          onConfirm={handleReactivate}
+          onCancel={() => setReactivateTarget(null)}
+        />
+      )}
+
+      {/* DEACTIVATE CONFIRMATION */}
+      {deactivateTarget && (
+        <ConfirmDialog
+          title="Deactivate Account"
+          message={`Deactivate ${deactivateTarget.name}'s account? They won't be able to sign in until an Admin or Chairperson reactivates it — their account data stays intact either way, unlike Delete.`}
+          confirmText={deactivating ? 'Deactivating...' : 'Deactivate'}
+          variant="red"
+          confirmDisabled={deactivating}
+          onConfirm={handleDeactivate}
+          onCancel={() => setDeactivateTarget(null)}
+        />
+      )}
+
     </>
   );
 }

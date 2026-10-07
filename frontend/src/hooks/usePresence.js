@@ -12,6 +12,35 @@ import socket from '../services/socket';
 // Returns { [userId]: { online: boolean, last_seen_at: string|null } }.
 // An ID with no entry yet (still loading) should be treated as unknown, not
 // offline — callers checking `presence[id]?.online` naturally get that.
+// The server only pushes a person's online/offline flip to sockets that asked
+// to watch them (it used to broadcast every flip to everyone — see server.js).
+// Several lists can be mounted at once and may watch the same person, so
+// subscriptions are reference-counted here: the server hears "watch" when the
+// first list wants someone and "unwatch" only when the last one stops.
+const watchCounts = new Map(); // userId -> number of mounted hooks watching
+const watch = (ids) => {
+  const fresh = [];
+  ids.forEach((id) => {
+    const n = watchCounts.get(id) || 0;
+    watchCounts.set(id, n + 1);
+    if (n === 0) fresh.push(id);
+  });
+  if (fresh.length > 0 && socket.connected) socket.emit('presence:watch', fresh);
+};
+const unwatch = (ids) => {
+  const gone = [];
+  ids.forEach((id) => {
+    const n = watchCounts.get(id) || 0;
+    if (n <= 1) { watchCounts.delete(id); gone.push(id); } else watchCounts.set(id, n - 1);
+  });
+  if (gone.length > 0 && socket.connected) socket.emit('presence:unwatch', gone);
+};
+// Rooms live on the server-side socket, which is brand new after every
+// reconnect — put everyone still on screen back.
+socket.on('connect', () => {
+  if (watchCounts.size > 0) socket.emit('presence:watch', [...watchCounts.keys()]);
+});
+
 export function usePresence(userIds) {
   const [presence, setPresence] = useState({});
   // Stable dependency key — an inline array literal from the caller would
@@ -23,10 +52,12 @@ export function usePresence(userIds) {
 
   useEffect(() => {
     const ids = idsRef.current;
-    if (ids.length === 0) return;
+    if (ids.length === 0) return undefined;
+    watch(ids);
     userService.getPresence(ids)
       .then(({ data }) => setPresence((prev) => ({ ...prev, ...data.presence })))
       .catch(() => {});
+    return () => unwatch(ids);
   }, [idsKey]);
 
   useEffect(() => {

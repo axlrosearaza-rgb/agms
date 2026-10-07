@@ -4,9 +4,11 @@ import API from '../../services/api';
 import { setUser as persistUser } from '../../services/authStorage';
 import { Icons, Avatar, Badge, ProgramBadge, roleLabel, StudentTypeBadge, RegularityBadge, studentYearLevelsLabel, CurrentSemesterTag } from '../common';
 import toast from 'react-hot-toast';
+import { useSemesterLabels } from '../../utils/semesterLabels';
 
 export default function ProfilePage() {
   const { user, login } = useAuth();
+  const { currentLabel } = useSemesterLabels();
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   // Email isn't editable from here — changing it goes through Settings'
@@ -195,7 +197,7 @@ export default function ProfilePage() {
                   </div>
 
                   <div>
-                    <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">Academic Year</p>
+                    <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">{currentLabel}</p>
                     <CurrentSemesterTag className="!bg-gray-100" />
                   </div>
 

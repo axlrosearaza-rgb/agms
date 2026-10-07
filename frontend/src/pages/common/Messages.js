@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
-import { Icons, Avatar, Badge, LoadingSpinner, Modal, ConfirmDialog, roleLabel, ProgramDot, programShortLabel, PresenceDot, PresenceLabel } from '../../components/common';
+import { Icons, Avatar, Badge, LoadingSpinner, Modal, ConfirmDialog, roleLabel, ProgramDot, programShortLabel, PresenceDot, PresenceLabel, ClearSearchButton } from '../../components/common';
 import { chatService } from '../../services';
 import socket from '../../services/socket';
 import { usePresence } from '../../hooks/usePresence';
@@ -269,18 +269,29 @@ export default function Messages() {
   // detect and react to each one, this just always keeps both the
   // conversation list and any open thread correct on its own.
   useEffect(() => {
-    // Messenger-fast safety net: 1.5s while the tab is actually visible
-    // (hidden tabs are skipped — the visibilitychange handler above catches
-    // them up the moment they come back). Silent so failures never toast.
+    // Safety net only. While the socket is connected every message/edit/
+    // delete already arrives as a push and reloads this list itself, so
+    // polling on top of that just multiplies requests by everyone with this
+    // page open. Quick (2s) the moment the socket is down, a relaxed 15s
+    // backstop while it's up. Hidden tabs skip it (visibilitychange catches
+    // them up on return). Silent so failures never toast.
     const interval = setInterval(() => {
-      if (document.visibilityState === 'visible') loadConversations(true);
-    }, 1500);
+      if (document.visibilityState !== 'visible') return;
+      if (socket.connected && ++ticks % 8 !== 0) return;
+      loadConversations(true);
+    }, 2000);
+    let ticks = 0;
     return () => clearInterval(interval);
   }, [loadConversations]);
 
   useEffect(() => {
     if (!activeId) return undefined;
+    let ticks = 0;
     const interval = setInterval(() => {
+      // Same idea as the list poll above: pushes deliver instantly while the
+      // socket is up, so only backstop it every ~10s then; every 2s if it's down.
+      if (document.visibilityState !== 'visible') return;
+      if (socket.connected && ++ticks % 5 !== 0) return;
       chatService.getMessages(activeId).then(({ data }) => {
         const next = data.messages || [];
         setMessages((prev) => {
@@ -294,7 +305,7 @@ export default function Messages() {
           chatService.markRead(activeId).catch(() => {});
         }
       }).catch(() => {});
-    }, 1200);
+    }, 2000);
     return () => clearInterval(interval);
   }, [activeId, user.id]);
 
@@ -745,14 +756,15 @@ export default function Messages() {
               <p className="text-[13px] text-gray-700 truncate">{stripMessageLinks(forwardingMessage.body)}</p>
             </div>
           )}
-          <div className="mb-3">
+          <div className="mb-3 relative">
             <input
-              className="form-input w-full"
+              className="form-input w-full pr-9"
               placeholder="Search by name..."
               value={contactSearch}
               onChange={(e) => setContactSearch(e.target.value)}
               autoFocus
             />
+            <ClearSearchButton value={contactSearch} onClear={() => setContactSearch('')} />
           </div>
           {filteredContacts.length === 0 ? (
             <p className="text-sm text-gray-400 text-center py-6">

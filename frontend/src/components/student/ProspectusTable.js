@@ -14,11 +14,11 @@ export const SEMESTER_ORDER = { '1st Semester': 0, '2nd Semester': 1, 'Summer': 
 export const gradeCellText = (r) => {
   if (r.status === 'INC') return 'INC';
   if (r.status === 'DRP') return 'DROP';
-  // One decimal place — matching the Grade Sheet and Class Record exactly
-  // (both use .toFixed(1), per the Registrar's own 1-decimal GWA convention)
-  // so the same underlying value never displays as two different-looking
+  // One decimal — matching the Grade Sheet and Class Record's own Final
+  // Grade exactly (classRecordExcel.js's formatGrade, epsilon-corrected) so
+  // the same underlying value never displays as two different-looking
   // numbers across documents.
-  if (r.grade?.average) return parseFloat(r.grade.average).toFixed(1);
+  if (r.grade?.average) return (Math.round(parseFloat(r.grade.average) * 10 + 1e-9) / 10).toFixed(1);
   return '';
 };
 
@@ -61,7 +61,7 @@ export const semesterSums = (rows) => rows.reduce((acc, r) => {
 export const semesterGWA = (rows) => {
   const eligible = rows.filter((r) => r.grade?.average != null && r.status !== 'INC' && r.status !== 'DRP');
   if (eligible.length === 0) return null;
-  return (eligible.reduce((sum, r) => sum + parseFloat(r.grade.average), 0) / eligible.length).toFixed(1);
+  return (eligible.reduce((sum, r) => sum + parseFloat(r.grade.average), 0) / eligible.length).toFixed(3);
 };
 
 // Shared curriculum-checklist ("prospectus") view — every subject in the
@@ -82,6 +82,14 @@ export default function ProspectusTable({ years, search = '', collapsible = fals
 
   const yearNums = Object.keys(years || {}).map(Number).sort((a, b) => a - b);
   const q = search.trim().toLowerCase();
+
+  // Column widths shared by EVERY table shown (so they all line up), sized to
+  // the longest Subject Description among them: short names → a narrower
+  // description column; long names → a wider one, up to a limit (then it wraps).
+  const longestName = Math.max(0, ...Object.values(years || {}).flatMap((sems) => Object.values(sems || {}).flatMap((rows) => (rows || []).map((r) => String(r.subject?.name || '').length))));
+  const descPct = Math.min(42, Math.max(22, 14 + longestName * 0.5));
+  const rest = (100 - descPct) / 70; // the other columns share what's left, in these proportions
+  const colWidths = [7, 11, null, 5.5, 5.5, 5.5, 5.5, 5.5, 5.5, 10, 9].map((w) => `${(w === null ? descPct : w * rest).toFixed(2)}%`);
 
   if (yearNums.length === 0) {
     return (
@@ -134,7 +142,12 @@ export default function ProspectusTable({ years, search = '', collapsible = fals
                           (and the Word export's identical border). */}
                       <h4 className="text-[13px] font-bold text-gray-700 px-1 mb-2 pb-1" style={{ borderBottom: '2px solid #000' }}>{SEM_LABEL[sem] || sem.toUpperCase()}</h4>
                       <div className="overflow-x-auto">
-                        <table className="eval-table" style={{ borderCollapse: 'collapse', width: '100%', fontSize: 12 }}>
+                        {/* Fixed column widths — every semester's table lines
+                            up with the others, whatever its subjects' names. */}
+                        <table className="eval-table" style={{ borderCollapse: 'collapse', width: '100%', minWidth: 900, fontSize: 12, tableLayout: 'fixed' }}>
+                          <colgroup>
+                            {colWidths.map((w, i) => <col key={i} style={{ width: w }} />)}
+                          </colgroup>
                           <thead>
                             <tr style={{ background: '#F3F4F6' }}>
                               <Th rowSpan={2}>Grade</Th>

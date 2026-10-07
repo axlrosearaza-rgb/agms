@@ -1,14 +1,21 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Icons, Badge, SearchBar, Modal, LoadingSpinner, ProgramDot, ConfirmDialog } from '../../components/common';
+import { Icons, Badge, SearchBar, Modal, LoadingSpinner, ProgramBadge, ConfirmDialog, ClearSearchButton } from '../../components/common';
 import { subjectService } from '../../services';
 import { useAuth } from '../../context/AuthContext';
 import toast from 'react-hot-toast';
 import { usePageState } from '../../hooks/usePageState';
+import { latestCurriculumByProgram, curriculumYears, curriculumStatus } from '../../components/common/CurriculumBadge';
 
 const SEMESTERS = ['1st Semester', '2nd Semester', 'Summer'];
 // Curriculum-checklist ordering — "Summer" always last, not alphabetical.
 const SEMESTER_ORDER = { '1st Semester': 0, '2nd Semester': 1, 'Summer': 2 };
 const YEAR_LABEL = { 1: 'FIRST YEAR', 2: 'SECOND YEAR', 3: 'THIRD YEAR', 4: 'FOURTH YEAR' };
+const ALL_PROGRAMS = [
+  'Bachelor of Science in Information Technology',
+  'Bachelor of Science in Information Systems',
+  'Bachelor of Science in Psychology',
+  'Bachelor of Science in Statistics',
+];
 
 // Program → Department mapping (subjects store the short department name;
 // User accounts store the full program name — same 4 programs, two spellings).
@@ -20,7 +27,7 @@ const PROGRAM_DEPARTMENT = {
 };
 
 const emptyForm = {
-  code: '', name: '', department: '', program: '', year_level: 1, semester: '1st Semester',
+  code: '', name: '', department: '', program: '', year_level: 1, semester: '1st Semester', curriculum_year: '', subject_type: 'Major',
   lecture_hours: 0, lecture_units: 0, lab_hours: 0, lab_units: 0,
   // Total Hrs/Units are their own fields, not forced to equal Lecture + Lab —
   // some subjects (Practicum, Thesis, OJT) have no Lecture/Lab split at all, just
@@ -40,17 +47,22 @@ const emptyForm = {
 export default function Subjects() {
   const { user } = useAuth();
   const myPrograms = (user?.programs || []).filter((p) => p !== 'General Education (GE)');
-  // Only the Chairperson creates/edits/deletes subjects now — Faculty shares this
-  // page but sees a read-only catalog once the Chairperson has set it up.
-  const canManage = user?.role === 'Chairperson';
+  // One Subjects page for Admin, Chairperson and Faculty (same design for all
+  // three): Admin sees and manages every program; a Chairperson manages their
+  // own program(s); Faculty get the same view read-only.
+  const isAdmin = user?.role === 'Admin';
+  const canManage = isAdmin || user?.role === 'Chairperson';
+  const programOptions = isAdmin ? ALL_PROGRAMS : myPrograms;
 
-  // Namespaced by role — this page is reused as-is for both Faculty and
+  // Namespaced by role — this page is shared by Admin, Faculty and
   // Chairperson, so their search/expanded state (usePageState, persists
   // across navigation) shouldn't bleed into each other.
   const pk = `Subjects.${user?.role || 'unknown'}`;
   const [subjects, setSubjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = usePageState(`${pk}.search`, '');
+  const [programFilter, setProgramFilter] = usePageState(`${pk}.programFilter`, '');
+  const [curriculumFilter, setCurriculumFilter] = usePageState(`${pk}.curriculumFilter`, '');
   const [showModal, setShowModal] = useState(false);
   const [editSubject, setEditSubject] = useState(null);
   const [formData, setFormData] = useState({ ...emptyForm });
@@ -62,13 +74,20 @@ export default function Subjects() {
   const [expanded, setExpanded] = usePageState(`${pk}.expanded`, {});
   const toggle = (key) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
   const [coreqSearch, setCoreqSearch] = useState('');
-  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [archiveTarget, setArchiveTarget] = useState(null);
+  // Subjects are never deleted — archived ones are listed at the bottom.
+  const [archivedSubjects, setArchivedSubjects] = useState([]);
+  const [archivedOpen, setArchivedOpen] = useState(false);
 
   const loadSubjects = useCallback(async () => {
     try {
       setLoading(true);
-      const { data } = await subjectService.getAll();
+      const [{ data }, archived] = await Promise.all([
+        subjectService.getAll(),
+        subjectService.getAll({ archived: 'only' }).catch(() => ({ data: { subjects: [] } })),
+      ]);
       setSubjects(data.subjects || []);
+      setArchivedSubjects(archived.data.subjects || []);
     } catch (err) {
       toast.error('Failed to load subjects');
     } finally {
@@ -78,14 +97,20 @@ export default function Subjects() {
 
   useEffect(() => { loadSubjects(); }, [loadSubjects]);
 
-  const openCreate = (prefillYear, prefillSemester) => {
+  // Prefilled from wherever "Add" was clicked (a curriculum header or a
+  // semester), else the filtered/first program and its current curriculum.
+  const openCreate = (prefillYear, prefillSemester, prefillProgram, prefillCurriculum) => {
+    const program = prefillProgram || programFilter || programOptions[0] || '';
     setEditSubject(null);
     setFormData({
       ...emptyForm,
-      program: myPrograms[0] || '',
-      department: PROGRAM_DEPARTMENT[myPrograms[0]] || '',
+      program,
+      department: PROGRAM_DEPARTMENT[program] || '',
       year_level: prefillYear || 1,
       semester: prefillSemester || '1st Semester',
+      curriculum_year: prefillCurriculum !== undefined && prefillCurriculum !== null
+        ? prefillCurriculum
+        : (latestByProgram[program] || String(new Date().getFullYear())),
     });
     setPrereqSearch('');
     setCoreqSearch('');
@@ -101,6 +126,8 @@ export default function Subjects() {
       program: s.program || '',
       year_level: s.year_level || 1,
       semester: s.semester || '1st Semester',
+      curriculum_year: s.curriculum_year || '',
+      subject_type: s.subject_type === 'Minor' ? 'Minor' : 'Major',
       lecture_hours: s.lecture_hours ?? 0,
       lecture_units: s.lecture_units ?? 0,
       lab_hours: s.lab_hours ?? 0,
@@ -188,23 +215,36 @@ export default function Subjects() {
     }
   };
 
-  const handleDelete = async () => {
-    const s = deleteTarget;
+  const handleArchive = async () => {
+    const s = archiveTarget;
     if (!s) return;
     try {
-      await subjectService.delete(s.id);
-      toast.success('Subject deleted');
-      setDeleteTarget(null);
+      await subjectService.archive(s.id, true);
+      toast.success(`${s.code} archived`);
+      setArchiveTarget(null);
       loadSubjects();
     } catch (err) {
-      toast.error(err.response?.data?.message || 'Failed to delete subject');
+      toast.error(err.response?.data?.message || 'Failed to archive subject');
+    }
+  };
+  const handleRestore = async (s) => {
+    try {
+      await subjectService.archive(s.id, false);
+      toast.success(`${s.code} restored`);
+      loadSubjects();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to restore subject');
     }
   };
 
+  // New vs Old is per program: its latest curriculum year is New.
+  const latestByProgram = latestCurriculumByProgram(subjects);
+  const allCurriculumYears = curriculumYears(subjects);
+
   const filtered = subjects.filter((s) =>
-    !search ||
-    s.name?.toLowerCase().includes(search.toLowerCase()) ||
-    s.code?.toLowerCase().includes(search.toLowerCase())
+    (!search || s.name?.toLowerCase().includes(search.toLowerCase()) || s.code?.toLowerCase().includes(search.toLowerCase()))
+    && (!programFilter || s.program === programFilter)
+    && (!curriculumFilter || (curriculumFilter === '__none__' ? !s.curriculum_year : s.curriculum_year === curriculumFilter))
   );
 
   const prereqOptions = subjects.filter((s) => !editSubject || s.id !== editSubject.id);
@@ -215,21 +255,37 @@ export default function Subjects() {
     !coreqSearch || p.code?.toLowerCase().includes(coreqSearch.toLowerCase()) || p.name?.toLowerCase().includes(coreqSearch.toLowerCase())
   );
 
-  // Group into the curriculum-checklist sequence: Year -> Semester -> subjects
-  // (in code order), with subjects missing either field parked in "Unassigned"
-  // so nothing silently disappears from the list.
-  const grouped = {};
-  const unassigned = [];
+  // Curriculum-checklist sequence: Program → Curriculum → Year → Semester →
+  // subjects (code order). The curriculum is a header ABOVE its subjects
+  // ("2023 CURRICULUM · NEW"), not a badge on every row. Subjects with no
+  // Year/Semester are parked in "Unassigned" inside their curriculum, and
+  // subjects with no curriculum year sit in their own "No curriculum set"
+  // group, so nothing silently disappears from the list.
+  const NO_CURRICULUM = '__none__';
+  const byProgram = {};
   filtered.forEach((s) => {
+    const prog = s.program || 'No Program';
+    const cur = s.curriculum_year || NO_CURRICULUM;
+    byProgram[prog] = byProgram[prog] || {};
+    byProgram[prog][cur] = byProgram[prog][cur] || { grouped: {}, unassigned: [] };
+    const bucket = byProgram[prog][cur];
     if (!s.year_level || !s.semester) {
-      unassigned.push(s);
+      bucket.unassigned.push(s);
       return;
     }
-    if (!grouped[s.year_level]) grouped[s.year_level] = {};
-    if (!grouped[s.year_level][s.semester]) grouped[s.year_level][s.semester] = [];
-    grouped[s.year_level][s.semester].push(s);
+    bucket.grouped[s.year_level] = bucket.grouped[s.year_level] || {};
+    bucket.grouped[s.year_level][s.semester] = bucket.grouped[s.year_level][s.semester] || [];
+    bucket.grouped[s.year_level][s.semester].push(s);
   });
-  const years = Object.keys(grouped).map(Number).sort((a, b) => a - b);
+  const programKeys = Object.keys(byProgram).sort();
+  // Newest curriculum first; "No curriculum set" last.
+  const sortCurricula = (keys) => keys.sort((a, b) => {
+    if (a === NO_CURRICULUM) return 1;
+    if (b === NO_CURRICULUM) return -1;
+    return (parseInt(b, 10) || 0) - (parseInt(a, 10) || 0) || String(b).localeCompare(String(a));
+  });
+  // Program headers only when more than one program can be on screen.
+  const showProgramHeaders = isAdmin || programOptions.length > 1 || programKeys.length > 1;
 
   // Total Hours is its own value (not derived) — falls back to Lecture+Lab only
   // for legacy rows that predate the standalone Total field.
@@ -237,7 +293,7 @@ export default function Subjects() {
 
   if (loading) return <LoadingSpinner />;
 
-  const semesterTable = (yr, sem, rows) => {
+  const semesterTable = (ctx, yr, sem, rows) => {
     const sums = rows.reduce((acc, s) => ({
       lecHrs: acc.lecHrs + (s.lecture_hours || 0),
       lecUnits: acc.lecUnits + (s.lecture_units || 0),
@@ -247,7 +303,7 @@ export default function Subjects() {
       totalUnits: acc.totalUnits + (s.units || 0),
     }), { lecHrs: 0, lecUnits: 0, labHrs: 0, labUnits: 0, totalHrs: 0, totalUnits: 0 });
 
-    const semKey = `sem:${yr}-${sem}`;
+    const semKey = `${ctx.key}|sem:${yr}-${sem}`;
     const semOpen = !!expanded[semKey];
 
     return (
@@ -261,8 +317,8 @@ export default function Subjects() {
             <h4 className="text-sm font-semibold text-gray-600 italic">{sem}</h4>
             <span className="text-xs text-gray-400">({rows.length})</span>
           </button>
-          {canManage && (
-            <button className="btn-icon" onClick={() => openCreate(yr, sem)} title={`Add subject to Year ${yr} — ${sem}`}>
+          {canManage && yr && (
+            <button className="btn-icon" onClick={() => openCreate(yr, sem, ctx.program, ctx.curriculum)} title={`Add subject to Year ${yr} — ${sem}`}>
               <Icons.Plus className="w-4 h-4" />
             </button>
           )}
@@ -291,14 +347,13 @@ export default function Subjects() {
               </tr>
             </thead>
             <tbody>
-              {rows.sort((a, b) => a.code.localeCompare(b.code)).map((s) => (
+              {rows.slice().sort((a, b) => a.code.localeCompare(b.code)).map((s) => (
                 <tr key={s.id} className="border-b border-gray-50 hover:bg-gray-50/50">
-                  <td className="px-3 py-2.5 font-semibold text-navy">
-                    {/* Only worth showing once a Faculty actually teaches more than
-                        one program (e.g. a real program + General Education) —
-                        for everyone else every row would be the same color anyway. */}
-                    {myPrograms.length > 1 && <ProgramDot program={s.program} className="mr-1.5" />}
+                  <td className="px-3 py-2.5 font-semibold text-navy whitespace-nowrap">
                     {s.code}
+                    {s.subject_type === 'Minor'
+                      ? <span className="ml-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-500 bg-gray-100 rounded px-1.5 py-0.5 align-middle" title="Minor subject — doesn't change a student's year level">Minor</span>
+                      : <span className="ml-1.5 text-[10px] font-semibold uppercase tracking-wide text-navy bg-navy/10 rounded px-1.5 py-0.5 align-middle" title="Major subject — sets a student's year level">Major</span>}
                   </td>
                   <td className="px-3 py-2.5">{s.name}</td>
                   <td className="px-2 py-2.5 text-center">{s.lecture_hours ?? '—'}</td>
@@ -323,7 +378,7 @@ export default function Subjects() {
                     {canManage ? (
                       <div className="flex gap-1.5 justify-end">
                         <button className="btn-icon" onClick={() => openEdit(s)} title="Edit"><Icons.Edit /></button>
-                        <button className="btn-icon hover:!bg-red-50 hover:!text-red-500" onClick={() => setDeleteTarget(s)} title="Delete"><Icons.Trash /></button>
+                        <button className="btn-icon hover:!bg-amber-50 hover:!text-amber-600" onClick={() => setArchiveTarget(s)} title="Archive"><Icons.Archive /></button>
                       </div>
                     ) : <span className="text-gray-300 text-xs">—</span>}
                   </td>
@@ -349,12 +404,93 @@ export default function Subjects() {
     );
   };
 
+  // One curriculum's subjects: its header bar on top, then Year cards.
+  const curriculumSection = (prog, cur, bucket) => {
+    const ctx = { key: `${prog}|${cur}`, program: prog === 'No Program' ? '' : prog, curriculum: cur === NO_CURRICULUM ? '' : cur };
+    const years = Object.keys(bucket.grouped).map(Number).sort((a, b) => a - b);
+    const count = years.reduce((n, yr) => n + Object.values(bucket.grouped[yr]).reduce((m, r) => m + r.length, 0), 0) + bucket.unassigned.length;
+    const isNone = cur === NO_CURRICULUM;
+    const status = isNone ? null : curriculumStatus({ program: prog, curriculum_year: cur }, latestByProgram);
+    const units = [...years.flatMap((yr) => Object.values(bucket.grouped[yr]).flat()), ...bucket.unassigned].reduce((n, s) => n + (s.units || 0), 0);
+    return (
+      <div key={cur} className="mb-6 last:mb-0">
+        {/* Curriculum header — the curriculum year sits on top of its subjects. */}
+        <div className={`flex flex-wrap items-center justify-between gap-2 rounded-xl px-4 py-3 mb-3 border ${isNone ? 'bg-gray-50 border-dashed border-gray-300' : status === 'New' ? 'bg-green-50 border-green-200' : 'bg-amber-50 border-amber-200'}`}>
+          <div className="flex items-center gap-2.5">
+            <Icons.Book className={`w-4 h-4 ${isNone ? 'text-gray-400' : status === 'New' ? 'text-green-600' : 'text-amber-600'}`} />
+            <h3 className={`text-sm font-bold tracking-wide ${isNone ? 'text-gray-500' : 'text-navy'}`}>
+              {isNone ? 'NO CURRICULUM SET' : `${cur} CURRICULUM`}
+            </h3>
+            {status && (
+              <span className={`text-[10px] font-bold uppercase rounded-full px-2 py-0.5 ${status === 'New' ? 'bg-green-600 text-white' : 'bg-amber-500 text-white'}`}>{status}</span>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-gray-500">{count} subject{count !== 1 ? 's' : ''} · {units} units</span>
+            {canManage && (
+              <button className="btn btn-outline btn-sm bg-white" onClick={() => openCreate(null, null, ctx.program, ctx.curriculum)}>
+                <Icons.Plus className="w-3.5 h-3.5" /> Add subject
+              </button>
+            )}
+          </div>
+        </div>
+
+        {years.map((yr) => {
+          const semesters = Object.keys(bucket.grouped[yr]).sort((a, b) => (SEMESTER_ORDER[a] ?? 9) - (SEMESTER_ORDER[b] ?? 9));
+          const yearKey = `${ctx.key}|year:${yr}`;
+          const yearOpen = !!expanded[yearKey];
+          const yearSubjectCount = semesters.reduce((n, sem) => n + bucket.grouped[yr][sem].length, 0);
+          return (
+            <div key={yr} className="card overflow-hidden mb-4">
+              <button
+                onClick={() => toggle(yearKey)}
+                className="w-full px-5 py-3 bg-navy text-white flex items-center justify-center gap-2 cursor-pointer border-none font-sans"
+              >
+                <h3 className="text-sm font-bold tracking-wide">{YEAR_LABEL[yr] || `YEAR ${yr}`}</h3>
+                <span className="text-xs opacity-70">({yearSubjectCount})</span>
+                {yearOpen ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
+              </button>
+              {yearOpen && (
+                <div className="card-body">
+                  {semesters.map((sem) => semesterTable(ctx, yr, sem, bucket.grouped[yr][sem]))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {bucket.unassigned.length > 0 && (() => {
+          const key = `${ctx.key}|year:unassigned`;
+          return (
+            <div className="card overflow-hidden mb-4">
+              <button
+                onClick={() => toggle(key)}
+                className="w-full px-5 py-3 bg-gray-400 text-white flex items-center justify-center gap-2 cursor-pointer border-none font-sans"
+              >
+                <h3 className="text-sm font-bold tracking-wide">UNASSIGNED — no Year/Semester set</h3>
+                <span className="text-xs opacity-70">({bucket.unassigned.length})</span>
+                {expanded[key] ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
+              </button>
+              {expanded[key] && (
+                <div className="card-body">
+                  {semesterTable(ctx, null, 'No Semester Set', bucket.unassigned)}
+                </div>
+              )}
+            </div>
+          );
+        })()}
+      </div>
+    );
+  };
+
   return (
     <>
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-5 gap-3">
         <div>
           <h2 className="text-lg font-bold text-navy">Subjects</h2>
-          <p className="text-[13px] text-gray-500">Curriculum sequence for your program(s), grouped by Year and Semester ({filtered.length})</p>
+          <p className="text-[13px] text-gray-500">
+            {isAdmin ? 'Every program\'s curriculum' : 'Curriculum for your program(s)'}, grouped by Curriculum, Year and Semester ({filtered.length} subject{filtered.length !== 1 ? 's' : ''})
+          </p>
         </div>
         {canManage && (
           <button className="btn btn-gold" onClick={() => openCreate()}>
@@ -363,58 +499,54 @@ export default function Subjects() {
         )}
       </div>
 
-      <div className="mb-5">
+      <div className="flex flex-wrap gap-3 mb-5">
         <SearchBar value={search} onChange={setSearch} placeholder="Search by name or code..." />
+        {programOptions.length > 1 && (
+          <select className="form-select w-auto text-sm py-2.5" value={programFilter} onChange={(e) => setProgramFilter(e.target.value)}>
+            <option value="">All Programs</option>
+            {programOptions.map((p) => <option key={p} value={p}>{p}</option>)}
+          </select>
+        )}
+        <select className="form-select w-auto text-sm py-2.5" value={curriculumFilter} onChange={(e) => setCurriculumFilter(e.target.value)}>
+          <option value="">All Curricula</option>
+          {allCurriculumYears.map((y) => <option key={y} value={y}>{y} Curriculum</option>)}
+          <option value={NO_CURRICULUM}>No curriculum set</option>
+        </select>
       </div>
 
-      {years.length === 0 && unassigned.length === 0 && (
+      {programKeys.length === 0 && (
         <div className="card p-12 text-center text-gray-400">
           <Icons.FileText className="w-8 h-8 mx-auto mb-2 opacity-30" />
-          No subjects found.
+          {subjects.length === 0 ? (canManage ? 'No subjects yet — use Add Subject.' : 'No subjects yet.') : 'No subjects match these filters.'}
         </div>
       )}
 
-      {years.map((yr) => {
-        const semesters = Object.keys(grouped[yr]).sort((a, b) => (SEMESTER_ORDER[a] ?? 9) - (SEMESTER_ORDER[b] ?? 9));
-        const yearKey = `year:${yr}`;
-        const yearOpen = !!expanded[yearKey];
-        const yearSubjectCount = semesters.reduce((n, sem) => n + grouped[yr][sem].length, 0);
+      {programKeys.map((prog) => {
+        const curricula = sortCurricula(Object.keys(byProgram[prog]));
+        const body = curricula.map((cur) => curriculumSection(prog, cur, byProgram[prog][cur]));
+        if (!showProgramHeaders) return <div key={prog}>{body}</div>;
+        const progKey = `prog:${prog}`;
+        const progOpen = expanded[progKey] !== false; // open by default
+        const progCount = curricula.reduce((n, cur) => {
+          const b = byProgram[prog][cur];
+          return n + b.unassigned.length + Object.values(b.grouped).reduce((m, sems) => m + Object.values(sems).reduce((k, r) => k + r.length, 0), 0);
+        }, 0);
         return (
-          <div key={yr} className="card overflow-hidden mb-5">
+          <div key={prog} className="card overflow-hidden mb-5">
             <button
-              onClick={() => toggle(yearKey)}
-              className="w-full px-5 py-3 bg-navy text-white flex items-center justify-center gap-2 cursor-pointer border-none font-sans"
+              onClick={() => setExpanded((prev) => ({ ...prev, [progKey]: !progOpen }))}
+              className="w-full flex items-center justify-between px-5 py-3 cursor-pointer border-none bg-gray-50/60 hover:bg-gray-100 font-sans transition-colors"
             >
-              <h3 className="text-sm font-bold tracking-wide">{YEAR_LABEL[yr] || `YEAR ${yr}`}</h3>
-              <span className="text-xs opacity-70">({yearSubjectCount})</span>
-              {yearOpen ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
-            </button>
-            {yearOpen && (
-              <div className="card-body">
-                {semesters.map((sem) => semesterTable(yr, sem, grouped[yr][sem]))}
+              <div className="flex items-center gap-2.5">
+                {prog === 'No Program' ? <span className="text-xs font-semibold text-gray-500 uppercase">No Program</span> : <ProgramBadge program={prog} size="lg" />}
+                <span className="text-xs text-gray-400">({progCount})</span>
               </div>
-            )}
+              {progOpen ? <Icons.ChevronUp className="w-4 h-4 text-gray-400" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400" />}
+            </button>
+            {progOpen && <div className="card-body">{body}</div>}
           </div>
         );
       })}
-
-      {unassigned.length > 0 && (
-        <div className="card overflow-hidden mb-5">
-          <button
-            onClick={() => toggle('year:unassigned')}
-            className="w-full px-5 py-3 bg-gray-400 text-white flex items-center justify-center gap-2 cursor-pointer border-none font-sans"
-          >
-            <h3 className="text-sm font-bold tracking-wide">UNASSIGNED — no Year/Semester set</h3>
-            <span className="text-xs opacity-70">({unassigned.length})</span>
-            {expanded['year:unassigned'] ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
-          </button>
-          {expanded['year:unassigned'] && (
-            <div className="card-body">
-              {semesterTable(null, 'No Semester Set', unassigned)}
-            </div>
-          )}
-        </div>
-      )}
 
       {/* CREATE / EDIT MODAL */}
       {showModal && (
@@ -440,7 +572,7 @@ export default function Subjects() {
               <label className="form-label">Program <span className="text-red-500">*</span></label>
               <select className="form-select" value={formData.program} onChange={(e) => handleProgramChange(e.target.value)}>
                 <option value="">Select Program</option>
-                {myPrograms.map((p) => <option key={p} value={p}>{p}</option>)}
+                {programOptions.map((p) => <option key={p} value={p}>{p}</option>)}
               </select>
             </div>
             <div className="sm:col-span-2">
@@ -458,6 +590,40 @@ export default function Subjects() {
               <select className="form-select" value={formData.semester} onChange={(e) => setFormData({ ...formData, semester: e.target.value })}>
                 {SEMESTERS.map((s) => <option key={s}>{s}</option>)}
               </select>
+            </div>
+            <div className="sm:col-span-2">
+              <label className="form-label">Subject Type</label>
+              <div className="flex gap-2">
+                {['Major', 'Minor'].map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => setFormData({ ...formData, subject_type: t })}
+                    className={`flex-1 px-3 py-2 rounded-lg border text-sm font-semibold cursor-pointer font-sans ${formData.subject_type === t ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] text-gray-400 mt-1">
+                A student's year level follows the <b>major</b> subjects they take. <b>Minor</b> subjects (GE, PE, electives outside the program) never change it.
+              </p>
+            </div>
+            <div className="sm:col-span-2">
+              <label className="form-label">Curriculum Year</label>
+              <input
+                className="form-input"
+                list="curriculum-year-options"
+                value={formData.curriculum_year}
+                onChange={(e) => setFormData({ ...formData, curriculum_year: e.target.value })}
+                placeholder="e.g. 2023"
+              />
+              <datalist id="curriculum-year-options">
+                {allCurriculumYears.map((y) => <option key={y} value={y} />)}
+              </datalist>
+              <p className="text-[11px] text-gray-400 mt-1">
+                The year this subject's curriculum took effect. Your program's latest curriculum year shows as <b>New</b>, earlier ones as <b>Old</b>.
+              </p>
             </div>
 
             {/* Lecture / Laboratory-RLE breakdown, matching the official curriculum checklist.
@@ -512,12 +678,15 @@ export default function Subjects() {
 
             <div>
               <label className="form-label">Pre-Requisite</label>
-              <input
-                className="form-input mb-2 text-[13px]"
-                value={prereqSearch}
-                onChange={(e) => setPrereqSearch(e.target.value)}
-                placeholder="Search subjects..."
-              />
+              <div className="relative mb-2">
+                <input
+                  className="form-input text-[13px] pr-9"
+                  value={prereqSearch}
+                  onChange={(e) => setPrereqSearch(e.target.value)}
+                  placeholder="Search subjects..."
+                />
+                <ClearSearchButton value={prereqSearch} onClear={() => setPrereqSearch('')} />
+              </div>
               <div className="grid grid-cols-1 gap-2 border border-gray-200 rounded-lg p-3 max-h-48 overflow-y-auto">
                 {prereqOptions.length === 0 && <span className="text-xs text-gray-400">No other subjects yet.</span>}
                 {prereqOptions.length > 0 && prereqFiltered.length === 0 && <span className="text-xs text-gray-400">No matches.</span>}
@@ -531,12 +700,15 @@ export default function Subjects() {
             </div>
             <div>
               <label className="form-label">Co-Requisite</label>
-              <input
-                className="form-input mb-2 text-[13px]"
-                value={coreqSearch}
-                onChange={(e) => setCoreqSearch(e.target.value)}
-                placeholder="Search subjects..."
-              />
+              <div className="relative mb-2">
+                <input
+                  className="form-input text-[13px] pr-9"
+                  value={coreqSearch}
+                  onChange={(e) => setCoreqSearch(e.target.value)}
+                  placeholder="Search subjects..."
+                />
+                <ClearSearchButton value={coreqSearch} onClear={() => setCoreqSearch('')} />
+              </div>
               <div className="grid grid-cols-1 gap-2 border border-gray-200 rounded-lg p-3 max-h-48 overflow-y-auto">
                 {prereqOptions.length === 0 && <span className="text-xs text-gray-400">No other subjects yet.</span>}
                 {prereqOptions.length > 0 && coreqFiltered.length === 0 && <span className="text-xs text-gray-400">No matches.</span>}
@@ -612,14 +784,63 @@ export default function Subjects() {
         </Modal>
       )}
 
-      {deleteTarget && (
+      {/* ARCHIVED SUBJECTS — never deleted; restore puts one back in the list. */}
+      {canManage && archivedSubjects.length > 0 && (
+        <div className="card mt-6 overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setArchivedOpen((o) => !o)}
+            className="w-full px-5 py-3 flex items-center justify-between bg-gray-50 border-none cursor-pointer font-sans text-left"
+          >
+            <span className="flex items-center gap-2 text-sm font-bold text-gray-700">
+              <Icons.Archive className="w-4 h-4" /> Archived Subjects
+              <span className="text-[11px] font-semibold bg-gray-200 text-gray-700 rounded-full px-2 py-0.5">{archivedSubjects.length}</span>
+            </span>
+            {archivedOpen ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
+          </button>
+          {archivedOpen && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-[13px]">
+                <thead className="bg-gray-50 text-[11px] uppercase text-gray-500">
+                  <tr>
+                    <th className="px-4 py-2 text-left">Code</th>
+                    <th className="px-4 py-2 text-left">Description</th>
+                    <th className="px-4 py-2 text-left">Program</th>
+                    <th className="px-4 py-2 text-center">Curriculum</th>
+                    <th className="px-4 py-2 text-center">Year · Semester</th>
+                    <th className="px-4 py-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {archivedSubjects.map((s) => (
+                    <tr key={s.id} className="border-t border-gray-100 text-gray-600">
+                      <td className="px-4 py-2 font-semibold">{s.code}</td>
+                      <td className="px-4 py-2">{s.name}</td>
+                      <td className="px-4 py-2 text-[12px]">{s.program}</td>
+                      <td className="px-4 py-2 text-center">{s.curriculum_year || '—'}</td>
+                      <td className="px-4 py-2 text-center whitespace-nowrap">Year {s.year_level || '—'} · {s.semester || '—'}</td>
+                      <td className="px-4 py-2 text-right">
+                        <button className="btn btn-outline btn-sm" onClick={() => handleRestore(s)} title="Put this subject back in the list">
+                          <Icons.RotateCw className="w-3.5 h-3.5" /> Restore
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {archiveTarget && (
         <ConfirmDialog
-          title="Delete Subject"
-          message={`Are you sure you want to delete ${deleteTarget.code} — ${deleteTarget.name}? This will also remove any prerequisite/co-requisite links to it. This cannot be undone.`}
-          confirmText="Delete"
-          variant="red"
-          onConfirm={handleDelete}
-          onCancel={() => setDeleteTarget(null)}
+          title="Archive Subject"
+          message={`Archive ${archiveTarget.code} — ${archiveTarget.name}? It leaves this list and can no longer be picked for new classes, but every class, grade and prospectus that already uses it keeps it. You can restore it from Archived Subjects at the bottom.`}
+          confirmText="Archive"
+          variant="gold"
+          onConfirm={handleArchive}
+          onCancel={() => setArchiveTarget(null)}
         />
       )}
     </>

@@ -4,7 +4,6 @@ const {
   getCurrentSemester,
   createSemester,
   updateSemester,
-  deleteSemester,
   setCurrentSemester,
 } = require('../controllers/semesterController');
 const { authenticate, authorize } = require('../middleware/auth');
@@ -20,7 +19,6 @@ router.get('/', getSemesters);
 router.get('/current', getCurrentSemester);
 router.post('/', authorize('Admin'), createSemester);
 router.put('/:id', authorize('Admin'), updateSemester);
-router.delete('/:id', authorize('Admin'), deleteSemester);
 router.put('/:id/set-current', authorize('Admin'), setCurrentSemester);
 
 module.exports = router;

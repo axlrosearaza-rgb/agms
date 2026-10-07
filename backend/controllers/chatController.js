@@ -1,4 +1,4 @@
-const { Op } = require('sequelize');
+const { Op, QueryTypes } = require('sequelize');
 const { sequelize } = require('../config/database');
 const { Conversation, ConversationParticipant, Message, User, Class, Subject, Enrollment } = require('../models');
 const { asyncHandler } = require('../middleware/errorHandler');
@@ -210,101 +210,107 @@ const getContacts = asyncHandler(async (req, res) => {
 });
 
 // GET /api/chat/conversations
+//
+// Set-based: a fixed handful of queries no matter how many conversations the
+// caller has. This used to run four queries PER conversation (other user, my
+// participant row, last message, unread count) — an N+1 that took ~4.5s per
+// request at 100 concurrent users and is hit by every open Messages page on a
+// timer. Behavior is unchanged: a conversation the caller deleted stays
+// hidden, "delete for me" (cleared_before / hidden_for) still erases content
+// from the preview and unread count, ordering is by last_message_at.
 const getConversations = asyncHandler(async (req, res) => {
   const myId = req.user.id;
-  const conversations = await Conversation.findAll({
-    where: { [Op.or]: [{ user_a_id: myId }, { user_b_id: myId }] },
-    order: [['last_message_at', 'DESC']],
-  });
 
-  // Deleting a conversation only hides it from the deleter's own list (their
-  // own ConversationParticipant.deleted_at) — skip any conversation the
-  // caller has deleted, unless sendMessage already cleared it back out for new activity.
-  const myParticipants = await ConversationParticipant.findAll({ where: { conversation_id: { [Op.in]: conversations.map((c) => c.id) }, user_id: myId } });
-  const deletedConversationIds = new Set(myParticipants.filter((p) => p.deleted_at).map((p) => p.conversation_id));
-  const visibleConversations = conversations.filter((c) => !deletedConversationIds.has(c.id));
+  // 1) My visible conversations + my own participant settings, one query.
+  const convs = await sequelize.query(
+    `SELECT c.id, c.user_a_id, c.user_b_id, c.last_message_at,
+            COALESCE(p.is_muted, false) AS is_muted, p.cleared_before
+       FROM conversations c
+       LEFT JOIN conversation_participants p
+              ON p.conversation_id = c.id AND p.user_id = :me
+      WHERE (c.user_a_id = :me OR c.user_b_id = :me)
+        AND p.deleted_at IS NULL
+      ORDER BY c.last_message_at DESC`,
+    { replacements: { me: myId }, type: QueryTypes.SELECT }
+  );
+  if (convs.length === 0) return res.json({ conversations: [] });
 
-  const result = await Promise.all(visibleConversations.map(async (c) => {
-    const otherId = otherUserId(c, myId);
-    const [other, myParticipant] = await Promise.all([
-      User.findByPk(otherId, { attributes: ['id', 'name', 'role', 'avatar'] }),
-      ConversationParticipant.findOne({ where: { conversation_id: c.id, user_id: myId } }),
-    ]);
+  const convIds = convs.map((c) => c.id);
+  const otherIds = [...new Set(convs.map((c) => otherUserId({ user_a_id: c.user_a_id, user_b_id: c.user_b_id }, myId)))];
 
-    // "Delete for me" permanently erases everything at or before
-    // cleared_before from THIS user's own view — the preview and unread
-    // count shown here must never resurrect pre-deletion content, even once
-    // new activity has brought the conversation back into the visible list.
-    const clearedBefore = myParticipant?.cleared_before;
-    // Same per-message "delete for me" exclusion getMessages applies — a
-    // message the caller individually hid must not surface here as the
-    // preview either, even though it's still the true last message overall.
-    const messageScope = {
-      conversation_id: c.id,
-      [Op.and]: [notHiddenFor(myId)],
-      ...(clearedBefore ? { created_at: { [Op.gt]: clearedBefore } } : {}),
-    };
+  // "Delete for me" scoping shared by the preview and the unread count: not
+  // individually hidden from me, and after my cleared_before watermark.
+  const visibleMessage = `NOT (m.hidden_for @> ARRAY[:me]::integer[])
+        AND (p.cleared_before IS NULL OR m.created_at > p.cleared_before)`;
 
-    const [lastMessage, unreadCount] = await Promise.all([
-      Message.findOne({ where: messageScope, order: [['created_at', 'DESC']] }),
-      Message.count({ where: { ...messageScope, sender_id: { [Op.ne]: myId }, is_read: false } }),
-    ]);
+  // 2-4) Other users, last message per conversation, unread per conversation.
+  const [others, lastMessages, unreadRows] = await Promise.all([
+    User.findAll({ where: { id: otherIds }, attributes: ['id', 'name', 'role', 'avatar'] }),
+    sequelize.query(
+      `SELECT DISTINCT ON (m.conversation_id)
+              m.conversation_id, m.body, m.created_at, m.sender_id, m.deleted_at
+         FROM messages m
+         LEFT JOIN conversation_participants p
+                ON p.conversation_id = m.conversation_id AND p.user_id = :me
+        WHERE m.conversation_id IN (:ids) AND ${visibleMessage}
+        ORDER BY m.conversation_id, m.created_at DESC`,
+      { replacements: { me: myId, ids: convIds }, type: QueryTypes.SELECT }
+    ),
+    sequelize.query(
+      `SELECT m.conversation_id, COUNT(*)::int AS unread
+         FROM messages m
+         LEFT JOIN conversation_participants p
+                ON p.conversation_id = m.conversation_id AND p.user_id = :me
+        WHERE m.conversation_id IN (:ids)
+          AND m.sender_id <> :me AND m.is_read = false AND ${visibleMessage}
+        GROUP BY m.conversation_id`,
+      { replacements: { me: myId, ids: convIds }, type: QueryTypes.SELECT }
+    ),
+  ]);
 
+  const otherById = new Map(others.map((u) => [u.id, u]));
+  const lastByConv = new Map(lastMessages.map((m) => [m.conversation_id, m]));
+  const unreadByConv = new Map(unreadRows.map((r) => [r.conversation_id, r.unread]));
+
+  const result = convs.map((c) => {
+    const last = lastByConv.get(c.id);
     return {
       id: c.id,
-      other_user: other,
+      other_user: otherById.get(otherUserId({ user_a_id: c.user_a_id, user_b_id: c.user_b_id }, myId)) || null,
       // `deleted_at` carried through so the list preview can tell "last
       // message was unsent" (blank body, but a real message exists) apart
-      // from "no messages at all yet" (lastMessage itself is null).
-      last_message: lastMessage ? { body: lastMessage.body, created_at: lastMessage.createdAt, sender_id: lastMessage.sender_id, deleted_at: lastMessage.deleted_at } : null,
+      // from "no messages at all yet" (no last message).
+      last_message: last ? { body: last.body, created_at: last.created_at, sender_id: last.sender_id, deleted_at: last.deleted_at } : null,
       last_message_at: c.last_message_at,
-      is_muted: myParticipant?.is_muted || false,
-      unread_count: unreadCount,
+      is_muted: !!c.is_muted,
+      unread_count: unreadByConv.get(c.id) || 0,
     };
-  }));
+  });
 
   res.json({ conversations: result });
 });
 
 // GET /api/chat/unread-count — sidebar "Messages" badge: total unread across
-// every conversation, not scoped to any one thread. A single COUNT instead
-// of getConversations' full per-conversation breakdown (other_user, last
-// message, mute state, ...), which is far more than a badge needs.
+// every conversation, not scoped to any one thread. One COUNT query (this ran
+// one query per conversation, on a timer, for every signed-in user). Same
+// rules as getConversations: a conversation the caller deleted doesn't count,
+// and "delete for me" content never counts.
 const getUnreadCount = asyncHandler(async (req, res) => {
   const myId = req.user.id;
-  const conversations = await Conversation.findAll({
-    where: { [Op.or]: [{ user_a_id: myId }, { user_b_id: myId }] },
-    attributes: ['id'],
-  });
-  const conversationIds = conversations.map((c) => c.id);
-  if (conversationIds.length === 0) return res.json({ count: 0 });
-
-  // Same "deleted only hides it from the deleter's own list" rule
-  // getConversations applies — a conversation the caller deleted shouldn't
-  // pad this count even if the other side sent something into it since.
-  const myParticipants = await ConversationParticipant.findAll({
-    where: { conversation_id: { [Op.in]: conversationIds }, user_id: myId },
-  });
-  const deletedIds = new Set(myParticipants.filter((p) => p.deleted_at).map((p) => p.conversation_id));
-  const visibleIds = conversationIds.filter((id) => !deletedIds.has(id));
-  const clearedBeforeById = new Map(myParticipants.filter((p) => p.cleared_before).map((p) => [p.conversation_id, p.cleared_before]));
-
-  // Same "delete for me" erasure getConversations applies per-conversation —
-  // messages at or before the caller's own cleared_before watermark for that
-  // conversation must never count toward this badge either.
-  const count = visibleIds.length === 0 ? 0 : (await Promise.all(visibleIds.map((id) => {
-    const clearedBefore = clearedBeforeById.get(id);
-    return Message.count({
-      where: {
-        conversation_id: id,
-        sender_id: { [Op.ne]: myId },
-        is_read: false,
-        [Op.and]: [notHiddenFor(myId)],
-        ...(clearedBefore ? { created_at: { [Op.gt]: clearedBefore } } : {}),
-      },
-    });
-  }))).reduce((sum, n) => sum + n, 0);
-  res.json({ count });
+  const [row] = await sequelize.query(
+    `SELECT COUNT(*)::int AS count
+       FROM messages m
+       JOIN conversations c ON c.id = m.conversation_id
+       LEFT JOIN conversation_participants p
+              ON p.conversation_id = c.id AND p.user_id = :me
+      WHERE (c.user_a_id = :me OR c.user_b_id = :me)
+        AND p.deleted_at IS NULL
+        AND m.sender_id <> :me AND m.is_read = false
+        AND NOT (m.hidden_for @> ARRAY[:me]::integer[])
+        AND (p.cleared_before IS NULL OR m.created_at > p.cleared_before)`,
+    { replacements: { me: myId }, type: QueryTypes.SELECT }
+  );
+  res.json({ count: row?.count || 0 });
 });
 
 // POST /api/chat/conversations  { targetUserId }

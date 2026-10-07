@@ -1,10 +1,11 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Icons, Avatar, Badge, SearchBar, LoadingSpinner, ConfirmDialog, FacultyProgramTags, Modal, ProgramDot, programShortLabel, comparePeopleNames, formatPersonName } from '../../components/common';
-import { classService, reportService, userService } from '../../services';
+import { Icons, Avatar, Badge, SearchBar, LoadingSpinner, ConfirmDialog, FacultyProgramTags, ProgramBadge, Modal, ProgramDot, programShortLabel, comparePeopleNames, formatPersonName } from '../../components/common';
+import { classService, reportService, userService, dashboardService } from '../../services';
 import toast from 'react-hot-toast';
 import { usePageState } from '../../hooks/usePageState';
-import socket from '../../services/socket';
+import { onGradesUpdated } from '../../services/socket';
+import { EncodingProgress } from '../../components/common/FacultyProgressRow';
 import { useAuth } from '../../context/AuthContext';
 
 // Mirrors Admin's Grade Approval page (same filter bar, grouped containers,
@@ -16,6 +17,10 @@ import { useAuth } from '../../context/AuthContext';
 // forward to Admin (reportController.verifyDocument derives that
 // automatically; nothing extra to click once the second one lands).
 const YEAR_LEVELS = [1, 2, 3, 4];
+// Excluded from grouping (same as Admin's Grade Approval / UserManagement.js)
+// — GE is a bonus tag every program's faculty can carry, not a program of
+// its own to bucket under.
+const GE_OPTION = 'General Education (GE)';
 
 // Same four-way split byTopGroup below buckets classes into — pulled out on
 // its own so the Faculty completion rollup can reuse the exact same logic.
@@ -80,15 +85,17 @@ function groupByYearSection(classes) {
 function DocCell({ cls, type, verified, hasSubmissions, onPreview }) {
   const icon = type === 'record' ? <Icons.Book /> : <Icons.FileText />;
   return (
-    <div className="flex items-center gap-2 whitespace-nowrap">
-      {verified
-        ? <Badge variant="green"><Icons.Check className="w-3 h-3" /> Verified</Badge>
-        : <Badge variant="gray">Not Verified</Badge>}
-      <button className="btn-icon flex-shrink-0" onClick={() => onPreview(cls, type)} title={`Preview ${DOC[type].label}`}>
-        {icon}
-      </button>
+    <div className="whitespace-nowrap">
+      <div className="flex items-center gap-2">
+        {verified
+          ? <Badge variant="green"><Icons.Check className="w-3 h-3" /> Verified</Badge>
+          : <Badge variant="gray">Not Verified</Badge>}
+        <button className="btn-icon flex-shrink-0" onClick={() => onPreview(cls, type)} title={`Preview ${DOC[type].label}`}>
+          {icon}
+        </button>
+      </div>
       {!verified && !hasSubmissions && (
-        <span className="text-[11px] text-gray-400 italic">Nothing submitted yet</span>
+        <p className="text-[11px] text-gray-400 italic mt-1">Nothing submitted yet</p>
       )}
     </div>
   );
@@ -163,6 +170,22 @@ export default function GradingSheets() {
   // Faculty with 0 classes in `classes` below (nothing assigned yet this
   // semester) never showed up in the Faculty completion widget at all.
   const [allFaculty, setAllFaculty] = useState([]);
+  // Faculty completion widget's own per-class data — same endpoint Admin's
+  // Grade Approval page uses (backend-scoped to this Chairperson's own
+  // program(s)). It's the only source that carries `sent` (every enrolled
+  // student's grade submitted) and `total_students`; the `classes` state
+  // from classService.getAll() has neither, so building the widget off that
+  // left every faculty reading 0 real classes → 0 submitted / 0 verified.
+  const [facultyReview, setFacultyReview] = useState([]);
+
+  const loadFacultyReview = async () => {
+    try {
+      const { data } = await dashboardService.getChairpersonFacultyReview();
+      setFacultyReview(data.faculty || []);
+    } catch (err) {
+      toast.error('Failed to load faculty submission progress');
+    }
+  };
 
   const loadAllFaculty = async () => {
     try {
@@ -200,16 +223,15 @@ export default function GradingSheets() {
     }
   };
 
-  useEffect(() => { load(); loadAllFaculty(); }, []);
+  useEffect(() => { load(); loadAllFaculty(); loadFacultyReview(); }, []);
 
   // Live refresh — Faculty submitting/resubmitting, or Admin approving/
   // returning a class, changes what belongs in which container here without
   // this page's own reload ever firing, so without this a Chairperson
   // sitting on this page wouldn't see it until they manually reloaded.
   useEffect(() => {
-    const handler = () => load();
-    socket.on('gradesUpdated', handler);
-    return () => socket.off('gradesUpdated', handler);
+    const handler = () => { load(); loadFacultyReview(); };
+    return onGradesUpdated(handler);
   }, []);
 
   const openPreview = (cls, type) => {
@@ -341,11 +363,7 @@ export default function GradingSheets() {
   // Timer" tile instead of one program (they're tagged with every program a
   // Chairperson might see, so filing them under one would misrepresent it).
   const facultyByInstructor = {};
-  filtered.forEach((c) => {
-    if (!c.instructor) return;
-    if (!facultyByInstructor[c.instructor.id]) facultyByInstructor[c.instructor.id] = { instructor: c.instructor, classes: [] };
-    facultyByInstructor[c.instructor.id].classes.push(c);
-  });
+  facultyReview.forEach((f) => { facultyByInstructor[f.instructor.id] = f; });
   // Merge the full Faculty roster (allFaculty — every Faculty tagged for
   // this Chairperson's own program(s), backend-scoped by user.programs)
   // with the per-class data above (facultyByInstructor — every instructor
@@ -363,13 +381,39 @@ export default function GradingSheets() {
   const facultyList = [...facultyIds].map((id) =>
     facultyByInstructor[id] || { instructor: facultyById[id], classes: [] }
   );
-  const facultySent = (f) => f.classes.length > 0 && f.classes.every((c) => topGroupOf(c) !== 'pending');
+  // `f.classes` comes from facultyReview (dashboardService's own
+  // chairperson-faculty-review endpoint) — a different, flatter shape than
+  // the `classes` state (from classService.getAll()): it has `sent`,
+  // `total_students` and `class_id`, but no `chairperson_verified`/
+  // `admin_return_reason`. `sent` is exactly the boolean facultySent needs;
+  // `verifiedClassIds` cross-references each entry's class_id against the
+  // `classes` state instead — same pattern Admin's own Grade Approval page
+  // uses for its own approvedClassIds.
+  // A class with zero enrolled students has nothing to submit at all — it
+  // can never turn `sent` true no matter what, so counting it in the
+  // all-or-nothing check below permanently blocked a faculty from ever
+  // reading as "done" once every class that actually HAS students is
+  // already through, just because some other unrelated empty class was
+  // still sitting there. Only classes with real students in them count
+  // toward whether a faculty is actually done.
+  const realClasses = (f) => f.classes.filter((c) => (c.total_students ?? 0) > 0);
+  const facultySent = (f) => { const rc = realClasses(f); return rc.length > 0 && rc.every((c) => c.sent); };
   const facultyDoneCount = facultyList.filter(facultySent).length;
   // "Passed" here means fully verified and forwarded to Admin — as far as
   // THIS Chairperson's own job on it goes (Admin still has its own approval
   // step afterward), same all-or-nothing rule.
-  const facultyPassed = (f) => f.classes.length > 0 && f.classes.every((c) => topGroupOf(c) === 'done');
+  const verifiedClassIds = new Set(classes.filter((c) => topGroupOf(c) === 'done').map((c) => c.id));
+  // Full class (classService shape) by id — the per-class chips below need
+  // topGroupOf's stage, which only that shape carries. A class that isn't in
+  // `classes` (e.g. sent back to Faculty for revision) reads as pending.
+  const classById = Object.fromEntries(classes.map((c) => [c.id, c]));
+  const chipStageOf = (c) => (classById[c.class_id] ? topGroupOf(classById[c.class_id]) : 'pending');
+  const facultyPassed = (f) => { const rc = realClasses(f); return rc.length > 0 && rc.every((c) => verifiedClassIds.has(c.class_id)); };
   const facultyPassedCount = facultyList.filter(facultyPassed).length;
+
+  const totalDoneClasses = classes.filter((c) => c.chairperson_verified || (c.class_record_verified && c.grade_sheet_verified)).length;
+  const totalPendingRecordClasses = classes.filter((c) => !c.class_record_verified).length;
+  const totalPendingSheetClasses = classes.filter((c) => !c.grade_sheet_verified).length;
 
   const facultyPartTime = facultyList.filter((f) => f.instructor.employment_type === 'Part Time');
   const facultyFullTime = facultyList.filter((f) => f.instructor.employment_type !== 'Part Time');
@@ -395,19 +439,17 @@ export default function GradingSheets() {
   const crossProgramFaculty = facultyFullTime.filter((f) => !ownFacultyIds.has(f.instructor.id));
   const ownFullTime = facultyFullTime.filter((f) => ownFacultyIds.has(f.instructor.id));
 
+  // Own Full-Time faculty, tagged by their ACCOUNT's own real program(s) —
+  // same rule Admin's own Grade Approval page uses: GE excluded from the
+  // pick (it's a bonus tag on top of a real program, not a department of
+  // its own), falling back to whatever's left on the account, or Unassigned
+  // if there's nothing at all. This is who they actually belong to
+  // departmentally, not just whatever they happen to be teaching this
+  // semester — cross-program teaching still surfaces separately below.
   const facultyByProgram = {};
   ownFullTime.forEach((f) => {
-    // Tag by the program(s) of the classes actually in this Chairperson's own
-    // queue (not the instructor's full `programs` list, which can include
-    // other programs this Chairperson doesn't oversee — e.g. a faculty who
-    // also teaches GE or a second program elsewhere). `classes` is already
-    // scoped server-side to this Chairperson's own program(s), so deriving
-    // tags from the visible classes naturally keeps this to "their" programs.
-    // A faculty with 0 classes has nothing to derive from, so falls back to
-    // their account's own `programs` list (also backend-scoped to this
-    // Chairperson already, via the allFaculty fetch above).
-    const classTags = [...new Set(f.classes.map((c) => c.subject?.program).filter(Boolean))];
-    const tags = classTags.length > 0 ? classTags : (f.instructor.programs?.length > 0 ? f.instructor.programs : ['Unassigned']);
+    const realPrograms = (f.instructor.programs || []).filter((p) => p !== GE_OPTION);
+    const tags = realPrograms.length > 0 ? realPrograms : (f.instructor.programs?.length > 0 ? f.instructor.programs : ['Unassigned']);
     tags.forEach((tag) => {
       if (!facultyByProgram[tag]) facultyByProgram[tag] = [];
       facultyByProgram[tag].push(f);
@@ -416,14 +458,14 @@ export default function GradingSheets() {
 
   const crossProgramByProgram = {};
   crossProgramFaculty.forEach((f) => {
-    // Same reasoning as facultyByProgram above: tag by the program(s) of the
-    // classes actually visible here, not the instructor's whole `programs`
-    // list — a foreign faculty tagged for BOTH BSIS and GE (say) but only
-    // teaching a BSIS class in this queue was otherwise showing up in BOTH
-    // the "BSIS (Teaching Here)" AND "GE (Teaching Here)" tiles, duplicated
-    // under a program they aren't actually teaching here at all.
-    const classTags = [...new Set(f.classes.map((c) => c.subject?.program).filter(Boolean))];
-    const tags = classTags.length > 0 ? classTags : (f.instructor.programs?.length > 0 ? f.instructor.programs : ['Other Program']);
+    // Tagged by the faculty's OWN account program (e.g. "BSIS (Teaching
+    // Here)"), not the program of the class they teach here — that's always
+    // this Chairperson's own program, so every tile read "BSIT (Teaching
+    // Here)" and never said where the faculty actually comes from. GE is
+    // excluded the same way facultyByProgram above does it, so a BSIS+GE
+    // faculty isn't duplicated into a "GE (Teaching Here)" tile too.
+    const realPrograms = (f.instructor.programs || []).filter((p) => p !== GE_OPTION);
+    const tags = realPrograms.length > 0 ? realPrograms : (f.instructor.programs?.length > 0 ? f.instructor.programs : ['Other Program']);
     tags.forEach((tag) => {
       if (!crossProgramByProgram[tag]) crossProgramByProgram[tag] = [];
       crossProgramByProgram[tag].push(f);
@@ -459,15 +501,15 @@ export default function GradingSheets() {
     <tr key={c.id} className="border-b border-gray-50 hover:bg-gray-50/60 transition-colors">
       {/* Program only — Year is now the outer container's own header
           (groupByYearSection), so it doesn't need repeating on every row. */}
-      <td className="px-4 py-3.5 align-top whitespace-nowrap">
+      <td className="px-4 py-3.5 align-middle whitespace-nowrap">
         <div className="flex items-center gap-1.5">
           <ProgramDot program={c.subject?.program} />
           <span className="text-xs font-semibold text-gray-600">{programShortLabel(c.subject?.program)}</span>
         </div>
       </td>
-      <td className="px-4 py-3.5 align-top">
+      <td className="px-4 py-3.5 align-middle">
         <p className="font-semibold text-[13px] text-navy whitespace-nowrap">{c.subject?.code}</p>
-        <p className="text-gray-500 text-xs">{c.subject?.name}</p>
+        <p className="text-gray-500 text-xs min-w-[180px] max-w-[260px]">{c.subject?.name}</p>
         {c.admin_return_reason && (
           <p className="text-[11px] text-red-600 mt-1 max-w-xs">
             <Icons.AlertTriangle className="w-3 h-3 inline mr-1 -mt-0.5" />
@@ -478,24 +520,26 @@ export default function GradingSheets() {
       {/* `c.semester` already bakes the academic year in ("First Semester
           2026-2027") — appending c.academic_year again duplicated it into
           "First Semester 2026-2027 2026-2027" whenever both were set. */}
-      <td className="px-4 py-3.5 text-xs align-top whitespace-nowrap">{c.semester}</td>
-      <td className="px-4 py-3.5 text-[13px] align-top">
-        <div>{c.instructor?.name || '—'}</div>
+      <td className="px-4 py-3.5 text-xs align-middle whitespace-nowrap">{c.semester}</td>
+      <td className="px-4 py-3.5 text-[13px] align-middle">
+        <div className="whitespace-nowrap font-medium">{c.instructor?.name || '—'}</div>
         {c.instructor && (
           <div className="mt-1 flex flex-wrap gap-1">
             <FacultyProgramTags user={c.instructor} />
           </div>
         )}
       </td>
-      <td className="px-4 py-3.5 text-[13px] align-top text-center">{c.student_count ?? 0}</td>
-      <td className="px-4 py-3.5 align-top">
+      <td className="px-4 py-3.5 text-[13px] align-middle min-w-[150px]">
+        <EncodingProgress c={c} />
+      </td>
+      <td className="px-4 py-3.5 align-middle">
         <DocCell cls={c} type="record" verified={c.class_record_verified} hasSubmissions={(c.submitted_count ?? 0) > 0} onPreview={openPreview} />
       </td>
-      <td className="px-4 py-3.5 align-top">
+      <td className="px-4 py-3.5 align-middle">
         <DocCell cls={c} type="sheet" verified={c.grade_sheet_verified} hasSubmissions={(c.submitted_count ?? 0) > 0} onPreview={openPreview} />
       </td>
       {showActionCol && (
-        <td className="px-4 py-3.5 align-top">
+        <td className="px-4 py-3.5 align-middle">
           <div className="flex flex-col items-center gap-1.5">
             {c.admin_return_reason && (
               <button className="btn btn-red btn-sm whitespace-nowrap" onClick={() => openReturnFormDirect(c)}>
@@ -616,7 +660,7 @@ export default function GradingSheets() {
                                   <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Subject</th>
                                   <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Semester</th>
                                   <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Faculty</th>
-                                  <th className="text-center px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Students</th>
+                                  <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Progress</th>
                                   <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Class Record</th>
                                   <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Grade Sheet</th>
                                   {showActionCol && <th className="text-center px-4 py-2 text-[10px] font-semibold uppercase tracking-wide">Action</th>}
@@ -656,29 +700,50 @@ export default function GradingSheets() {
       {facultyList.length > 0 && (
         <div className="card p-4 mb-5">
           <div className="flex items-center gap-3 mb-3">
-            <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 ${facultyDoneCount === facultyList.length ? 'bg-green-50 text-green-500' : 'bg-amber-50 text-amber-500'}`}>
+            <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 ${totalDoneClasses > 0 ? 'bg-green-50 text-green-500' : 'bg-amber-50 text-amber-500'}`}>
               <Icons.Users className="w-4 h-4" />
             </div>
-            <div className="min-w-0">
-              <p className="text-sm font-semibold text-navy leading-snug">
-                {facultyDoneCount}/{facultyList.length} faculty done submitting · {facultyPassedCount}/{facultyList.length} fully verified
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2.5 flex-wrap">
+                <span className="text-sm font-bold text-navy leading-snug">
+                  <span className="text-green-600 font-bold">{totalDoneClasses}</span> Done
+                </span>
+                <span className="text-gray-300">·</span>
+                <span className="text-sm font-semibold text-amber-600 leading-snug">
+                  {totalPendingRecordClasses} Pending Class Record
+                </span>
+                <span className="text-gray-300">·</span>
+                <span className="text-sm font-semibold text-blue-600 leading-snug">
+                  {totalPendingSheetClasses} Pending Grade Sheet
+                </span>
+              </div>
+              <p className="text-xs text-gray-400 leading-snug mt-0.5">
+                Overview across your overseen program(s)
               </p>
-              <p className="text-xs text-gray-400 leading-snug mt-0.5">Submitted = Faculty sent every class. Verified = you've forwarded every class to Admin.</p>
             </div>
           </div>
           <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))' }}>
             {facultyGroups.map((g) => {
-              const done = g.list.filter((f) => facultySent(f)).length;
-              const passed = g.list.filter(facultyPassed).length;
               const total = g.list.length;
-              const complete = total > 0 && done === total;
-              const allPassed = total > 0 && passed === total;
-              // Total classes this program's faculty are carrying — a
-              // faculty only counts as "done" once ALL of their classes are
-              // in (unchanged all-or-nothing rule above), but the class
-              // count itself is what that "all" actually means for this
-              // group, so it's worth showing alongside the faculty count.
-              const classCount = g.list.reduce((sum, f) => sum + f.classes.length, 0);
+
+              // Collect classes belonging exclusively to this program group's instructors
+              const seenClassIds = new Set();
+              const groupClasses = [];
+              g.list.forEach((f) => {
+                (f.classes || []).forEach((c) => {
+                  if (!seenClassIds.has(c.class_id)) {
+                    seenClassIds.add(c.class_id);
+                    const fullClass = classById[c.class_id] || c;
+                    groupClasses.push(fullClass);
+                  }
+                });
+              });
+
+              const doneClasses = groupClasses.filter((c) => c.chairperson_verified || (c.class_record_verified && c.grade_sheet_verified)).length;
+              const pendingRecordClasses = groupClasses.filter((c) => !c.class_record_verified).length;
+              const pendingSheetClasses = groupClasses.filter((c) => !c.grade_sheet_verified).length;
+              const classCount = groupClasses.length;
+
               // Jumps to (and opens) this program's own dropdown in the
               // "Every group's own faculty" list further down the card,
               // instead of leaving the tile purely informational and making
@@ -690,48 +755,59 @@ export default function GradingSheets() {
               return (
                 <div
                   key={g.key}
-                  className="border border-gray-100 rounded-lg p-3 min-w-0 cursor-pointer hover:border-navy/30 hover:shadow-sm transition-all"
+                  className="border border-gray-100 dark:border-slate-800 rounded-lg p-3 min-w-0 cursor-pointer hover:border-navy/30 hover:shadow-sm transition-all bg-white dark:bg-slate-900 flex flex-col justify-between"
                   role="button"
                   tabIndex={0}
                   onClick={openGroupBelow}
                   onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openGroupBelow(); } }}
                   title={`View ${g.label} faculty`}
                 >
-                  <div className="flex items-center gap-1.5 mb-2 min-w-0">
-                    {g.key === 'part_time'
-                      ? <span className="w-2 h-2 rounded-full bg-amber-400 flex-shrink-0 inline-block" />
-                      : <ProgramDot program={g.program} />}
-                    <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide truncate">{g.label}</span>
-                  </div>
-                  <p className="text-[11px] text-gray-400 mb-1.5">{total} faculty · {classCount} class{classCount !== 1 ? 'es' : ''} total</p>
+                  <div>
+                    <div className="flex items-center gap-1.5 mb-1.5 min-w-0">
+                      {g.key === 'part_time'
+                        ? <span className="w-2 h-2 rounded-full bg-amber-400 flex-shrink-0 inline-block" />
+                        : <ProgramDot program={g.program} />}
+                      <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide truncate">{g.label}</span>
+                    </div>
+                    <p className="text-[11px] text-gray-400 mb-2">{total} faculty · {classCount} class{classCount !== 1 ? 'es' : ''}</p>
 
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] text-gray-500 uppercase tracking-wide">Submitted</span>
-                    <span className={`text-xs font-bold ${complete ? 'text-green-600' : 'text-navy'}`}>{done}/{total}</span>
-                  </div>
-                  <div className="w-full h-1 bg-gray-100 rounded-full overflow-hidden mt-1 mb-2">
-                    <div className={`h-full rounded-full ${complete ? 'bg-green-500' : 'bg-amber-400'}`} style={{ width: `${total > 0 ? (done / total) * 100 : 0}%` }} />
-                  </div>
+                    {classCount === 0 ? (
+                      <p className="text-xs text-gray-300 dark:text-slate-600 italic py-3 text-center">No active classes</p>
+                    ) : (
+                      <div className="space-y-2 py-0.5">
+                        <div>
+                          <div className="flex items-center justify-between text-xs mb-1">
+                            <span className="text-gray-600 dark:text-gray-300 flex items-center gap-1 font-medium">
+                              <Icons.Check className="w-3.5 h-3.5 text-green-500" /> Done
+                            </span>
+                            <span className={`font-bold ${doneClasses > 0 ? 'text-green-600' : 'text-gray-400'}`}>
+                              {doneClasses}/{classCount}
+                            </span>
+                          </div>
+                          <div className="w-full h-1.5 bg-gray-100 dark:bg-slate-700 rounded-full overflow-hidden">
+                            <div className="h-full bg-green-500 rounded-full transition-all" style={{ width: `${(doneClasses / classCount) * 100}%` }} />
+                          </div>
+                        </div>
 
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] text-gray-500 uppercase tracking-wide">Verified</span>
-                    <span className={`text-xs font-bold ${allPassed ? 'text-green-600' : 'text-navy'}`}>{passed}/{total}</span>
-                  </div>
-                  <div className="w-full h-1 bg-gray-100 rounded-full overflow-hidden mt-1 mb-2">
-                    <div className={`h-full rounded-full ${allPassed ? 'bg-green-500' : 'bg-blue-400'}`} style={{ width: `${total > 0 ? (passed / total) * 100 : 0}%` }} />
-                  </div>
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-gray-600 dark:text-gray-300 flex items-center gap-1 truncate" title="Pending Class Record">
+                            <Icons.Book className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" /> Pending Class Record
+                          </span>
+                          <span className={`font-bold px-1.5 py-0.5 rounded text-xs ${pendingRecordClasses > 0 ? 'text-amber-700 bg-amber-50 dark:text-amber-400 dark:bg-amber-950/40' : 'text-gray-400'}`}>
+                            {pendingRecordClasses}
+                          </span>
+                        </div>
 
-                  {/* Spelled out explicitly, not just left to the ratio above
-                      — the whole point of the tile is answering "how many
-                      have passed and how many haven't, per program" at a
-                      glance. */}
-                  <div className="flex items-center gap-3 pt-1 border-t border-gray-50">
-                    <span className="flex items-center gap-1 text-[11px] text-green-600 font-medium">
-                      <Icons.Check className="w-3 h-3" /> {passed} passed
-                    </span>
-                    <span className="flex items-center gap-1 text-[11px] text-gray-400 font-medium">
-                      <Icons.Clock className="w-3 h-3" /> {total - passed} not yet
-                    </span>
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-gray-600 dark:text-gray-300 flex items-center gap-1 truncate" title="Pending Grade Sheet">
+                            <Icons.FileText className="w-3.5 h-3.5 text-blue-500 flex-shrink-0" /> Pending Grade Sheet
+                          </span>
+                          <span className={`font-bold px-1.5 py-0.5 rounded text-xs ${pendingSheetClasses > 0 ? 'text-blue-700 bg-blue-50 dark:text-blue-400 dark:bg-blue-950/40' : 'text-gray-400'}`}>
+                            {pendingSheetClasses}
+                          </span>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               );
@@ -754,7 +830,7 @@ export default function GradingSheets() {
           {facultyGroups.map((g) => {
             const visibleList = g.list
               .slice()
-              .sort(comparePeopleNames)
+              .sort((a, b) => comparePeopleNames(a.instructor, b.instructor))
               .filter((f) => !facultySearch || formatPersonName(f.instructor.name)?.toLowerCase().includes(facultySearch.toLowerCase()));
             // A search match auto-expands its own program's group — so
             // finding someone surfaces which program they're under without
@@ -797,8 +873,26 @@ export default function GradingSheets() {
                     // Partial progress, not just the all-or-nothing badges
                     // beside it — a faculty with 5 classes and 3 submitted
                     // reads as "3/5", not just an undifferentiated "5 classes".
-                    const classesSubmitted = f.classes.filter((c) => topGroupOf(c) !== 'pending').length;
-                    const classesVerified = f.classes.filter((c) => topGroupOf(c) === 'done').length;
+                    // Counted against realClasses (students > 0) using the
+                    // same c.sent/verifiedClassIds facultySent/facultyPassed
+                    // use above — topGroupOf(c) here read chairperson_verified
+                    // as always undefined on this data shape, so "verified"
+                    // could never show above 0 no matter how complete a
+                    // faculty's classes actually were; an empty, unenrolled
+                    // class has nothing to submit either, so it shouldn't
+                    // drag the ratio down as a missing one.
+                    const rc = realClasses(f);
+                    const classesSubmitted = rc.filter((c) => c.sent).length;
+                    const classesVerified = rc.filter((c) => verifiedClassIds.has(c.class_id)).length;
+                    // What program(s) this row's own tags actually come from —
+                    // the program(s) of the classes they're teaching THIS
+                    // semester when they have any (same source facultyByProgram/
+                    // crossProgramByProgram above tag them by), falling back to
+                    // FacultyProgramTags' own account-based rendering (which
+                    // collapses an idle Part-Time faculty to a plain "Part
+                    // Timer" badge) only when there's no real class to derive
+                    // it from.
+                    const rowClassTags = [...new Set(f.classes.map((c) => c.program).filter(Boolean))];
                     return (
                       <div key={f.instructor.id} className="px-3 py-2 rounded-lg border border-gray-100">
                         <div className="flex items-center gap-3">
@@ -806,21 +900,31 @@ export default function GradingSheets() {
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-1.5 flex-wrap">
                               <p className="text-sm font-medium truncate">{formatPersonName(f.instructor.name)}</p>
+                              {/* One employment label only — a Part Timer with no
+                                  classes already gets "Part Timer" from
+                                  FacultyProgramTags below, so it isn't repeated. */}
+                              {!(f.instructor.employment_type === 'Part Time' && rowClassTags.length === 0) && (
+                                <Badge variant={f.instructor.employment_type === 'Part Time' ? 'yellow' : 'blue'}>
+                                  {f.instructor.employment_type === 'Part Time' ? 'Part Timer' : 'Full Time'}
+                                </Badge>
+                              )}
                               {/* This faculty's OWN program tag(s) — e.g. a
                                   BSIS instructor who's shown here under the
                                   "GE (Teaching Here)" tile because they teach
                                   a GE class in this queue still reads as BSIS
                                   by tag, with GE alongside it if they're
                                   tagged for that too. */}
-                              <FacultyProgramTags user={f.instructor} />
+                              {rowClassTags.length > 0
+                                ? rowClassTags.map((p) => <ProgramBadge key={p} program={p} short />)
+                                : <FacultyProgramTags user={f.instructor} />}
                             </div>
                             <p className="text-[11px] text-gray-400">{f.classes.length} class{f.classes.length !== 1 ? 'es' : ''} handled</p>
                           </div>
                           <Badge variant={sent ? 'green' : 'gray'} className="flex-shrink-0" title={sent ? 'Every class submitted' : 'Not every class submitted yet'}>
-                            {sent && <Icons.Check className="w-3 h-3" />} {classesSubmitted}/{f.classes.length} submitted
+                            {sent && <Icons.Check className="w-3 h-3" />} {classesSubmitted}/{rc.length} submitted
                           </Badge>
                           <Badge variant={passed ? 'green' : 'gray'} className="flex-shrink-0" title={passed ? 'Every class verified' : 'Not every class verified yet'}>
-                            {passed && <Icons.Check className="w-3 h-3" />} {classesVerified}/{f.classes.length} verified
+                            {passed && <Icons.Check className="w-3 h-3" />} {classesVerified}/{rc.length} verified
                           </Badge>
                         </div>
                         {/* The actual classes this faculty created/is
@@ -837,13 +941,13 @@ export default function GradingSheets() {
                             {f.classes.slice().sort((a, b) =>
                               (a.year_level ?? 0) - (b.year_level ?? 0) ||
                               String(a.section ?? '').localeCompare(String(b.section ?? '')) ||
-                              String(a.subject?.code ?? '').localeCompare(String(b.subject?.code ?? ''))
+                              String(a.subject_code ?? '').localeCompare(String(b.subject_code ?? ''))
                             ).map((c) => {
-                              const stage = topGroupOf(c);
+                              const stage = chipStageOf(c);
                               return (
                                 <span
-                                  key={c.id}
-                                  title={`${c.subject?.name || c.subject?.code}${c.section ? ` · Section ${c.section}` : ''}${c.year_level ? ` · Year ${c.year_level}` : ''}`}
+                                  key={c.class_id}
+                                  title={`${c.program ? programShortLabel(c.program) + ' · ' : ''}${c.subject_name || c.subject_code}${c.section ? ` · Section ${c.section}` : ''}${c.year_level ? ` · Year ${c.year_level}` : ''}`}
                                   className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full border ${
                                     stage === 'done'
                                       ? 'bg-green-50 border-green-200 text-green-700'
@@ -856,7 +960,7 @@ export default function GradingSheets() {
                                 >
                                   {stage === 'done' && <Icons.Check className="w-2.5 h-2.5" />}
                                   {stage === 'returned' && <Icons.AlertTriangle className="w-2.5 h-2.5" />}
-                                  {c.subject?.code}{c.year_level ? ` · Y${c.year_level}` : ''}{c.section ? ` · ${c.section}` : ''}
+                                  {c.program ? `${programShortLabel(c.program)} · ` : ''}{c.subject_code}{c.year_level ? ` · Y${c.year_level}` : ''}{c.section ? ` · ${c.section}` : ''}
                                 </span>
                               );
                             })}
@@ -879,7 +983,7 @@ export default function GradingSheets() {
       <div className="card p-4 mb-5">
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
           <div className="col-span-2 sm:col-span-3 lg:col-span-2">
-            <SearchBar value={search} onChange={setSearch} placeholder="Search by subject, course title, or instructor..." />
+            <SearchBar value={search} onChange={setSearch} placeholder="Search by subject, course title, or faculty..." />
           </div>
           {programOptions.length > 1 && (
             <select
@@ -1023,7 +1127,7 @@ export default function GradingSheets() {
                                             <div className="min-w-0">
                                               <p className="text-sm font-semibold text-navy truncate">{c.subject?.code}</p>
                                               <p className="text-xs text-gray-400 truncate">{c.subject?.name} · {c.semester}</p>
-                                              <p className="text-xs text-gray-500 truncate">{c.instructor?.name || 'No instructor'}</p>
+                                              <p className="text-xs text-gray-500 truncate">{c.instructor?.name || 'No faculty'}</p>
                                             </div>
                                           </div>
                                           <div className="flex items-center gap-1.5 flex-shrink-0">
@@ -1071,7 +1175,7 @@ export default function GradingSheets() {
         <Modal
           title={`${previewDoc.label} — ${preview.cls.subject?.code}${preview.cls.section ? ` Sec ${preview.cls.section}` : ''}`}
           onClose={closePreview}
-          size="max-w-5xl"
+          size="max-w-[98vw]"
           footer={
             showReturnForm ? (
               <>
@@ -1106,7 +1210,7 @@ export default function GradingSheets() {
           {showReturnForm ? (
             <div>
               <p className="text-[13px] text-gray-500 mb-3">
-                This sends BOTH the Class Record and Grade Sheet back to {preview.cls.instructor?.name || 'the instructor'} for
+                This sends BOTH the Class Record and Grade Sheet back to {preview.cls.instructor?.name ? formatPersonName(preview.cls.instructor.name) : 'the faculty'} for
                 revision — they always move together. Every grade unlocks for editing, and once resubmitted it goes through
                 Chairperson and Admin review again from the start.
               </p>
@@ -1125,7 +1229,7 @@ export default function GradingSheets() {
               key={`${preview.cls.id}-${preview.type}`}
               src={`${previewDoc.path}/${preview.cls.id}?preview=1`}
               title="Document preview"
-              style={{ width: '100%', height: '65vh', border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
+              style={{ width: '100%', height: 'calc(90vh - 200px)', minHeight: 360, border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
             />
           )}
         </Modal>
@@ -1134,7 +1238,7 @@ export default function GradingSheets() {
       {confirmReturn && (
         <ConfirmDialog
           title="Send back to Faculty?"
-          message={`This un-verifies the ${previewDoc.label} for ${preview?.cls.subject?.code || 'this class'} and unlocks every grade in it for the instructor to re-edit. It goes through Chairperson and Admin review again once resubmitted. Reason: "${returnMessage.trim()}"`}
+          message={`This un-verifies the ${previewDoc.label} for ${preview?.cls.subject?.code || 'this class'} and unlocks every grade in it for the faculty to re-edit. It goes through Chairperson and Admin review again once resubmitted. Reason: "${returnMessage.trim()}"`}
           confirmText={returning ? 'Sending...' : 'Send Back'}
           variant="red"
           confirmDisabled={returning}
@@ -1158,7 +1262,7 @@ export default function GradingSheets() {
       {showBulkReturnConfirm && (
         <ConfirmDialog
           title="Return All to Faculty"
-          message={`Return all ${byTopGroup.returned.length} class${byTopGroup.returned.length !== 1 ? 'es' : ''} in "Returned by Admin" to their instructors? Each one goes back with Admin's own reason already attached — every grade unlocks for editing, and once resubmitted it goes through Chairperson and Admin review again from the start.`}
+          message={`Return all ${byTopGroup.returned.length} class${byTopGroup.returned.length !== 1 ? 'es' : ''} in "Returned by Admin" to their faculty? Each one goes back with Admin's own reason already attached — every grade unlocks for editing, and once resubmitted it goes through Chairperson and Admin review again from the start.`}
           confirmText={bulkReturning ? 'Sending...' : 'Return All'}
           variant="red"
           confirmDisabled={bulkReturning}

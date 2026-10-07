@@ -20,7 +20,8 @@
 import PizZip from 'pizzip';
 import { saveAs } from 'file-saver';
 import toast from 'react-hot-toast';
-import { programShortLabel } from '../components/common';
+import { programShortLabel, formatPersonNameFirstLast, comparePeopleNames } from '../components/common';
+import { getSemesterFor, yearAbbrOf } from './semesterLabels';
 
 const TEMPLATE_URL = '/templates/grades-monitoring-form-template.docx';
 const HEADER_SHADE = 'D9D9D9'; // light gray, matches the reference printout's own header row shading
@@ -52,7 +53,7 @@ function findSubtitleRange(docXml) {
 // and run 3 (" Semester A.Y. ...") XML verbatim — preserves their exact
 // formatting attributes automatically — with only their actual text content
 // swapped out, rather than hand-reconstructing the run XML from scratch.
-function buildSubtitleReplacement(docXml, range, semesterName) {
+function buildSubtitleReplacement(docXml, range, semesterName, yearAbbr = 'A.Y.') {
   const raw = semesterName || '';
   const ay = raw.match(/\d{4}-\d{4}/)?.[0] || '';
   const term = raw.replace(ay, '').replace(/,?\s*$/, '').replace(/\s*(Semester|Summer)\s*$/i, '').trim();
@@ -66,11 +67,11 @@ function buildSubtitleReplacement(docXml, range, semesterName) {
   if (isSummer) {
     // No ordinal suffix for Summer — drop run 2 entirely, adjust run 3's
     // own text (still reusing its real formatting attributes).
-    const newRun3 = run3Xml.replace(/<w:t[^>]*>[^<]*<\/w:t>/, `<w:t xml:space="preserve"> Summer A.Y. ${esc(ay)}</w:t>`);
+    const newRun3 = run3Xml.replace(/<w:t[^>]*>[^<]*<\/w:t>/, `<w:t xml:space="preserve"> Summer ${esc(yearAbbr)} ${esc(ay)}</w:t>`);
     return `College of Arts and Sciences / Summer</w:t></w:r>${newRun3}`;
   }
   const newRun2 = run2Xml.replace(/<w:t[^>]*>[^<]*<\/w:t>/, `<w:t xml:space="preserve">${esc(suf)}</w:t>`);
-  const newRun3 = run3Xml.replace(/<w:t[^>]*>[^<]*<\/w:t>/, `<w:t xml:space="preserve"> Semester A.Y. ${esc(ay)}</w:t>`);
+  const newRun3 = run3Xml.replace(/<w:t[^>]*>[^<]*<\/w:t>/, `<w:t xml:space="preserve"> Semester ${esc(yearAbbr)} ${esc(ay)}</w:t>`);
   return `College of Arts and Sciences / ${num}</w:t></w:r>${newRun2}${newRun3}`;
 }
 
@@ -170,12 +171,29 @@ function emptyStateRowXml(columnCount, message) {
   return `<w:tr><w:tc><w:tcPr><w:gridSpan w:val="${columnCount}"/></w:tcPr><w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:i/><w:iCs/></w:rPr><w:t xml:space="preserve">${esc(message)}</w:t></w:r></w:p></w:tc></w:tr>`;
 }
 
+// A program's classes, alphabetical by faculty surname (then subject code),
+// each with `span`: how many rows that faculty member's name covers on their
+// FIRST row, 0 on the rows after it — a faculty member with several classes
+// is named once. Shared by the Reports pages and this export.
+export function withFacultySpans(rows = []) {
+  const sorted = [...rows].sort((a, b) => comparePeopleNames(a.instructor_name || '', b.instructor_name || '') || String(a.subject_code).localeCompare(String(b.subject_code)));
+  const who = (c) => c.instructor_id ?? c.instructor_name ?? '';
+  return sorted.map((c, i) => {
+    if (i > 0 && who(sorted[i - 1]) === who(c)) return { c, span: 0 };
+    let span = 1;
+    while (i + span < sorted.length && who(sorted[i + span]) === who(c)) span += 1;
+    return { c, span };
+  });
+}
+
 function buildProgramTableXml(tblOpenXml, headerRowsXml, blankRowTemplate, columnCount, rows) {
   const dataRowsXml = (rows && rows.length > 0)
-    ? rows.map((r) => {
+    // Alphabetical by surname (same order as the Reports page), printed
+    // First M. Surname, and only on each faculty member's first row.
+    ? withFacultySpans(rows).map(({ c: r, span }) => {
       const total = (r.passed || 0) + (r.inc || 0) + (r.failed || 0) + (r.dropped || 0);
       return fillRowCells(blankRowTemplate, [
-        r.instructor_name || '—',
+        span === 0 ? '' : r.instructor_name ? formatPersonNameFirstLast(r.instructor_name) : '—',
         r.subject_code || '—',
         r.subject_name || '—',
         fmtDate(r.date_submitted),
@@ -217,7 +235,9 @@ export async function exportGradesMonitoringFormDocx({ programs, semester, prepa
       const titleParaStart = docXml.lastIndexOf('<w:p ', subtitleRange.start);
       const titleParaEndTag = docXml.indexOf('</w:p>', subtitleRange.thirdRClose);
       const titleParaEnd = titleParaEndTag + '</w:p>'.length;
-      const subtitleReplacement = buildSubtitleReplacement(docXml, subtitleRange, semester);
+      // "A.Y." or "S.Y." — this semester's own label (Semester Management).
+      const yearAbbr = yearAbbrOf(await getSemesterFor(semester));
+      const subtitleReplacement = buildSubtitleReplacement(docXml, subtitleRange, semester, yearAbbr);
       titleParaXml = docXml.slice(titleParaStart, subtitleRange.start) + subtitleReplacement + docXml.slice(subtitleRange.thirdRClose, titleParaEnd);
       docXml = docXml.slice(0, titleParaStart) + docXml.slice(titleParaEnd);
     }
@@ -312,7 +332,7 @@ export async function exportGradesMonitoringFormDocx({ programs, semester, prepa
     if (footerFile) {
       let footerXml = footerFile.asText();
       footerXml = footerXml
-        .split('MARK B. ESCALANTE').join(esc((preparedByName || '').toUpperCase()))
+        .split('MARK B. ESCALANTE').join(esc((preparedByName ? formatPersonNameFirstLast(preparedByName) : '').toUpperCase()))
         .split('Program Chairperson, BSIT').join(esc(preparedByTitle));
       zip.file('word/footer1.xml', footerXml);
     }

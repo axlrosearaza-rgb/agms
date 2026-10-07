@@ -1,16 +1,19 @@
 import { useState, useEffect, useRef } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { gradeService } from '../../services';
-import { LoadingSpinner, comparePeopleNames, formatPersonName, formatPersonNameCapsSurname } from '../../components/common';
+import { LoadingSpinner, comparePeopleNames, formatPersonNameFirstLast, formatPersonNameCapsSurname } from '../../components/common';
 // Mirrors whatever the Class Record already has marked for this student — an
 // INC there means the Grading Sheet shows INC too, automatically, not a blank
 // Remarks waiting on it to be resolved first. Shared with classRecordExcel.js/
 // ClassRecordView.js so this table's own Remarks column is never a different
 // color/wording from the Class Record's own Passed/Failed/INC/DROP cells.
-import { remarksFor, remarksStyle } from '../../utils/classRecordExcel';
+import { remarksText, remarksStyle, formatGrade } from '../../utils/classRecordExcel';
 import toast from 'react-hot-toast';
+import { programWithSection } from '../../utils/gradingSheetDocx';
+import { useSemesterLabels } from '../../utils/semesterLabels';
 
-const TOTAL_ROWS = 25;
+const TOTAL_ROWS = 25; // one page for up to 25 students; more pages only when needed
+const ROWS_PER_PAGE = 25;
 
 // Same fix as classRecordExcel.js's stripYearFromSemester — `semester`
 // already bakes its own academic year into the string ("First Semester
@@ -42,6 +45,7 @@ export default function GradingSheet() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const hasAutoPrinted = useRef(false);
+  const { shortFor } = useSemesterLabels();
 
   useEffect(() => {
     (async () => {
@@ -75,7 +79,14 @@ export default function GradingSheet() {
   const rows = (data.student_grades || [])
     .slice()
     .sort((a, b) => comparePeopleNames(a.student, b.student));
-  const padded = [...rows, ...Array(Math.max(0, TOTAL_ROWS - rows.length)).fill(null)].slice(0, Math.max(TOTAL_ROWS, rows.length));
+  // "*** NOTHING FOLLOWS ***" on the row right after the last student (the
+  // official form's convention), then the blank rows the form still carries.
+  // Padded with numbered blank rows to 50, or to a full 25-row page for a
+  // bigger class — same as the exported sheet.
+  const NOTHING_FOLLOWS = { nothingFollows: true };
+  const rowTotal = Math.max(TOTAL_ROWS, Math.ceil(rows.length / ROWS_PER_PAGE) * ROWS_PER_PAGE);
+  const withMarker = rows.length > 0 && rows.length < rowTotal ? [...rows, NOTHING_FOLLOWS] : rows;
+  const padded = [...withMarker, ...Array(rowTotal - withMarker.length).fill(null)];
 
   return (
     <div style={{ fontFamily: 'Arial, sans-serif', color: '#111', maxWidth: 900, margin: '0 auto', padding: '24px' }}>
@@ -118,16 +129,16 @@ export default function GradingSheet() {
             that same year back out of the semester text so it isn't shown
             twice ("AY 2026-2027, First Semester" instead of "AY ________,
             First Semester 2026-2027"). */}
-        AY <b>{academicYear || '________'}</b>, <b>{semesterLabel || '________'}</b>
+        {shortFor(cls.semester)} <b>{academicYear || '________'}</b>, <b>{semesterLabel || '________'}</b>
       </p>
-      <p style={{ fontSize: 12, margin: '4px 0 2px' }}><b>{subject.program || '________________________'}</b></p>
+      <p style={{ fontSize: 12, margin: '4px 0 2px' }}><b>{programWithSection(cls) || '________________________'}</b></p>
       <p style={{ fontSize: 10, margin: '0 0 14px', fontStyle: 'italic' }}>(Curriculum/Program)</p>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 24px', fontSize: 12, marginBottom: 14 }}>
         <p style={{ margin: 0 }}><b>Subject Code:</b> {subject.code}</p>
         <p style={{ margin: 0 }}><b>Units:</b> {subject.units}</p>
         <p style={{ margin: 0 }}><b>Course Description:</b> {subject.name}</p>
-        <p style={{ margin: 0 }}><b>Faculty/Professor:</b> {formatPersonName(cls.instructor?.name)}</p>
+        <p style={{ margin: 0 }}><b>Faculty/Professor:</b> {formatPersonNameFirstLast(cls.instructor?.name)}</p>
       </div>
 
       <div style={{ overflowX: 'auto' }}>
@@ -148,30 +159,55 @@ export default function GradingSheet() {
             // as the Class Record's own Remarks cell (remarksStyle), instead
             // of plain uncolored text — a glance at this sheet should read
             // the outcome exactly as fast as the Class Record already does.
-            const rStyle = row?.grade ? remarksStyle(row.grade.status) : null;
+            // INC only in the Midterm with the Finals complete: the Final
+            // Grade cell below still shows that real Finals number (it's
+            // genuinely done), but Remarks stays INC — the student is still
+            // INC overall until the Midterm resolves too, so it never judges
+            // Passed/Failed off a number that's still provisional. Same as
+            // the Class Record's Finals tab.
+            const gr = row?.grade;
+            const midtermOnlyInc = gr?.status === 'INC' && !!gr.inc_midterm && !gr.inc_finals && gr.finals != null && gr.finals !== '';
+            const effStatus = gr?.status;
+            const rStyle = gr ? remarksStyle(effStatus) : null;
+            if (row?.nothingFollows) {
+              return (
+                <tr key={i}>
+                  <td style={{ textAlign: 'center' }}>{i + 1}</td>
+                  <td colSpan={5} style={{ textAlign: 'center', fontWeight: 700, letterSpacing: '0.5px' }}>*** NOTHING FOLLOWS ***</td>
+                </tr>
+              );
+            }
+            // Continuous numbering, blank rows included.
+            const rowNo = i + 1;
             return (
               <tr key={i}>
-                <td style={{ textAlign: 'center' }}>{i + 1}</td>
+                <td style={{ textAlign: 'center' }}>{rowNo}</td>
                 <td>{row?.student?.student_no || ''}</td>
                 <td>{row?.student?.name ? formatPersonNameCapsSurname(row.student.name) : ''}</td>
-                {/* An INC or a DRP both clear midterm/finals/average to null at
-                    the source (Grade model's beforeSave hook), so both number
-                    columns show the literal "INC"/"DRP" text here — same as
-                    the Class Record's own INC/DRP cells — instead of just
-                    going blank and leaving only Remarks to explain why. */}
+                {/* INC is per period, same as the Class Record: a student who
+                    finished the Midterm but is INC in Finals still shows their
+                    real Midterm Grade here (Grade.midterm is only ever stored
+                    for a completed period) — "INC" only appears when this
+                    column's own period is the missing one. DRP clears both. */}
                 <td style={{ textAlign: 'center' }}>
-                  {row?.grade?.status === 'INC' ? 'INC' : row?.grade?.status === 'DRP' ? 'DROP' : (row?.grade?.midterm != null && row.grade.midterm !== '' ? parseFloat(row.grade.midterm).toFixed(1) : '')}
+                  {row?.grade?.status === 'DRP'
+                    ? 'DROP'
+                    : (row?.grade?.status === 'INC' && ((row.grade.inc_midterm || row.grade.inc_finals) ? row.grade.inc_midterm : (row.grade.midterm == null || row.grade.midterm === '')))
+                      ? 'INC'
+                      : formatGrade(row?.grade?.midterm)}
                 </td>
-                {/* Final Grade — not the raw Finals-term score, but the same
-                    computed average shown on the Class Record's "Final Grade"
-                    column (grade.average, backend-computed as (midterm + finals) / 2
-                    in the Grade model's beforeSave hook), so the two documents
-                    never disagree on what a student's final grade is. */}
+                {/* Final Grade — the average of the Midterm and Finals grades
+                    (grade.average, backend-computed as (midterm + finals) / 2
+                    in the Grade model's beforeSave hook). The Class Record's
+                    own Final Grade column is that exact same average (same
+                    rounding — formatGrade), so the two documents never
+                    disagree on what a student's final grade is. Needs both
+                    periods, so an INC in either one reads INC here. */}
                 <td style={{ textAlign: 'center' }}>
-                  {row?.grade?.status === 'INC' ? 'INC' : row?.grade?.status === 'DRP' ? 'DROP' : (row?.grade?.average != null && row.grade.average !== '' ? parseFloat(row.grade.average).toFixed(1) : '')}
+                  {row?.grade?.status === 'INC' ? 'INC' : row?.grade?.status === 'DRP' ? 'DROP' : formatGrade(row?.grade?.average)}
                 </td>
                 <td className="gs-remarks" style={rStyle ? { textAlign: 'center', background: rStyle.bg, color: rStyle.color, fontWeight: 700 } : { textAlign: 'center' }}>
-                  {row?.grade ? remarksFor(row.grade.status) : ''}
+                  {gr ? remarksText(effStatus, gr) : ''}
                 </td>
               </tr>
             );

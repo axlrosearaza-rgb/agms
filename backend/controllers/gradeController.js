@@ -1,3 +1,6 @@
+const { emitGradesUpdated } = require('../utils/realtime');
+const { cached } = require('../utils/responseCache');
+const { USER_SECRET_FIELDS } = require('../utils/userFields');
 const { Grade, Class, Subject, User, Enrollment, GradeComponent, ComponentItem, ComponentScore } = require('../models');
 const { Op } = require('sequelize');
 const { logActivity } = require('../utils/activityLogger');
@@ -9,6 +12,15 @@ const { actsAsInstructor } = require('../utils/teachingAuth');
 // directly would leave it silently sitting there until the recipient's next
 // page load/manual refresh, with no live badge update or sound at all.
 const { createNotification } = require('./notificationController');
+const { resolveCompletedINCs } = require('./gradeComponentController');
+
+// Grades only go out to students after BOTH sign-offs: the Chairperson's
+// verification (chairperson_verified) AND Admin's approval of both documents
+// (the Class Record and the Grade Sheet). Admin's side is checked from those
+// two document flags, not just from "no Passed grade is still pending" —
+// that alone reads as approved for a class with no Passed grades at all
+// (everyone INC/Dropped/Failed), which Admin never actually looked at.
+const adminSignedOff = (cls) => !!(cls.admin_class_record_approved && cls.admin_grade_sheet_approved);
 
 // Valid GWA values
 const VALID_GWA = [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 5.0];
@@ -31,14 +43,22 @@ const getGradesByClass = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'You can only view grades for your own classes.' });
   }
 
+  // An INC past its deadline becomes 5.0 — settled before the grades are read.
+  await require('../utils/incLapse').lapseExpiredINCs(req.app, { classId: cls.id });
+
   const enrollments = await Enrollment.findAll({
     where: { class_id: cls.id },
     include: [{
       model: User,
       as: 'student',
-      attributes: ['id', 'name', 'student_no', 'avatar', 'program', 'year_level'],
+      attributes: ['id', 'name', 'student_no', 'avatar', 'program', 'year_level', 'section'],
     }],
   });
+
+  // The Class Record is the source of truth — an INC student whose scores are
+  // now all in isn't incomplete anymore, so settle that before reading the
+  // grades, and the Grade Sheet (and everything built from it) matches.
+  await resolveCompletedINCs(cls.id);
 
   const grades = await Grade.findAll({ where: { class_id: cls.id } });
 
@@ -63,11 +83,15 @@ const getGradesByClass = asyncHandler(async (req, res) => {
   const releaseStatus = {
     chairperson_verified: cls.chairperson_verified,
     chairperson_verified_at: cls.chairperson_verified_at,
-    admin_finalized: pendingAdminApproval === 0,
+    // Admin's sign-off only counts while the Chairperson's verification still
+    // stands — a class sent back (by either one) resets chairperson_verified,
+    // so it reads as awaiting again instead of staying "finalized" off grades
+    // that happened to be approved before it was returned.
+    admin_finalized: !!cls.chairperson_verified && adminSignedOff(cls) && pendingAdminApproval === 0,
     pending_admin_approval: pendingAdminApproval,
     submitted_count: submitted.length,
     already_released: alreadyReleased,
-    can_release: submitted.length > 0 && cls.chairperson_verified && pendingAdminApproval === 0 && !alreadyReleased,
+    can_release: submitted.length > 0 && !!cls.chairperson_verified && adminSignedOff(cls) && pendingAdminApproval === 0 && !alreadyReleased,
   };
 
   res.json({ class: cls, student_grades: studentGrades, release_status: releaseStatus });
@@ -140,7 +164,7 @@ const encodeGrades = asyncHandler(async (req, res) => {
 
   const io = req.app.get('io');
   if (io) {
-    io.emit('gradesUpdated', { class_id, message: 'Grades updated (draft)' });
+    emitGradesUpdated(io, { class_id, message: 'Grades updated (draft)' }, 'draft');
   }
 
   res.json({ message: 'Grades saved as draft.', grades: results });
@@ -149,12 +173,24 @@ const encodeGrades = asyncHandler(async (req, res) => {
 // ================= MARK AS INC =================
 // POST /api/grades/inc
 const markAsINC = asyncHandler(async (req, res) => {
-  const { class_id, student_id, inc_remarks, inc_deadline } = req.body;
+  const { class_id, student_id, inc_remarks, inc_deadline, period } = req.body;
+
+  // INC is per period — Midterm and Finals are marked (and resolved)
+  // independently, so which one this is for has to be stated.
+  if (period !== 'Midterm' && period !== 'Finals') {
+    return res.status(400).json({ message: 'Choose which period this INC is for: "Midterm" or "Finals".' });
+  }
 
   // Required, not optional — an INC has to state what the student is
   // actually missing (the frontend already blocks submitting without it;
   // this is the real gate, same reasoning as every other frontend-validated
   // field in this app).
+  // A compliance deadline is required too — the follow-up list and its time
+  // limit are built on it, and a request can always skip the form's own check.
+  if (!inc_deadline || Number.isNaN(new Date(inc_deadline).getTime())) {
+    return res.status(400).json({ message: 'A compliance deadline is required to mark a student as INC.' });
+  }
+
   if (!inc_remarks || !inc_remarks.trim()) {
     return res.status(400).json({ message: 'Reason / remarks are required to mark a student as INC.' });
   }
@@ -172,23 +208,10 @@ const markAsINC = asyncHandler(async (req, res) => {
   const enrolled = await Enrollment.findOne({ where: { class_id, student_id } });
   if (!enrolled) return res.status(404).json({ message: 'Student not enrolled in this class.' });
 
-  // The real gate behind the frontend's disabled "Mark INC" button — a
-  // student with every component item already scored has nothing left to be
-  // incomplete about, so this blocks a direct API call from bypassing that.
-  const classItemIds = (
-    await ComponentItem.findAll({
-      include: [{ model: GradeComponent, as: 'component', where: { class_id }, attributes: [] }],
-      attributes: ['id'],
-    })
-  ).map((i) => i.id);
-  if (classItemIds.length > 0) {
-    const scoredCount = await ComponentScore.count({
-      where: { student_id, item_id: classItemIds, score: { [Op.ne]: null } },
-    });
-    if (scoredCount === classItemIds.length) {
-      return res.status(400).json({ message: 'This student is already fully scored — nothing left to mark incomplete.' });
-    }
-  }
+  // No "already fully scored" gate here anymore: Faculty can mark a period INC
+  // (or edit an existing INC) at any time — whether the student's scores are
+  // in or not is their call. (It used to reject a period with every score
+  // entered, which is what kept "Mark INC" from being usable.)
 
   const [grade] = await Grade.findOrCreate({
     where: { class_id, student_id },
@@ -211,33 +234,43 @@ const markAsINC = asyncHandler(async (req, res) => {
     });
   }
 
-  // ✅ Use update() instead of save() to bypass the beforeSave hook
+  // ✅ Use update() instead of save() to bypass the beforeSave hook.
+  // midterm/finals are deliberately left as stored, not nulled: a period only
+  // has a stored GWA once ALL of its scores were entered, so whatever is here
+  // is a genuinely completed period — the Grade Sheet keeps showing it (INC
+  // only for the period that's actually missing), same as the Class Record.
+  // The overall average is what can't exist yet, so that alone is cleared.
+  // Only THIS period gets flagged — the other one is never touched (an older
+  // INC row with neither flag is settled to a real period when the class
+  // loads, see resolveCompletedINCs).
   await Grade.update(
     {
       status: 'INC',
       average: null,
-      midterm: null,
-      finals: null,
       is_draft: false,
       submitted: true,
       submitted_date: new Date(),
       inc_remarks: inc_remarks || null,
       inc_deadline: inc_deadline || null,
       inc_resolved_date: null,
+      inc_lapsed_at: null,
+      inc_lapsed_period: null,
+      inc_midterm: period === 'Midterm' ? true : grade.inc_midterm,
+      inc_finals: period === 'Finals' ? true : grade.inc_finals,
     },
     { where: { id: grade.id } }
   );
 
   await logActivity(
     req.user.id,
-    `marked ${(await User.findByPk(student_id))?.name} as INC in ${cls.subject.code}`,
+    `marked ${(await User.findByPk(student_id))?.name} as INC (${period}) in ${cls.subject.code}`,
     'Grade',
     grade.id
   );
 
   const io = req.app.get('io');
   if (io) {
-    io.emit('gradesUpdated', { class_id, message: 'INC grade recorded' });
+    emitGradesUpdated(io, { class_id, message: 'INC grade recorded' }, 'pipeline');
   }
 
   const updated = await Grade.findByPk(grade.id);
@@ -254,7 +287,7 @@ const markAsINC = asyncHandler(async (req, res) => {
 // there ready to finish entering. The frontend's "Resolve INC" button calls
 // this directly now.
 const undoINC = asyncHandler(async (req, res) => {
-  const { grade_id } = req.body;
+  const { grade_id, period } = req.body;
 
   const grade = await Grade.findByPk(grade_id, {
     include: [{ model: Class, as: 'class', include: [{ model: Subject, as: 'subject' }] }],
@@ -266,18 +299,46 @@ const undoINC = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'You can only undo an INC for your own classes.' });
   }
 
+  // Per period: resolving the Midterm INC leaves a Finals INC alone (and vice
+  // versa) — the student only stops being INC once NO period is flagged.
+  if (period === 'Midterm' || period === 'Finals') {
+    const stillMidterm = period === 'Midterm' ? false : grade.inc_midterm;
+    const stillFinals = period === 'Finals' ? false : grade.inc_finals;
+    if (stillMidterm || stillFinals) {
+      await Grade.update({ inc_midterm: stillMidterm, inc_finals: stillFinals }, { where: { id: grade_id } });
+      const io = req.app.get('io');
+      if (io) emitGradesUpdated(io, { class_id: grade.class_id, message: 'INC partly resolved' }, 'pipeline');
+      const partial = await Grade.findByPk(grade_id);
+      return res.json({ message: `${period} INC resolved — the student is still INC in the ${stillMidterm ? 'Midterm' : 'Finals'}.`, grade: partial, still_inc: true });
+    }
+  }
+
   await Grade.update(
     {
       status: 'Pending',
       average: null,
       midterm: null,
       finals: null,
+      inc_midterm: false,
+      inc_finals: false,
       submitted: false,
       is_draft: true,
       submitted_date: null,
+      // The completed grade is a brand-new one — it hasn't been released or
+      // approved yet, whatever the INC placeholder that came before it had
+      // (INC grades get released along with the rest of the class). Left
+      // as-is, `released` stayed true, so the class kept counting as "already
+      // released" and Release to Students never became available again for
+      // this student's new grade.
+      released: false,
+      released_date: null,
+      admin_approved: false,
+      admin_approved_date: null,
       inc_remarks: null,
       inc_deadline: null,
       inc_resolved_date: null,
+      inc_lapsed_at: null,
+      inc_lapsed_period: null,
     },
     { where: { id: grade_id } }
   );
@@ -290,7 +351,7 @@ const undoINC = asyncHandler(async (req, res) => {
   );
 
   const io = req.app.get('io');
-  if (io) io.emit('gradesUpdated', { class_id: grade.class_id, message: 'INC undone' });
+  if (io) emitGradesUpdated(io, { class_id: grade.class_id, message: 'INC undone' }, 'pipeline');
 
   const updated = await Grade.findByPk(grade_id);
   res.json({ message: 'INC undone — grade is back to unsubmitted and ready to edit.', grade: updated });
@@ -355,7 +416,7 @@ const markAsDRP = asyncHandler(async (req, res) => {
   );
 
   const io = req.app.get('io');
-  if (io) io.emit('gradesUpdated', { class_id, message: 'Student marked Dropped' });
+  if (io) emitGradesUpdated(io, { class_id, message: 'Student marked Dropped' }, 'pipeline');
 
   const updated = await Grade.findByPk(grade.id);
   res.json({ message: 'Student marked as Dropped successfully.', grade: updated });
@@ -393,7 +454,7 @@ const undoDRP = asyncHandler(async (req, res) => {
   );
 
   const io = req.app.get('io');
-  if (io) io.emit('gradesUpdated', { class_id: grade.class_id, message: 'Drop undone' });
+  if (io) emitGradesUpdated(io, { class_id: grade.class_id, message: 'Drop undone' }, 'pipeline');
 
   const updated = await Grade.findByPk(grade_id);
   res.json({ message: 'Drop undone — grade is back to unsubmitted.', grade: updated });
@@ -445,6 +506,66 @@ const getINCList = asyncHandler(async (req, res) => {
   res.json({ inc_grades: result, total: result.length });
 });
 
+// ================= GET MY RELEASED INC LIST =================
+// GET /api/grades/inc/mine — the Faculty's own follow-up list: students still
+// marked INC in classes whose grades were already released to students, so
+// there's one place to see who still needs to be completed. A student stays
+// on it only for a set time — until the INC deadline set when they were
+// marked (through the end of that day), or, when none was set, for
+// INC_DEFAULT_WINDOW_DAYS after the grades were released. Past that they drop
+// off; resolving the INC (undoINC) takes them off immediately since the
+// status is no longer INC.
+const INC_DEFAULT_WINDOW_DAYS = 365;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const getMyReleasedINCList = asyncHandler(async (req, res) => {
+  const incGrades = await Grade.findAll({
+    where: { status: 'INC', released: true },
+    include: [
+      { model: User, as: 'student', attributes: ['id', 'name', 'student_no'] },
+      {
+        model: Class,
+        as: 'class',
+        required: true,
+        where: { instructor_id: req.user.id },
+        include: [{ model: Subject, as: 'subject', attributes: ['id', 'code', 'name'] }],
+      },
+    ],
+  });
+
+  const now = Date.now();
+  const list = [];
+  incGrades.forEach((g) => {
+    const hasDeadline = !!g.inc_deadline;
+    const startedAt = new Date(g.released_date || g.submitted_date || g.updatedAt).getTime();
+    // A deadline is a calendar date — still valid for that whole day.
+    const deadlineAt = hasDeadline ? new Date(g.inc_deadline).getTime() : startedAt + INC_DEFAULT_WINDOW_DAYS * DAY_MS;
+    const expiresAt = hasDeadline ? deadlineAt + DAY_MS : deadlineAt;
+    if (expiresAt <= now) return;
+    list.push({
+      id: g.id,
+      student: g.student,
+      class: {
+        id: g.class.id,
+        section: g.class.section,
+        year_level: g.class.year_level,
+        semester: g.class.semester,
+        subject: g.class.subject,
+      },
+      inc_remarks: g.inc_remarks,
+      // Which period(s) are INC (marked and resolved independently).
+      incomplete_periods: [g.inc_midterm && 'Midterm', g.inc_finals && 'Finals'].filter(Boolean),
+      inc_deadline: new Date(deadlineAt).toISOString(),
+      deadline_is_default: !hasDeadline,
+      days_left: Math.max(0, Math.ceil((expiresAt - now) / DAY_MS) - (hasDeadline ? 1 : 0)),
+      expires_at: expiresAt,
+    });
+  });
+
+  list.sort((a, b) => a.expires_at - b.expires_at);
+  res.json({ inc_students: list, total: list.length });
+});
+
 // ================= SUBMIT GRADES =================
 const submitGrades = asyncHandler(async (req, res) => {
   const { class_id } = req.body;
@@ -452,7 +573,7 @@ const submitGrades = asyncHandler(async (req, res) => {
   const cls = await Class.findByPk(class_id, {
     include: [
       { model: Subject, as: 'subject' },
-      { model: User, as: 'instructor', attributes: { exclude: ['password'] } },
+      { model: User, as: 'instructor', attributes: { exclude: USER_SECRET_FIELDS } },
     ],
   });
 
@@ -488,10 +609,41 @@ const submitGrades = asyncHandler(async (req, res) => {
 
   if (notYetSubmitted.length > 0) {
     const idsToSubmit = notYetSubmitted.map(g => g.id);
+    // released is cleared too: a grade being (re)submitted here hasn't been
+    // released in its current form — this also heals a completed INC that was
+    // resolved before undoINC started clearing it, whose stale released flag
+    // kept the whole class reading "already released".
     await Grade.update(
-      { submitted: true, is_draft: false, submitted_date: new Date() },
+      { submitted: true, is_draft: false, submitted_date: new Date(), released: false, released_date: null },
       { where: { id: { [Op.in]: idsToSubmit } } }
     );
+  }
+
+  // A grade submitted AFTER the Chairperson already verified the class can
+  // only be a completed INC (a Chairperson return un-verifies everything, and
+  // before verification there's nothing to redo) — the Class Record and Grade
+  // Sheet both changed, so both have to go through the whole pipeline again:
+  // Chairperson verifies each document, forwards to Admin, Admin approves.
+  // Everything both of them signed off on is reset and the class is marked as
+  // not-yet-sent, so notifyGradingSheetSent below (once every student has a
+  // submitted grade) sends it to the Chairperson again. Admin hears about it
+  // only later, when the Chairperson forwards it (verifyDocument) — same as
+  // any first submission.
+  if (notYetSubmitted.length > 0 && cls.chairperson_verified) {
+    cls.chairperson_verified = false;
+    cls.chairperson_verified_at = null;
+    cls.class_record_verified = false;
+    cls.class_record_verified_at = null;
+    cls.grade_sheet_verified = false;
+    cls.grade_sheet_verified_at = null;
+    cls.admin_class_record_approved = false;
+    cls.admin_class_record_approved_at = null;
+    cls.admin_grade_sheet_approved = false;
+    cls.admin_grade_sheet_approved_at = null;
+    cls.admin_return_reason = null;
+    cls.admin_returned_at = null;
+    cls.sent_to_chairperson = false;
+    await cls.save();
   }
 
   // Faculty resubmitting is what brings a class back into the Chairperson's
@@ -516,7 +668,7 @@ const submitGrades = asyncHandler(async (req, res) => {
 
   const io = req.app.get('io');
   if (io) {
-    io.emit('gradesUpdated', { class_id, message: 'Grades submitted' });
+    emitGradesUpdated(io, { class_id, message: 'Grades submitted' }, 'pipeline');
   }
 
   // Every enrolled student now has a submitted grade — this class is
@@ -545,17 +697,102 @@ const submitGrades = asyncHandler(async (req, res) => {
   });
 });
 
+// ================= UNDO SUBMISSION =================
+// POST /api/grades/class/:classId/undo-submit — the instructor (Faculty, or a
+// teaching Chairperson) takes back a Class Record + Grade Sheet they sent by
+// mistake, so they can correct it and submit again. Only while it's still
+// untouched on the Chairperson's side: once the Chairperson has verified
+// either document (or anything further happened), the only way back is the
+// Chairperson returning it for revision.
+const undoSubmission = asyncHandler(async (req, res) => {
+  const { classId } = req.params;
+  const cls = await Class.findByPk(classId, {
+    include: [
+      { model: Subject, as: 'subject' },
+      { model: User, as: 'instructor', attributes: { exclude: USER_SECRET_FIELDS } },
+    ],
+  });
+  if (!cls) return res.status(404).json({ message: 'Class not found.' });
+
+  if (actsAsInstructor(req.user) && cls.instructor_id !== req.user.id) {
+    return res.status(403).json({ message: 'You can only undo submissions for your own classes.' });
+  }
+
+  if (!cls.sent_to_chairperson) {
+    return res.status(400).json({ message: 'This class has not been submitted yet.' });
+  }
+
+  const reviewStarted = cls.class_record_verified || cls.grade_sheet_verified || cls.chairperson_verified
+    || cls.admin_class_record_approved || cls.admin_grade_sheet_approved;
+  const releasedOrApproved = await Grade.count({
+    where: { class_id: cls.id, [Op.or]: [{ released: true }, { admin_approved: true }] },
+  });
+  if (reviewStarted || releasedOrApproved > 0) {
+    return res.status(400).json({
+      message: 'Your Chairperson has already started reviewing this class, so the submission can no longer be undone. Ask your Chairperson to return it for revision instead.',
+    });
+  }
+
+  await Grade.update(
+    { submitted: false, submitted_date: null, is_draft: true },
+    { where: { class_id: cls.id } }
+  );
+  cls.sent_to_chairperson = false;
+  await cls.save();
+
+  // Let the Chairperson(s) who were told about it know it's been taken back.
+  const recipients = await User.findAll({
+    where: { status: 'Active', role: 'Chairperson', programs: { [Op.contains]: [cls.subject?.program] } },
+  });
+  const label = `${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''}`;
+  await Promise.all(
+    recipients
+      .filter((r) => r.id !== req.user.id)
+      .map((r) => createNotification(req.app, {
+        userId: r.id,
+        title: 'Grading Sheet Submission Undone',
+        message: `${cls.instructor?.name || req.user.name} took back the Class Record and Grade Sheet for ${label} to make corrections. It will come back once resubmitted.`,
+        type: 'report',
+        link: '/chairperson/grading-sheets',
+      }))
+  );
+
+  await logActivity(req.user.id, `undid the grade submission for ${cls.subject?.code}`, 'Class', cls.id);
+
+  const io = req.app.get('io');
+  if (io) emitGradesUpdated(io, { class_id: cls.id, message: 'Submission undone' }, 'pipeline');
+
+  res.json({ message: `Submission undone — ${label}'s Class Record and Grade Sheet are editable again. Submit again once corrected.` });
+});
+
+// A student's full grade record (grades / prospectus) is private: only the
+// student themselves, the adviser of their Program / Year / Section (a
+// Faculty or Chairperson with that section in their advisories), and the
+// Chairperson of the student's own program.
+const canViewStudentRecord = async (user, studentId) => {
+  if (user.id === parseInt(studentId, 10)) return true;
+  if (user.role !== 'Faculty' && user.role !== 'Chairperson') return false;
+  const [me, student] = await Promise.all([
+    User.findByPk(user.id, { attributes: ['advisories', 'programs'] }),
+    User.findByPk(studentId, { attributes: ['role', 'program', 'year_level', 'section'] }),
+  ]);
+  if (!student || student.role !== 'Student') return false;
+  if (user.role === 'Chairperson' && (me?.programs || []).includes(student.program)) return true;
+  return (Array.isArray(me?.advisories) ? me.advisories : []).some((a) =>
+    a.program === student.program && Number(a.year_level) === Number(student.year_level) && a.section === student.section);
+};
+
 // ================= STUDENT GRADES =================
 const getStudentGrades = asyncHandler(async (req, res) => {
   const studentId = req.params.studentId;
   const { semester } = req.query;
 
-  if (req.user.role === 'Student' && req.user.id !== parseInt(studentId)) {
-    return res.status(403).json({ message: 'You can only view your own grades.' });
+  if (!(await canViewStudentRecord(req.user, studentId))) {
+    return res.status(403).json({ message: req.user.role === 'Student' ? 'You can only view your own grades.' : 'Only this student\'s adviser or their program\'s Chairperson can view their grades.' });
   }
 
   const student = await User.findByPk(studentId, {
-    attributes: { exclude: ['password'] },
+    attributes: { exclude: USER_SECRET_FIELDS },
   });
 
   if (!student) return res.status(404).json({ message: 'Student not found.' });
@@ -575,14 +812,12 @@ const getStudentGrades = asyncHandler(async (req, res) => {
 
   const allGrades = await Grade.findAll({ where: { student_id: studentId } });
 
-  // A student viewing their own record only ever sees grades Faculty has
-  // actually released (matching getStudentProspectus, which the My Grades
-  // page itself calls) — `submitted` alone isn't enough, since a grade sits
-  // submitted-but-unreleased through the whole Chairperson/Admin review
-  // pipeline first. Staff viewing a student's record (Admin/Chairperson/
-  // Faculty) still see everything, released or not.
+  // If the student has not yet completed their account setup (password changed + email verified),
+  // their grades cannot be received/viewed by the student, chairperson, or adviser on the grade record.
+  // The grades remain safely stored in the database and will be revealed once setup is completed.
+  const isSetup = !!student.account_setup_at;
   const isOwnRecord = req.user.role === 'Student';
-  const grades = isOwnRecord ? allGrades.filter((g) => g.released) : allGrades;
+  const grades = isSetup ? (isOwnRecord ? allGrades.filter((g) => g.released) : allGrades) : [];
 
   const gradeMap = {};
   grades.forEach(g => { gradeMap[g.class_id] = g; });
@@ -609,6 +844,7 @@ const getStudentGrades = asyncHandler(async (req, res) => {
   res.json({
     student,
     grades: studentGrades,
+    account_setup_pending: !isSetup,
     summary: {
       gwa,
       total_subjects: submittedGrades.length,
@@ -631,11 +867,11 @@ const getStudentGrades = asyncHandler(async (req, res) => {
 const getStudentProspectus = asyncHandler(async (req, res) => {
   const studentId = req.params.studentId;
 
-  if (req.user.role === 'Student' && req.user.id !== parseInt(studentId)) {
-    return res.status(403).json({ message: 'You can only view your own prospectus.' });
+  if (!(await canViewStudentRecord(req.user, studentId))) {
+    return res.status(403).json({ message: req.user.role === 'Student' ? 'You can only view your own prospectus.' : 'Only this student\'s adviser or their program\'s Chairperson can view their grades.' });
   }
 
-  const student = await User.findByPk(studentId, { attributes: { exclude: ['password'] } });
+  const student = await User.findByPk(studentId, { attributes: { exclude: USER_SECRET_FIELDS } });
   if (!student) return res.status(404).json({ message: 'Student not found.' });
 
   if (!student.program) {
@@ -647,14 +883,19 @@ const getStudentProspectus = asyncHandler(async (req, res) => {
     });
   }
 
-  const subjects = await Subject.findAll({
+  // The whole program curriculum (with prerequisites/co-requisites joined in) is
+  // identical for every student in the same program, and it's the heaviest
+  // query on this page — so it's fetched once and shared, not once per student
+  // (every student opening My Grades ran their own copy). Dropped the moment a
+  // subject is edited (see utils/responseCache.js TAGS_BY_PREFIX).
+  const subjects = await cached(`curriculum:${student.program}`, { ttlMs: 60000, tags: ['classes'] }, () => Subject.findAll({
     where: { program: student.program },
     include: [
       { model: Subject, as: 'prerequisites', through: { attributes: [] }, attributes: ['id', 'code'] },
       { model: Subject, as: 'co_requisites', through: { attributes: [] }, attributes: ['id', 'code'] },
     ],
     order: [['year_level', 'ASC'], ['semester', 'ASC'], ['code', 'ASC']],
-  });
+  }));
 
   const enrollments = await Enrollment.findAll({
     where: { student_id: studentId },
@@ -662,11 +903,15 @@ const getStudentProspectus = asyncHandler(async (req, res) => {
   });
   const enrolledSubjectIds = new Set(enrollments.filter((e) => e.class).map((e) => e.class.subject_id));
 
-  const grades = await Grade.findAll({
-    where: { student_id: studentId },
-    include: [{ model: Class, as: 'class' }],
-    order: [['created_at', 'DESC']],
-  });
+  const isSetup = !!student.account_setup_at;
+
+  const grades = isSetup
+    ? await Grade.findAll({
+        where: { student_id: studentId },
+        include: [{ model: Class, as: 'class' }],
+        order: [['created_at', 'DESC']],
+      })
+    : [];
 
   // A subject can have more than one Grade row over time (a retake creates a
   // new class/grade pair) — pick the most representative one: a Passed final
@@ -705,7 +950,7 @@ const getStudentProspectus = asyncHandler(async (req, res) => {
   const failed = finalRows.filter((r) => r.status === 'Failed');
   const gwaEligible = finalRows.filter((r) => r.status !== 'INC' && r.status !== 'DRP' && r.grade?.average != null);
   const gwa = gwaEligible.length > 0
-    ? (gwaEligible.reduce((sum, r) => sum + parseFloat(r.grade.average), 0) / gwaEligible.length).toFixed(1)
+    ? (gwaEligible.reduce((sum, r) => sum + parseFloat(r.grade.average), 0) / gwaEligible.length).toFixed(3)
     : null;
   const unitsEarned = passed.reduce((sum, r) => sum + (r.subject.units || 0), 0);
 
@@ -713,10 +958,21 @@ const getStudentProspectus = asyncHandler(async (req, res) => {
   // actual Chairperson of the student's own program, not a hardcoded name,
   // so this stays correct as chairperson assignments change and for
   // students in any of the college's programs, not just one.
-  const chairperson = await User.findOne({
+  const chairperson = await cached(`chairperson-of:${student.program}`, { ttlMs: 60000, tags: ['users'] }, () => User.findOne({
     where: { role: 'Chairperson', programs: { [Op.contains]: [student.program] } },
     attributes: ['id', 'name'],
-  });
+  }));
+
+  // "Evaluated By" — the student's adviser: the Faculty member the
+  // Chairperson assigned as adviser of this student's own Program / Year /
+  // Section (userController.setAdvisory). null until one is assigned.
+  const adviser = student.year_level && student.section ? await User.findOne({
+    where: {
+      role: { [Op.in]: ['Faculty', 'Chairperson'] },
+      advisories: { [Op.contains]: [{ program: student.program, year_level: student.year_level, section: student.section }] },
+    },
+    attributes: ['id', 'name'],
+  }) : null;
 
   const years = {};
   rows.forEach((r) => {
@@ -730,7 +986,9 @@ const getStudentProspectus = asyncHandler(async (req, res) => {
   res.json({
     student,
     years,
+    account_setup_pending: !isSetup,
     chairperson: chairperson ? { id: chairperson.id, name: chairperson.name } : null,
+    adviser: adviser ? { id: adviser.id, name: adviser.name } : null,
     summary: {
       total_subjects: subjects.length,
       passed: passed.length,
@@ -909,7 +1167,7 @@ const getReportData = asyncHandler(async (req, res) => {
 
       const students = await User.findAll({
         where: studentWhere,
-        attributes: { exclude: ['password'] },
+        attributes: { exclude: USER_SECRET_FIELDS },
       });
 
       data.students = await Promise.all(students.map(async (s) => {
@@ -951,7 +1209,7 @@ const getReportData = asyncHandler(async (req, res) => {
 
       const instructors = await User.findAll({
         where: instrWhere,
-        attributes: { exclude: ['password'] },
+        attributes: { exclude: USER_SECRET_FIELDS },
       });
 
       data.instructors = await Promise.all(instructors.map(async (instr) => {
@@ -1122,6 +1380,7 @@ const releaseGradesForClass = async (cls, actorId, app) => {
   const grades = await Grade.findAll({ where: { class_id: cls.id, submitted: true } });
   if (grades.length === 0) return null;
   if (!cls.chairperson_verified) return null;
+  if (!adminSignedOff(cls)) return null;
   const pendingAdminApproval = grades.filter((g) => g.status === 'Passed' && !g.admin_approved).length;
   if (pendingAdminApproval > 0) return null;
 
@@ -1146,7 +1405,60 @@ const releaseGradesForClass = async (cls, actorId, app) => {
 
   await logActivity(actorId, `released grades to ${toRelease.length} student(s) for ${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''}`, 'Class', cls.id);
 
+  // Admin releases the grades — the class's instructor hears about it.
+  if (cls.instructor_id && cls.instructor_id !== actorId) {
+    await createNotification(app, {
+      userId: cls.instructor_id,
+      title: 'Grades Released to Students',
+      message: `${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''} was approved by Admin and its grades were released to ${toRelease.length} student(s).`,
+      type: 'grade',
+      link: `/faculty/encode/${cls.id}`,
+    });
+  }
+
   return toRelease.length;
+};
+
+// Off: the Admin releases approved classes by hand (Admin dashboard → Release
+// Grades to Students, or Grade Approval). Set to true to release them
+// automatically the moment both documents are approved.
+const AUTO_RELEASE_ON_APPROVAL = false;
+
+// Admin's approval of both documents is the last step — the grades go out to
+// the students right then, with no separate "Release" click. Live-refreshes
+// open pages and starts the automatic promotion check, same as a manual
+// release. Returns how many students the grades were released to (0 if the
+// class wasn't fully cleared yet).
+const releaseAfterApproval = async (cls, actorId, app) => {
+  const released = await releaseGradesForClass(cls, actorId, app);
+  if (!released) return 0;
+  const io = app.get('io');
+  if (io) emitGradesUpdated(io, { class_id: cls.id, message: 'Grades released' }, 'release');
+  require('./promotionController').autoPromoteForClass(app, cls.id);
+  return released;
+};
+
+// Catch-up at server start: any class Admin already fully approved whose
+// grades still aren't out (approved before release became automatic, or a
+// release that failed midway) is released now. Never throws.
+const releaseApprovedBacklog = async (app) => {
+  try {
+    const candidates = await Class.findAll({
+      where: { chairperson_verified: true, admin_class_record_approved: true, admin_grade_sheet_approved: true },
+      include: [
+        { model: Subject, as: 'subject' },
+        { model: Grade, as: 'grades', where: { submitted: true, released: false }, attributes: ['id'], required: true },
+      ],
+    });
+    if (!candidates.length) return;
+    const admin = await User.findOne({ where: { role: 'Admin', status: 'Active' }, attributes: ['id'], order: [['id', 'ASC']] });
+    for (const cls of candidates) {
+      const released = await releaseAfterApproval(cls, admin?.id || null, app);
+      if (released) console.log(`[auto-release] ${cls.subject?.code || `class ${cls.id}`}${cls.section ? ` ${cls.section}` : ''}: released to ${released} student(s).`);
+    }
+  } catch (err) {
+    console.error('[auto-release] backlog check failed:', err.message);
+  }
 };
 
 // ================= ADMIN: APPROVE PASSED GRADES FOR A CLASS =================
@@ -1169,6 +1481,19 @@ const approveClassGrades = asyncHandler(async (req, res) => {
     ],
   });
   if (!cls) return res.status(404).json({ message: 'Class not found.' });
+  // Admin only acts after the Chairperson has verified (same rule as
+  // approveDocument below) — and approving here is Admin's sign-off on the
+  // class as a whole, so it also marks both documents approved, which is what
+  // releasing to students checks (adminSignedOff).
+  if (!cls.chairperson_verified) {
+    return res.status(400).json({ message: "This class hasn't been verified and forwarded by the Chairperson yet." });
+  }
+  const approvedAt = new Date();
+  cls.admin_class_record_approved = true;
+  cls.admin_class_record_approved_at = approvedAt;
+  cls.admin_grade_sheet_approved = true;
+  cls.admin_grade_sheet_approved_at = approvedAt;
+  await cls.save();
 
   const grades = await Grade.findAll({
     where: { class_id: cls.id, submitted: true, status: 'Passed', admin_approved: false },
@@ -1178,26 +1503,18 @@ const approveClassGrades = asyncHandler(async (req, res) => {
 
   await logActivity(req.user.id, `approved ${grades.length} passed grade(s) for ${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''}`, 'Class', cls.id);
 
-  // Fully cleared now? Notify Faculty they can export & release — checked
-  // fresh (not just "grades.length > 0") since a class could already have
-  // had 0 pending Passed grades and just been waiting on this last check.
-  const allGrades = await Grade.findAll({ where: { class_id: cls.id, submitted: true } });
-  const stillPending = allGrades.filter((g) => g.status === 'Passed' && !g.admin_approved).length;
-  const fullyCleared = cls.chairperson_verified && stillPending === 0 && allGrades.some((g) => !g.released);
-  if (fullyCleared && cls.instructor_id) {
-    await createNotification(req.app, {
-      userId: cls.instructor_id,
-      title: 'Class Record and Grade Sheet Approved',
-      message: `${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''} has been verified by your Chairperson and approved by Admin — you can now export the Class Record/Grade Sheet and release the grades to your students.`,
-      type: 'grade',
-      link: `/faculty/encode/${cls.id}`,
-    });
-  }
+  // Fully approved → released to the students right away (students and the
+  // instructor are notified by the release itself).
+  const released = AUTO_RELEASE_ON_APPROVAL ? await releaseAfterApproval(cls, req.user.id, req.app) : 0;
 
   const io = req.app.get('io');
-  if (io) io.emit('gradesUpdated', { class_id: cls.id, message: `Admin approved ${grades.length} grade(s)` });
+  if (io && !released) emitGradesUpdated(io, { class_id: cls.id, message: `Admin approved ${grades.length} grade(s)` }, 'pipeline');
 
-  res.json({ message: `Approved ${grades.length} student grade(s).`, approved: grades.length });
+  res.json({
+    message: `Approved ${grades.length} student grade(s).${released ? ` Grades released to ${released} student(s).` : ''}`,
+    approved: grades.length,
+    released,
+  });
 });
 
 const ADMIN_DOC_TYPES = {
@@ -1240,8 +1557,8 @@ const approveDocument = asyncHandler(async (req, res) => {
 
   if (!bothApproved) {
     await logActivity(req.user.id, `approved the ${doc.label.toLowerCase()} for ${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''}`, 'Class', cls.id);
-    if (io) io.emit('gradesUpdated', { class_id: cls.id, message: `${doc.label} approved by Admin` });
-    return res.json({ message: `${doc.label} approved. Approve the other document too to notify Faculty.`, fullyApproved: false });
+    if (io) emitGradesUpdated(io, { class_id: cls.id, message: `${doc.label} approved by Admin` }, 'pipeline');
+    return res.json({ message: `${doc.label} approved. Approve the other document too to release the grades to the students.`, fullyApproved: false });
   }
 
   // Both documents are now approved — clear every pending Passed grade the
@@ -1254,21 +1571,18 @@ const approveDocument = asyncHandler(async (req, res) => {
 
   await logActivity(req.user.id, `approved both documents (${pendingGrades.length} passed grade(s)) for ${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''}`, 'Class', cls.id);
 
-  const allGrades = await Grade.findAll({ where: { class_id: cls.id, submitted: true } });
-  const hasUnreleased = allGrades.some((g) => !g.released);
-  if (hasUnreleased && cls.instructor_id) {
-    await createNotification(req.app, {
-      userId: cls.instructor_id,
-      title: 'Class Record and Grade Sheet Approved',
-      message: `${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''} has been verified by your Chairperson and approved by Admin — you can now export the Class Record/Grade Sheet and release the grades to your students.`,
-      type: 'grade',
-      link: `/faculty/encode/${cls.id}`,
-    });
-  }
+  // Both approved → the grades go out to the students right away (students
+  // and the instructor are notified by the release itself).
+  const released = AUTO_RELEASE_ON_APPROVAL ? await releaseAfterApproval(cls, req.user.id, req.app) : 0;
+  if (io && !released) emitGradesUpdated(io, { class_id: cls.id, message: 'Both documents approved by Admin' }, 'pipeline');
 
-  if (io) io.emit('gradesUpdated', { class_id: cls.id, message: 'Both documents approved by Admin' });
-
-  res.json({ message: `${doc.label} approved — both documents are now approved. Faculty has been notified.`, fullyApproved: true });
+  res.json({
+    message: released
+      ? `${doc.label} approved — both documents are approved and the grades were released to ${released} student(s).`
+      : `${doc.label} approved — both documents are now approved. Release the grades from the dashboard (Release Grades to Students).`,
+    fullyApproved: true,
+    released,
+  });
 });
 
 // ================= RELEASE CLASS GRADES TO STUDENTS =================
@@ -1292,6 +1606,9 @@ const releaseClassGrades = asyncHandler(async (req, res) => {
   if (!cls.chairperson_verified) {
     return res.status(400).json({ message: 'Your Chairperson hasn\'t verified this class\'s Grade Sheet and Class Records yet.' });
   }
+  if (!adminSignedOff(cls)) {
+    return res.status(400).json({ message: 'Admin hasn\'t approved this class\'s Class Record and Grade Sheet yet.' });
+  }
   const pendingAdminApproval = grades.filter((g) => g.status === 'Passed' && !g.admin_approved).length;
   if (pendingAdminApproval > 0) {
     return res.status(400).json({ message: `Admin still has ${pendingAdminApproval} passed grade(s) awaiting approval on this class.` });
@@ -1308,13 +1625,18 @@ const releaseClassGrades = asyncHandler(async (req, res) => {
   // needs this at least as much as the others do.
   const io = req.app.get('io');
   if (io) {
-    io.emit('gradesUpdated', { class_id: cls.id, message: 'Grades released' });
+    emitGradesUpdated(io, { class_id: cls.id, message: 'Grades released' }, 'release');
   }
 
   res.json({ message: `Released grades to ${released} student(s).`, released });
+
+  // Automatic promotion check for this class's students — after the response,
+  // so releasing never waits on it (promotionController.autoPromoteForClass).
+  require('./promotionController').autoPromoteForClass(req.app, cls.id);
 });
 
 module.exports = {
+  undoSubmission,
   getGradesByClass,
   encodeGrades,
   submitGrades,
@@ -1323,6 +1645,7 @@ module.exports = {
   markAsDRP,
   undoDRP,
   getINCList,
+  getMyReleasedINCList,
   getStudentGrades,
   getStudentProspectus,
   getGradeDistribution,
@@ -1331,4 +1654,5 @@ module.exports = {
   approveClassGrades,
   approveDocument,
   releaseClassGrades,
+  releaseApprovedBacklog,
 };

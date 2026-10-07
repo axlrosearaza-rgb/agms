@@ -1,18 +1,25 @@
 import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useNavigate } from 'react-router-dom';
-import { Icons, Badge, SearchBar, StatCard, LoadingSpinner, Modal, ProgramBadge, ConfirmDialog, StudentTypeBadge, RegularityBadge, ProgramDot, programCascadeGradient, programShortLabel, comparePeopleNames, formatPersonName } from '../../components/common';
+import { Icons, Badge, SearchBar, StatCard, LoadingSpinner, Modal, ProgramBadge, ConfirmDialog, ProgramDot, programCascadeGradient, programShortLabel, comparePeopleNames, formatPersonName, ClearSearchButton } from '../../components/common';
 import { classService, subjectService, semesterService, gradeService } from '../../services';
 import toast from 'react-hot-toast';
 import { usePageState } from '../../hooks/usePageState';
+import { useAutoRefresh } from '../../hooks/useAutoRefresh';
 import { useDraftState } from '../../hooks/useDraftState';
-import { exportGradingSheetDocx, normalizeStudentGrades } from '../../utils/gradingSheetDocx';
-import { exportClassRecordToExcel } from '../../utils/classRecordExcel';
 import API from '../../services/api';
-import socket from '../../services/socket';
+import { onGradesUpdated } from '../../services/socket';
+import IncompleteStudentsCard from '../../components/common/IncompleteStudentsCard';
+import StudentWordImportModal from '../../components/admin/StudentWordImportModal';
+import AddStudentsModal from '../../components/instructor/AddStudentsModal';
+import SchedulePicker, { scheduleToString, scheduleFromString } from '../../components/instructor/SchedulePicker';
+import { EncodingProgress } from '../../components/common/FacultyProgressRow';
+import { useSemesterLabels } from '../../utils/semesterLabels';
+import { exportClassRecordToExcel, formatGrade } from '../../utils/classRecordExcel';
+import { exportGradingSheetDocx } from '../../utils/gradingSheetDocx';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const SECTIONS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
+const SECTIONS = Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i)); // A-Z
 
 // Same iframe-embedded-preview pattern Admin/Chairperson's Grade Approval
 // pages use — opens the actual document with ?preview=1 (suppresses its own
@@ -44,7 +51,7 @@ function groupByProgramYearSection(list) {
 // state) with a small table of rows at each section leaf — browsing into the
 // container you want IS the filter, no dropdown needed. `openGroups`/
 // `toggleGroup` are lifted to the parent so every tab shares one toggle map.
-function GroupedClassTree({ items, idPrefix, openGroups, toggleGroup, headerRow, renderRow, emptyMessage }) {
+function GroupedClassTree({ items, idPrefix, openGroups, toggleGroup, headerRow, colGroup, renderRow, emptyMessage, defaultOpen = false, minWidth = 560 }) {
   if (items.length === 0) {
     return <p className="text-sm text-gray-400 text-center py-10">{emptyMessage}</p>;
   }
@@ -56,7 +63,7 @@ function GroupedClassTree({ items, idPrefix, openGroups, toggleGroup, headerRow,
         const years = groups[program];
         const programTotal = Object.values(years).reduce((s, secs) => s + Object.values(secs).reduce((s2, arr) => s2 + arr.length, 0), 0);
         const programKey = `${idPrefix}|${program}`;
-        const programOpen = openGroups[programKey] ?? false;
+        const programOpen = openGroups[programKey] ?? defaultOpen;
         return (
           <div key={program} className="border-b border-gray-50 last:border-0">
             <button
@@ -76,7 +83,7 @@ function GroupedClassTree({ items, idPrefix, openGroups, toggleGroup, headerRow,
               const sections = years[year];
               const yearTotal = Object.values(sections).reduce((s, arr) => s + arr.length, 0);
               const yearKey = `${programKey}|${year}`;
-              const yearOpen = openGroups[yearKey] ?? false;
+              const yearOpen = openGroups[yearKey] ?? defaultOpen;
               return (
                 <div key={year} className="border-t border-gray-50">
                   <button
@@ -93,16 +100,16 @@ function GroupedClassTree({ items, idPrefix, openGroups, toggleGroup, headerRow,
                   {yearOpen && Object.keys(sections).sort().map((section) => {
                     const secClasses = sections[section];
                     const secKey = `${yearKey}|${section}`;
-                    const secOpen = openGroups[secKey] ?? false;
+                    const secOpen = openGroups[secKey] ?? defaultOpen;
                     return (
                       <div key={section} className="border-t border-gray-50">
                         <button
                           onClick={() => toggleGroup(secKey, !secOpen)}
-                          className="w-full pl-14 pr-5 py-1.5 flex items-center justify-between border-none cursor-pointer font-sans bg-white hover:bg-gray-50 transition-colors"
+                          className="w-full pl-14 pr-5 py-2 flex items-center justify-between border-none cursor-pointer font-sans bg-white hover:bg-gray-50 transition-colors shadow-[inset_3px_0_0_#3b82f6]"
                         >
-                          <span className="text-[12px] text-gray-600">{section === 'No Section' ? section : `Section ${section}`}</span>
+                          <span className="flex items-center gap-2 text-[13px] font-semibold text-gray-800"><span className="w-1.5 h-1.5 rounded-full bg-blue-500 flex-shrink-0" />{section === 'No Section' ? section : `Section ${section}`}</span>
                           <div className="flex items-center gap-2">
-                            <Badge variant="purple">{secClasses.length}</Badge>
+                            <span className="min-w-[22px] px-2 py-0.5 rounded-full bg-blue-600 text-white text-[11px] font-bold text-center leading-4">{secClasses.length}</span>
                             {secOpen ? <Icons.ChevronUp className="w-3.5 h-3.5 text-gray-400" /> : <Icons.ChevronDown className="w-3.5 h-3.5 text-gray-400" />}
                           </div>
                         </button>
@@ -117,8 +124,16 @@ function GroupedClassTree({ items, idPrefix, openGroups, toggleGroup, headerRow,
                                 only). The header below always ships explicit
                                 widths so every section's table lands on the
                                 same column boundaries as the ones above and
-                                below it. */}
-                            <table className="w-full table-fixed border-separate border-spacing-0">
+                                below it. A caller with no header to show
+                                (headerRow=null) still needs those same
+                                widths declared somewhere — table-fixed with
+                                NEITHER a header nor a colgroup falls back to
+                                the browser's own default column split, which
+                                is what was squeezing a wide Actions cell
+                                (several buttons) down to a sliver. colGroup
+                                covers that case explicitly. */}
+                            <table className="w-full table-fixed border-separate border-spacing-0" style={{ minWidth }}>
+                              {colGroup && <colgroup>{colGroup}</colgroup>}
                               {headerRow && <thead>{headerRow}</thead>}
                               <tbody>{secClasses.map(renderRow)}</tbody>
                             </table>
@@ -149,8 +164,11 @@ const SUBJECT_COLORS = [
 ];
 
 // ─── Main Component ───────────────────────────────────────────────────────────
-export default function InstructorClasses() {
+// `embedded` — only the Class List card with its actions and pop-ups, no page
+// header / stats / tabs / filters: that's how the Faculty dashboard shows it.
+export default function InstructorClasses({ embedded = false }) {
   const { user } = useAuth();
+  const { abbrFor } = useSemesterLabels();
   const navigate = useNavigate();
   // Reused as-is for a teaching Chairperson under /chairperson/* — route every
   // in-page navigation off the account's actual role rather than hardcoding /faculty.
@@ -168,7 +186,7 @@ export default function InstructorClasses() {
   const [readyOpen, setReadyOpen] = usePageState(`${base}.classes.readyOpen`, false);
   const [openReleasedSemesters, setOpenReleasedSemesters] = usePageState(`${base}.classes.openReleasedSemesters`, {});
   const [returnedOpen, setReturnedOpen] = usePageState(`${base}.classes.returnedOpen`, false);
-  const [classListOpen, setClassListOpen] = usePageState(`${base}.classes.classListOpen`, false);
+  const [classListOpen, setClassListOpen] = usePageState(`${base}.classes.classListOpen${embedded ? ".dashboard" : ""}`, embedded);
   const [preview, setPreview] = useState(null); // { cls, type: 'record' | 'sheet' }
   // Cross-program teaching means a faculty's own class list can span more
   // than one program — Program/Year/Section are collapsible containers to
@@ -308,6 +326,10 @@ export default function InstructorClasses() {
   }, [subjectDropdownOpen]);
 
   const [enrollClass, setEnrollClass] = useState(null);
+  // The class whose class list is being imported (Import Class List).
+  const [importClass, setImportClass] = useState(null);
+  // "Add Students" chooser: from advisory class lists, or Import Class List.
+  const [addStudentsClass, setAddStudentsClass] = useState(null);
   const [eligibleStudents, setEligibleStudents] = useState([]);
   const [selectedStudentIds, setSelectedStudentIds] = useState([]);
   const [enrolling, setEnrolling] = useState(false);
@@ -330,6 +352,8 @@ export default function InstructorClasses() {
   };
 
   useEffect(() => { loadClasses(); }, [user.id, semFilter]);
+  // Anything saved (here or elsewhere) → the class lists refresh on their own.
+  useAutoRefresh(() => loadClasses());
 
   // Live refresh — a Chairperson/Admin action on one of these classes
   // (verify, return for revision, approve...) changes what belongs here
@@ -338,14 +362,69 @@ export default function InstructorClasses() {
   // My Classes wouldn't see it until they manually navigated away and back.
   useEffect(() => {
     const handler = () => loadClasses();
-    socket.on('gradesUpdated', handler);
-    return () => socket.off('gradesUpdated', handler);
+    return onGradesUpdated(handler);
   }, [user.id, semFilter]);
 
   // Shared confirm-warning for Archive/Unarchive/Delete — one ConfirmDialog
   // instance instead of a separate confirm-target per action.
   const [confirmAction, setConfirmAction] = useState(null);
   const requestConfirm = (config) => setConfirmAction(config);
+
+  // Released classes can still be exported (the same files as the class's own
+  // page): the Class Record as Excel, the Grade Sheet as Word.
+  const [exportingDoc, setExportingDoc] = useState(null); // `${classId}-${type}`
+  // Grades are done once every student has both a Midterm and a Finals grade
+  // encoded — that's when the Class Record and Grade Sheet can be exported.
+  const gradesDone = (c) => (c.student_count || 0) > 0 && ((c.encoding_progress || 0) >= 100 || c.progress === 100 || !!c.all_released);
+
+  const exportReleased = async (c, type) => {
+    setExportingDoc(`${c.id}-${type}`);
+    try {
+      const { data } = await gradeService.getByClass(c.id);
+      const studentGrades = (data.student_grades || [])
+        .slice()
+        .sort((a, b) => comparePeopleNames(a.student, b.student))
+        .map((sg) => ({
+          student: sg.student,
+          midterm: sg.grade?.midterm ? formatGrade(sg.grade.midterm) : '',
+          finals: sg.grade?.finals ? formatGrade(sg.grade.finals) : '',
+          average: sg.grade?.average ?? null,
+          status: sg.grade?.status || 'Pending',
+          submitted: sg.grade?.submitted || false,
+          gradeId: sg.grade?.id || null,
+          inc_remarks: sg.grade?.inc_remarks || '',
+          inc_deadline: sg.grade?.inc_deadline || null,
+          inc_resolved_date: sg.grade?.inc_resolved_date || null,
+          inc_lapsed_at: sg.grade?.inc_lapsed_at || null,
+          inc_lapsed_period: sg.grade?.inc_lapsed_period || null,
+          inc_midterm: !!sg.grade?.inc_midterm,
+          inc_finals: !!sg.grade?.inc_finals,
+        }));
+      if (type === 'sheet') {
+        await exportGradingSheetDocx({ classData: data.class, studentGrades });
+      } else {
+        const [compRes, scoreRes] = await Promise.all([
+          API.get(`/grade-components/${c.id}/components`),
+          API.get(`/grade-components/${c.id}/scores`),
+        ]);
+        await exportClassRecordToExcel({ classData: data.class, components: compRes.data.components || [], studentGrades, componentScores: scoreRes.data.scores || {} });
+      }
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to export');
+    } finally {
+      setExportingDoc(null);
+    }
+  };
+  // Buttons that can't be used right now look disabled but stay clickable, so
+  // clicking one always shows WHY it can't be done (a truly `disabled` button
+  // swallows the click and says nothing).
+  const warnUnavailable = (message) => toast(message, { icon: '⚠️', duration: 5000 });
+  const createMissing = [
+    !createForm.subject_id && 'Subject',
+    !createForm.semester && 'Semester',
+    !createForm.year_level && 'Year Level',
+    !createForm.section && 'Section',
+  ].filter(Boolean);
   const runConfirmedAction = async () => {
     const cfg = confirmAction;
     setConfirmAction(null);
@@ -372,83 +451,31 @@ export default function InstructorClasses() {
     }
   };
 
-  // The one action that actually makes grades visible to students — "can_release"
-  // (computed server-side: submitted, Chairperson-verified, every Passed grade
-  // Admin-approved, not already released) gates whether this is even clickable.
-  // Once it succeeds, `can_release` and `all_released` are refreshed from the
-  // server via loadClasses, so the button locks itself out again — there's
-  // nothing left to release until a later resubmission cycle makes it true again.
-  const releaseGrades = async (c) => {
+  // Edit a class already created — its Section and Schedule. (Subject, Year
+  // Level and Semester are fixed when the class is created.)
+  const [editClass, setEditClass] = useState(null);
+  const [editForm, setEditForm] = useState({ section: '', schedule: '' });
+  // The class's schedule as day → time slots, for the same picker Create Class uses.
+  const [editTimes, setEditTimes] = useState({});
+  const [savingEdit, setSavingEdit] = useState(false);
+  const openEditClass = (c) => { setEditForm({ section: c.section || '', schedule: c.schedule || '' }); setEditTimes(scheduleFromString(c.schedule)); setEditClass(c); };
+  const saveEditClass = async () => {
+    if (!editForm.section) return toast.error('Choose a section.');
+    setSavingEdit(true);
     try {
-      const { data } = await gradeService.releaseClass(c.id);
-      toast.success(data.message || `Released grades for ${c.subject?.code || 'this class'} — students can now see them.`);
+      await classService.update(editClass.id, { section: editForm.section, schedule: scheduleToString(editTimes) || null });
+      toast.success('Class updated.');
+      setEditClass(null);
       loadClasses();
     } catch (err) {
-      toast.error(err.response?.data?.message || 'Failed to release grades');
-    }
-  };
-
-  // Export directly from this list — no need to open the class first. Fetches
-  // just enough data on demand (this page never loads the full grade grid up
-  // front) and hands it to the exact same generator GradeEncoding's own
-  // Export button uses (utils/gradingSheetDocx.js), so the file is identical
-  // either way.
-  const [exportingId, setExportingId] = useState(null);
-  const handleExportGradingSheet = async (c) => {
-    setExportingId(`sheet-${c.id}`);
-    try {
-      const { data } = await gradeService.getByClass(c.id);
-      await exportGradingSheetDocx({ classData: data.class, studentGrades: normalizeStudentGrades(data.student_grades) });
-    } catch (err) {
-      toast.error('Failed to export the Grading Sheet');
+      toast.error(err.response?.data?.message || 'Failed to update the class');
     } finally {
-      setExportingId(null);
-    }
-  };
-
-  // Same generator GradeEncoding's own Class Record tab uses
-  // (utils/classRecordExcel.js) — a class's own components/scores live under
-  // grade-components, not the grades endpoint, so they're fetched separately
-  // the same way GradeEncoding's loadData does.
-  const handleExportClassRecord = async (c) => {
-    setExportingId(`record-${c.id}`);
-    try {
-      const { data } = await gradeService.getByClass(c.id);
-      const studentGrades = normalizeStudentGrades(data.student_grades)
-        .slice()
-        // Alphabetical A-Z roster, matching the official Class Record.
-        .sort((a, b) => comparePeopleNames(a.student, b.student));
-      let components = [];
-      let componentScores = {};
-      try {
-        const compRes = await API.get(`/grade-components/${c.id}/components`);
-        components = compRes.data.components || [];
-        const scoreRes = await API.get(`/grade-components/${c.id}/scores`);
-        componentScores = scoreRes.data.scores || {};
-      } catch (e) {
-        // No components set up yet — exportClassRecordToExcel itself shows
-        // the "no components set up" toast for an empty list below.
-      }
-      await exportClassRecordToExcel({ classData: data.class, components, studentGrades, componentScores });
-    } catch (err) {
-      toast.error('Failed to export the Class Record');
-    } finally {
-      setExportingId(null);
-    }
-  };
-
-  const deleteClassRecord = async (c) => {
-    try {
-      await classService.delete(c.id);
-      toast.success(`${c.subject?.code || 'Class'} deleted`);
-      loadClasses();
-    } catch (err) {
-      toast.error(err.response?.data?.message || 'Failed to delete class');
+      setSavingEdit(false);
     }
   };
 
   // Clears this class's entered scores/grades and resets its whole submit/
-  // verify/approve/release pipeline — unlike deleteClassRecord above, the
+  // verify/approve/release pipeline — unlike archiving, the
   // class itself, its enrolled students, and its grade component/item setup
   // (weights, item names, max scores) all stay exactly as they are.
   const resetGrades = async (c) => {
@@ -517,9 +544,9 @@ export default function InstructorClasses() {
     try {
       setSaving(true);
       const { data } = await classService.create(createForm);
-      // Students in this class's Year Level + Section are auto-enrolled
-      // server-side — the response message reflects how many, if any.
-      toast.success(data.message || 'Class created successfully');
+      // No one is enrolled automatically — the Add Students chooser opens next
+      // (see below) and the faculty member decides who is in the class.
+      toast.success(data.message || 'Class created — now add its students.');
       // Auto-expand the exact Class List path the new class lands in
       // (Program → Year → Section, all collapsed by default, plus the
       // Class List card itself) — otherwise it exists in `classes` after
@@ -545,6 +572,7 @@ export default function InstructorClasses() {
       // instead of silently vanishing behind a stale filter.
       setSemFilter('');
       loadClasses();
+      if (data.class) setAddStudentsClass(data.class);
     } catch (err) {
       toast.error(err.response?.data?.message || 'Failed to create class');
     } finally {
@@ -563,7 +591,9 @@ export default function InstructorClasses() {
     setEligibleLoading(true);
     try {
       const { data } = await classService.getEligibleStudents(cls.id);
-      setEligibleStudents((data.students || []).slice().sort(comparePeopleNames));
+      // Only who's actually in the class — students are added through
+      // Add Students (advisory class list or Import Class List), never here.
+      setEligibleStudents((data.students || []).filter((s) => s.is_enrolled).sort(comparePeopleNames));
     } catch (err) {
       toast.error('Failed to load students');
     } finally {
@@ -589,6 +619,17 @@ export default function InstructorClasses() {
       toast.error(err.response?.data?.message || 'Failed to enroll students');
     } finally {
       setEnrolling(false);
+    }
+  };
+
+  const handleUnenroll = async (student) => {
+    try {
+      const { data } = await classService.unenroll(enrollClass.id, student.id);
+      toast.success(data.message || 'Student unenrolled');
+      setEligibleStudents((list) => list.filter((s) => s.id !== student.id));
+      loadClasses();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to unenroll the student');
     }
   };
 
@@ -667,6 +708,7 @@ export default function InstructorClasses() {
 
   return (
     <>
+      {!embedded && (<>
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-5 gap-3">
         <div>
           <h2 className="text-lg font-bold text-navy">My Classes</h2>
@@ -705,10 +747,12 @@ export default function InstructorClasses() {
           <Icons.FileText className="w-3.5 h-3.5 inline mr-1.5" />Archived {archivedClasses.length > 0 ? `(${archivedClasses.length})` : ''}
         </button>
       </div>
+      </>)}
 
       {/* ── LIST TAB ── */}
-      {activeTab === 'list' && (
+      {(embedded || activeTab === 'list') && (
         <>
+          {!embedded && (<>
           <div className="flex flex-wrap gap-3 mb-5">
             <SearchBar value={search} onChange={setSearch} placeholder="Search by subject code, name, or section..." />
             <select
@@ -720,6 +764,10 @@ export default function InstructorClasses() {
               {semesters.map(s => <option key={s} value={s}>{s}</option>)}
             </select>
           </div>
+
+          {/* Students still INC in classes already released to students — the
+              follow-up list (self-loading; renders nothing when empty). */}
+          <IncompleteStudentsCard onOpenClass={(classId) => navigate(`${base}/encode/${classId}`)} />
 
           {/* Classes the Chairperson bounced back for revision (returnToFaculty)
               — sits between the filters and the Class List card itself, its own
@@ -775,31 +823,38 @@ export default function InstructorClasses() {
             </div>
           )}
 
-          <div className="card overflow-hidden">
+          </>)}
+          <div className="card overflow-hidden mb-6">
             <button
               onClick={() => setClassListOpen((o) => !o)}
               className="card-header w-full border-none bg-transparent cursor-pointer font-sans text-left"
             >
-              <div>
-                <h3 className="text-base font-semibold text-navy">Class List ({filtered.length})</h3>
-                <p className="text-xs text-gray-400 mt-0.5">Grouped by Program → Year → Section — open the ones you want.</p>
+              {/* Count on the left, beside the title and its hint — same layout
+                  as the Released header below. */}
+              <div className="flex items-center gap-3 min-w-0">
+                <span className="flex-shrink-0 inline-flex items-center justify-center min-w-[34px] h-[34px] px-2 rounded-full bg-navy text-white text-sm font-bold">{filtered.length}</span>
+                <div className="min-w-0">
+                  <h3 className="text-base font-semibold text-navy leading-tight">Class List</h3>
+                  <p className="text-xs text-gray-400 mt-0.5">Grouped by Program → Year → Section — open the ones you want.</p>
+                </div>
               </div>
               {classListOpen ? <Icons.ChevronUp className="w-4 h-4 text-gray-400 flex-shrink-0" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />}
             </button>
             {classListOpen && <GroupedClassTree
               items={filtered}
               idPrefix="list"
+              minWidth={1150}
               openGroups={openGroups}
               toggleGroup={toggleGroup}
               emptyMessage="No classes found."
               headerRow={
                 <tr className="bg-gray-50 text-gray-500">
-                  <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide w-[30%]">Subject</th>
-                  <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide w-[13%]">Semester</th>
-                  <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide w-[12%]">Students</th>
-                  <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide w-[17%]">Progress</th>
-                  <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide w-[10%]">Status</th>
-                  <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide w-[18%]">Actions</th>
+                  <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide w-[22%]">Subject</th>
+                  <th className="text-center px-3 py-2 text-[10px] font-semibold uppercase tracking-wide w-[12%]">Semester</th>
+                  <th className="text-center px-3 py-2 text-[10px] font-semibold uppercase tracking-wide w-[15%]">Students</th>
+                  <th className="text-left pl-3 pr-6 py-2 text-[10px] font-semibold uppercase tracking-wide w-[16%]">Progress</th>
+                  <th className="text-center px-3 py-2 text-[10px] font-semibold uppercase tracking-wide w-[10%]">Status</th>
+                  <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide w-[25%]">Actions</th>
                 </tr>
               }
               renderRow={(c) => {
@@ -811,49 +866,75 @@ export default function InstructorClasses() {
                       <div className="flex items-center gap-2 min-w-0">
                         <span className={`w-2 h-2 rounded-full flex-shrink-0 ${color.dot}`} />
                         <div className="min-w-0">
-                          <p className="text-[13px] font-semibold truncate">{c.subject?.name}</p>
+                          <p className="text-[13px] font-semibold leading-snug break-words">{c.subject?.name}</p>
                           <p className="text-[11px] text-gray-500 truncate">{c.subject?.code} · {c.subject?.units} Units</p>
                         </div>
                       </div>
                     </td>
-                    <td className="px-4 py-3.5">
+                    <td className="px-3 py-3.5 text-center">
                       <Badge variant="blue">{c.semester?.split(' ').slice(0, 2).join(' ')}</Badge>
                     </td>
-                    <td className="px-4 py-3.5">
-                      <Badge variant="blue">{c.student_count} students</Badge>
+                    <td className="px-3 py-3.5 text-center">
+                      {c.student_count > 0 ? (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-800 shadow-xs">
+                          <Icons.Users className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                          {c.student_count} Students
+                        </span>
+                      ) : (
+                        <button type="button" onClick={() => setAddStudentsClass(c)} title="Add this class's students" className="bg-transparent border-none p-0 cursor-pointer">
+                          <Badge variant="yellow"><Icons.Upload className="w-3 h-3" /> Class list needed</Badge>
+                        </button>
+                      )}
                     </td>
-                    <td className="px-4 py-3.5">
-                      <div className="flex items-center gap-2">
-                        <div className="w-20 h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                          <div
-                            className={`h-full rounded-full ${c.progress === 100 ? 'bg-green-500' : 'bg-amber-500'}`}
-                            style={{ width: `${c.progress || 0}%` }}
-                          />
-                        </div>
-                        <span className="text-xs text-gray-500">{c.progress || 0}%</span>
-                      </div>
+                    {/* Encoding progress — moves every time the Class Record is saved. */}
+                    <td className="pl-3 pr-6 py-3.5">
+                      <EncodingProgress c={c} />
                     </td>
-                    <td className="px-4 py-3.5">
+                    <td className="px-3 py-3.5 text-center">
                       {c.all_released
                         ? <Badge variant="green"><Icons.Check /> Released</Badge>
-                        : c.progress === 100
+                        : gradesDone(c)
                           ? <Badge variant="green"><Icons.Check /> Complete</Badge>
                           : c.encoding_open
                             ? <Badge variant="yellow">Open</Badge>
                             : <Badge variant="red">Closed</Badge>}
                     </td>
                     <td className="px-4 py-3.5">
-                      <div className="flex flex-wrap gap-1.5">
-                        <button
-                          className="btn-icon"
-                          onClick={() => navigate(`${base}/encode/${c.id}`)}
-                          title="Encode Grades"
-                          disabled={!c.encoding_open && c.progress < 100}
-                        >
-                          <Icons.Edit />
-                        </button>
-                        <button className="btn-icon" onClick={() => openEnrollModal(c)} title="Class Roster">
+                      <div className="flex flex-nowrap gap-1.5">
+                        {/* Always here: before submitting it opens the Class Record for encoding;
+                            after, it opens the same page to review it, export it, or undo the submission. */}
+                        {(
+                          <button
+                            className={`btn-icon ${(!c.encoding_open && c.progress < 100) || !c.student_count ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            aria-disabled={(!c.encoding_open && c.progress < 100) || !c.student_count}
+                            onClick={() => {
+                              // The class record is built from the class list — nothing to encode before it's imported.
+                              if (!c.student_count) {
+                                warnUnavailable('Import the class list first — the class record is based on it.');
+                                return setImportClass(c);
+                              }
+                              if (!c.encoding_open && c.progress < 100 && !c.sent_to_chairperson) return warnUnavailable('Grade encoding is closed for this class right now, so it can\'t be opened for encoding.');
+                              navigate(`${base}/encode/${c.id}`);
+                            }}
+                            title={!c.student_count ? 'Import the class list first' : (c.sent_to_chairperson || c.all_released || (c.submitted_count || 0) >= (c.student_count || 1)) ? 'Open Class Record (submitted — review, export or undo submission)' : 'Encode Grades'}
+                          >
+                            <Icons.Edit />
+                          </button>
+                        )}
+                        {!(c.all_released || c.sent_to_chairperson || c.chairperson_verified) && (
+                          <button className="btn-icon" onClick={() => openEditClass(c)} title="Edit Class (section, schedule)">
+                            <Icons.Settings />
+                          </button>
+                        )}
+                        <button className="btn-icon" onClick={() => openEnrollModal(c)} title="Class List">
                           <Icons.Users />
+                        </button>
+                        <button
+                          className="btn-icon !border-blue-200 !text-blue-600 hover:!bg-blue-50"
+                          onClick={() => setAddStudentsClass(c)}
+                          title="Add Students — from an advisory class list, or Import Class List"
+                        >
+                          <Icons.Plus />
                         </button>
                         <button className="btn-icon" onClick={() => setPreview({ cls: c, type: 'record' })} title="Preview Class Record">
                           <Icons.Book />
@@ -870,18 +951,19 @@ export default function InstructorClasses() {
                             Released group below. Having both here too, on
                             every class a Faculty/teaching Chairperson creates,
                             duplicated an action that belongs to a later step. */}
+                        {/* Classes are never deleted — archived, with everything kept. */}
                         <button
-                          className="btn-icon hover:!bg-red-50 hover:!text-red-500"
-                          title="Delete Class"
+                          className="btn-icon hover:!bg-amber-50 hover:!text-amber-600"
+                          title="Archive Class"
                           onClick={() => requestConfirm({
-                            title: 'Delete Class',
-                            message: `Are you sure you want to delete ${c.subject?.code || 'this class'}${c.section ? ` - Section ${c.section}` : ''}? This permanently removes its grade components, enrollments, and grades — including any already submitted. This cannot be undone. If you just want it out of your active list without losing the grade history, Archive it instead.`,
-                            confirmText: 'Delete',
-                            variant: 'red',
-                            action: () => deleteClassRecord(c),
+                            title: 'Archive Class',
+                            message: `Archive ${c.subject?.code || 'this class'}${c.section ? ` - Section ${c.section}` : ''}? It moves to the Archived tab — its students, scores and grades are all kept, and you can restore it from there any time.`,
+                            confirmText: 'Archive',
+                            variant: 'gold',
+                            action: () => archiveClass(c),
                           })}
                         >
-                          <Icons.Trash />
+                          <Icons.Archive />
                         </button>
                       </div>
                     </td>
@@ -891,105 +973,10 @@ export default function InstructorClasses() {
             />}
           </div>
 
-          {/* ── READY FOR EXPORT — Admin has finished approving these
-              (c.can_release), but they haven't been released to students
-              yet. Sits between the working list and Released so it reads as
-              its own "your turn" queue instead of getting lost in either. ── */}
-          {filteredReadyForExport.length > 0 && (
-            <div className="card overflow-hidden mt-5">
-              <button
-                onClick={() => setReadyOpen((o) => !o)}
-                className="w-full px-5 py-3.5 flex items-center justify-between border-none cursor-pointer font-sans text-white transition-colors bg-amber-500 hover:bg-amber-600"
-              >
-                <div className="flex items-center gap-3">
-                  <span className="text-sm font-bold bg-white/20 rounded-full min-w-[26px] h-[26px] px-2 flex items-center justify-center">{filteredReadyForExport.length}</span>
-                  <div className="text-left">
-                    <p className="text-sm font-bold">Ready to Release</p>
-                    <p className="text-[11px] text-white/75">Admin has approved these — release to students. Class Record/Grade Sheet exports unlock once released.</p>
-                  </div>
-                </div>
-                {readyOpen ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
-              </button>
-
-              {readyOpen && (
-                <GroupedClassTree
-                  items={filteredReadyForExport}
-                  idPrefix="ready"
-                  openGroups={openGroups}
-                  toggleGroup={toggleGroup}
-                  emptyMessage="Nothing ready yet."
-                  headerRow={
-                    <tr className="bg-gray-50 text-gray-500">
-                      <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide w-[45%]">Subject</th>
-                      <th className="text-left px-4 py-2 text-[10px] font-semibold uppercase tracking-wide w-[20%]">Students</th>
-                      <th className="text-right px-4 py-2 pr-5 text-[10px] font-semibold uppercase tracking-wide w-[35%]">Actions</th>
-                    </tr>
-                  }
-                  renderRow={(c) => (
-                    <tr key={c.id} className="border-t border-gray-50 hover:bg-gray-50/50">
-                      <td className="px-4 py-3.5">
-                        <p className="text-[13px] font-semibold">{c.subject?.name}</p>
-                        <p className="text-[11px] text-gray-500">{c.subject?.code} · {c.subject?.units} Units</p>
-                      </td>
-                      <td className="px-4 py-3.5"><Badge variant="blue">{c.student_count} students</Badge></td>
-                      <td className="px-4 py-3.5 text-right pr-5">
-                        <div className="flex items-center justify-end flex-wrap gap-1.5">
-                          {/* Same two Export buttons the Released section
-                              below has, shown here too but disabled — a
-                              visible preview of what unlocks once Release is
-                              clicked, instead of them just not existing yet. */}
-                          <button
-                            className="btn btn-outline btn-sm whitespace-nowrap opacity-60 cursor-not-allowed"
-                            disabled
-                            title="Available once released to students"
-                          >
-                            <Icons.FileText className="w-3.5 h-3.5" /> Export Grading Sheet
-                          </button>
-                          <button
-                            className="btn btn-outline btn-sm whitespace-nowrap opacity-60 cursor-not-allowed"
-                            disabled
-                            title="Available once released to students"
-                          >
-                            <Icons.FileText className="w-3.5 h-3.5" /> Export Class Record
-                          </button>
-                          <button
-                            className="btn btn-gold btn-sm whitespace-nowrap"
-                            title="Release grades to students"
-                            onClick={() => requestConfirm({
-                              title: 'Release Grades',
-                              message: `Release grades for ${c.subject?.code || 'this class'}${c.section ? ` - Section ${c.section}` : ''} to students? This makes them visible immediately, and unlocks the Class Record/Grade Sheet exports for this class.`,
-                              confirmText: 'Release',
-                              variant: 'green',
-                              action: () => releaseGrades(c),
-                            })}
-                          >
-                            <Icons.Send className="w-3.5 h-3.5" /> Release to Students
-                          </button>
-                          <button
-                            className="btn-icon hover:!bg-red-50 hover:!text-red-500"
-                            title="Reset Grades"
-                            onClick={() => requestConfirm({
-                              title: 'Reset Grades',
-                              message: `Clear all entered scores and grades for ${c.subject?.code || 'this class'}${c.section ? ` - Section ${c.section}` : ''}? This un-releases it and resets it all the way back to the start of encoding — including anything already submitted, verified, or approved. The class itself, its enrolled students, and its grade component setup (weights, item names) are NOT affected. This cannot be undone.`,
-                              confirmText: 'Reset Grades',
-                              variant: 'red',
-                              action: () => resetGrades(c),
-                            })}
-                          >
-                            <Icons.RotateCcw />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  )}
-                />
-              )}
-            </div>
-          )}
-
+          {/* (Ready to Release removed — the Admin releases the grades from their own dashboard.) */}
           {/* ── RELEASED — grouped by Academic Year → Semester, kept separate
               from the working list above since there's nothing left to act on. ── */}
-          {filteredReleased.length > 0 && (
+          {!embedded && filteredReleased.length > 0 && (
             <div className="card overflow-hidden mt-5">
               <button
                 onClick={() => setReleasedOpen((o) => !o)}
@@ -1031,7 +1018,7 @@ export default function InstructorClasses() {
                                 "No Academic Year" group when a class is
                                 missing its own academic_year column. */}
                             <span className="text-sm font-semibold text-navy">
-                              {sem?.split(' ').slice(0, 2).join(' ')}{yr ? ` · A.Y. ${yr}` : ''}
+                              {sem?.split(' ').slice(0, 2).join(' ')}{yr ? ` · ${abbrFor(sem)} ${yr}` : ''}
                             </span>
                             <span className="text-xs text-gray-400">{semClasses.length} class{semClasses.length !== 1 ? 'es' : ''}</span>
                           </div>
@@ -1046,55 +1033,54 @@ export default function InstructorClasses() {
                             toggleGroup={toggleGroup}
                             emptyMessage="No released classes."
                             headerRow={null}
+                            colGroup={<><col className="w-[35%]" /><col className="w-[15%]" /><col className="w-[15%]" /><col className="w-[35%]" /></>}
                             renderRow={(c) => (
                               <tr key={c.id} className="border-t border-gray-50 hover:bg-gray-50/50">
                                 <td className="pl-14 pr-2 py-2.5">
                                   <p className="text-[13px] font-semibold">{c.subject?.code}</p>
                                   <p className="text-[11px] text-gray-500">{c.subject?.name}</p>
                                 </td>
-                                <td className="px-2 py-2.5"><Badge variant="blue">{c.student_count} students</Badge></td>
+                                <td className="px-2 py-2.5">
+                                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-800 shadow-xs">
+                                    <Icons.Users className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                                    {c.student_count} Students
+                                  </span>
+                                </td>
                                 <td className="px-2 py-2.5"><Badge variant="green"><Icons.Check className="w-3 h-3" /> Released</Badge></td>
                                 <td className="px-2 py-2.5 text-right pr-5">
-                                  {/* CSS Grid, single implicit column, instead
-                                      of the earlier flexbox attempts — a grid
-                                      column's width is set once by its widest
-                                      cell, and `justify-items-end` then aligns
-                                      every cell's own box to that column's
-                                      right edge, guaranteed by the grid spec
-                                      itself rather than depending on manually
-                                      matching pixel widths across differently
-                                      padded/bordered elements (which is what
-                                      kept drifting a few px off). */}
-                                  <div className="grid justify-items-end gap-1.5">
-                                    {/* Each file gets its own Export button —
-                                        downloads directly, no detour through
-                                        the class's own page first. */}
+                                  <div className="flex items-center justify-end flex-wrap gap-1.5">
                                     <button
                                       className="btn btn-outline btn-sm whitespace-nowrap"
-                                      onClick={() => handleExportGradingSheet(c)}
-                                      disabled={exportingId === `sheet-${c.id}`}
-                                      title="Export Grading Sheet (.docx)"
+                                      onClick={() => setPreview({ cls: c, type: 'record' })}
+                                      title="View Class Record"
                                     >
-                                      <Icons.FileText className="w-3.5 h-3.5 flex-shrink-0" /> {exportingId === `sheet-${c.id}` ? 'Exporting...' : 'Export Grading Sheet'}
+                                      <Icons.Book className="w-3.5 h-3.5" /> View Class Record
                                     </button>
                                     <button
                                       className="btn btn-outline btn-sm whitespace-nowrap"
-                                      onClick={() => handleExportClassRecord(c)}
-                                      disabled={exportingId === `record-${c.id}`}
-                                      title="Export Class Record (.xlsx)"
+                                      onClick={() => setPreview({ cls: c, type: 'sheet' })}
+                                      title="View Grade Sheet"
                                     >
-                                      <Icons.FileText className="w-3.5 h-3.5 flex-shrink-0" /> {exportingId === `record-${c.id}` ? 'Exporting...' : 'Export Class Record'}
+                                      <Icons.FileText className="w-3.5 h-3.5" /> View Grade Sheet
                                     </button>
-                                    {/* Released classes are done — a Chairperson
-                                        (or teaching Faculty) can tuck a
-                                        finished one straight into the
-                                        Archived tab from here, same
-                                        archiveClass() the working Class List
-                                        already uses, instead of having no way
-                                        to get a Released class out of this
-                                        list at all. */}
                                     <button
-                                      className="btn-icon mt-1"
+                                      className="btn btn-outline btn-sm whitespace-nowrap text-green-700 border-green-300"
+                                      onClick={() => exportReleased(c, 'record')}
+                                      disabled={!!exportingDoc}
+                                      title="Download the Class Record (Excel)"
+                                    >
+                                      <Icons.Download className="w-3.5 h-3.5" /> {exportingDoc === `${c.id}-record` ? 'Exporting…' : 'Export Class Record'}
+                                    </button>
+                                    <button
+                                      className="btn btn-outline btn-sm whitespace-nowrap text-green-700 border-green-300"
+                                      onClick={() => exportReleased(c, 'sheet')}
+                                      disabled={!!exportingDoc}
+                                      title="Download the Grade Sheet (Word)"
+                                    >
+                                      <Icons.Download className="w-3.5 h-3.5" /> {exportingDoc === `${c.id}-sheet` ? 'Exporting…' : 'Export Grade Sheet'}
+                                    </button>
+                                    <button
+                                      className="btn-icon"
                                       title="Archive Class"
                                       onClick={() => requestConfirm({
                                         title: 'Archive Class',
@@ -1123,7 +1109,7 @@ export default function InstructorClasses() {
       )}
 
       {/* ── ARCHIVED TAB — classes whose semester was marked Completed by Admin ── */}
-      {activeTab === 'archived' && (
+      {!embedded && activeTab === 'archived' && (
         <>
           <div className="flex flex-wrap gap-3 mb-5">
             <SearchBar value={search} onChange={setSearch} placeholder="Search by subject code, name, or section..." />
@@ -1156,7 +1142,12 @@ export default function InstructorClasses() {
                     <p className="text-[11px] text-gray-400">{c.subject?.code} · {c.subject?.units} Units</p>
                   </td>
                   <td className="px-4 py-3.5"><Badge variant="gray">{c.semester?.split(' ').slice(0, 2).join(' ')}</Badge></td>
-                  <td className="px-4 py-3.5"><Badge variant="gray">{c.student_count} students</Badge></td>
+                  <td className="px-4 py-3.5">
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold bg-gray-100 text-gray-700 border border-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-700 shadow-xs">
+                      <Icons.Users className="w-3.5 h-3.5 text-gray-500 dark:text-gray-400" />
+                      {c.student_count} Students
+                    </span>
+                  </td>
                   <td className="px-4 py-3.5">
                     <div className="flex items-center gap-1.5">
                       <button className="btn-icon" onClick={() => setPreview({ cls: c, type: 'record' })} title="Preview Class Record">
@@ -1195,6 +1186,51 @@ export default function InstructorClasses() {
         </>
       )}
 
+      {/* EDIT CLASS MODAL */}
+      {editClass && (
+        <Modal
+          title={`Edit Class — ${editClass.subject?.code || ''}`}
+          onClose={() => setEditClass(null)}
+          footer={
+            <>
+              <button className="btn btn-outline" onClick={() => setEditClass(null)} disabled={savingEdit}>Cancel</button>
+              <button className="btn btn-gold" onClick={saveEditClass} disabled={savingEdit}>{savingEdit ? 'Saving...' : 'Save Changes'}</button>
+            </>
+          }
+        >
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="sm:col-span-2">
+              <label className="form-label">Subject</label>
+              <div className="form-input !bg-gray-50 !text-gray-700 flex items-center gap-2 cursor-default select-none">
+                <Icons.Lock className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+                <span className="truncate">{editClass.subject?.code} — {editClass.subject?.name}</span>
+              </div>
+            </div>
+            <div>
+              <label className="form-label">Year Level</label>
+              <div className="form-input !bg-gray-50 !text-gray-700 flex items-center gap-2 cursor-default select-none">
+                <Icons.Lock className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+                <span>{editClass.year_level ? `Year ${editClass.year_level}` : '—'}</span>
+              </div>
+            </div>
+            <div>
+              <label className="form-label">Section <span className="text-red-500">*</span></label>
+              <select className="form-select" value={editForm.section} onChange={(e) => setEditForm({ ...editForm, section: e.target.value })}>
+                <option value="">Select Section</option>
+                {SECTIONS.map((s) => <option key={s} value={s}>Section {s}</option>)}
+              </select>
+            </div>
+            <div className="sm:col-span-2">
+              <label className="form-label">Schedule</label>
+              <SchedulePicker times={editTimes} onChange={setEditTimes} />
+            </div>
+          </div>
+          <p className="text-[11px] text-gray-400 mt-3">
+            Subject, Year Level and Semester are set when the class is created. The students already on the class list stay on it.
+          </p>
+        </Modal>
+      )}
+
       {/* CREATE CLASS MODAL */}
       {showCreateModal && (
         <Modal
@@ -1203,11 +1239,16 @@ export default function InstructorClasses() {
           footer={
             <>
               <button className="btn btn-outline" onClick={() => setShowCreateModal(false)}>Cancel</button>
+              {/* Soft-disabled: looks unavailable but stays clickable, so
+                  clicking it always says which required fields are missing. */}
               <button
-                className="btn btn-gold disabled:opacity-50 disabled:cursor-not-allowed"
-                onClick={handleCreateClass}
-                disabled={saving || !createForm.subject_id || !createForm.semester || !createForm.year_level || !createForm.section}
-                title={!createForm.subject_id || !createForm.semester || !createForm.year_level || !createForm.section ? 'Subject, Year Level, and Section are all required' : undefined}
+                className={`btn btn-gold ${createMissing.length > 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
+                aria-disabled={createMissing.length > 0}
+                onClick={() => {
+                  if (createMissing.length > 0) return warnUnavailable(`Can't create the class yet — fill in: ${createMissing.join(', ')}.`);
+                  handleCreateClass();
+                }}
+                disabled={saving}
               >
                 {saving ? 'Creating...' : 'Create Class'}
               </button>
@@ -1244,6 +1285,7 @@ export default function InstructorClasses() {
                         value={subjectSearch}
                         onChange={(e) => setSubjectSearch(e.target.value)}
                       />
+                      <ClearSearchButton value={subjectSearch} onClear={() => setSubjectSearch('')} inline />
                     </div>
                   </div>
                   <div className="max-h-52 overflow-y-auto">
@@ -1255,7 +1297,16 @@ export default function InstructorClasses() {
                           key={s.id}
                           type="button"
                           onClick={() => {
-                            setCreateForm({ ...createForm, subject_id: s.id, year_level: createForm.year_level || s.year_level || '' });
+                            // Always follows the newly picked subject's own
+                            // curriculum year — not just filled in once while
+                            // empty. Picking a different subject after Year
+                            // Level was already set (e.g. switching from a
+                            // Year 4 subject to a Year 2 one) used to leave
+                            // the stale Year 4 sitting there instead of
+                            // syncing; the field's still a plain <select>
+                            // right below, so overriding it afterward for a
+                            // retake/cross-year offering still works fine.
+                            setCreateForm({ ...createForm, subject_id: s.id, year_level: s.year_level || '' });
                             setSubjectDropdownOpen(false);
                             setSubjectSearch('');
                           }}
@@ -1295,11 +1346,20 @@ export default function InstructorClasses() {
             </div>
             <div>
               <label className="form-label">Year Level <span className="text-red-500">*</span></label>
-              <select className="form-select" value={createForm.year_level} onChange={(e) => setCreateForm({ ...createForm, year_level: e.target.value })}>
-                <option value="">Select Year Level</option>
-                {[1, 2, 3, 4].map((y) => <option key={y} value={y}>Year {y}</option>)}
-              </select>
-              <p className="text-[11px] text-gray-400 mt-1">Defaults to the Subject's own curriculum year — override for retake/cross-year offerings.</p>
+              {/* Locked, not a picker — same reasoning and same visual
+                  pattern as Semester above: it's a direct consequence of
+                  which Subject was picked (that subject's own curriculum
+                  year), not something Faculty chooses separately, so it's
+                  never left able to drift out of sync with the Subject. */}
+              <div className="form-input !bg-gray-50 !text-gray-700 flex items-center gap-2 cursor-default select-none">
+                <Icons.Lock className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+                <span className="whitespace-nowrap">{createForm.year_level ? `Year ${createForm.year_level}` : 'Select a subject first'}</span>
+              </div>
+              <p className="text-[11px] text-gray-400 mt-1">
+                {createForm.year_level
+                  ? "Locked to the Subject's own curriculum year."
+                  : 'Pick a Subject above to set this automatically.'}
+              </p>
             </div>
             <div>
               <label className="form-label">Section <span className="text-red-500">*</span></label>
@@ -1415,9 +1475,19 @@ export default function InstructorClasses() {
           somehow never got auto-enrolled (e.g. their year/section changed
           after the class was created) — those show up below as an
           unchecked, actionable exception, not the normal path. */}
+      {importClass && (
+        <StudentWordImportModal
+          key={importClass.id}
+          isOpen
+          classContext={importClass}
+          onClose={() => setImportClass(null)}
+          onSuccess={() => loadClasses()}
+        />
+      )}
+
       {enrollClass && (
         <Modal
-          title={`${eligibleStudents.some((s) => !s.is_enrolled) ? 'Enroll Students' : 'Class Roster'} — ${enrollClass.subject?.code}${enrollClass.year_level ? ` · Year ${enrollClass.year_level}` : ''}${enrollClass.section ? ` · Sec ${enrollClass.section}` : ''}`}
+          title={`${eligibleStudents.some((s) => !s.is_enrolled) ? 'Enroll Students' : 'Class List'} — ${enrollClass.subject?.code}${enrollClass.year_level ? ` · Year ${enrollClass.year_level}` : ''}${enrollClass.section ? ` · Sec ${enrollClass.section}` : ''}`}
           onClose={() => setEnrollClass(null)}
           footer={
             eligibleStudents.some((s) => !s.is_enrolled) ? (
@@ -1428,7 +1498,12 @@ export default function InstructorClasses() {
                 </button>
               </>
             ) : (
-              <button className="btn btn-gold" onClick={() => setEnrollClass(null)}>Close</button>
+              <>
+                <button className="btn btn-outline flex items-center gap-1.5 mr-auto text-blue-700 border-blue-300" onClick={() => { const c = enrollClass; setEnrollClass(null); setAddStudentsClass(c); }}>
+                  <Icons.Plus className="w-4 h-4" /> Add Students
+                </button>
+                <button className="btn btn-gold" onClick={() => setEnrollClass(null)}>Close</button>
+              </>
             )
           }
         >
@@ -1436,10 +1511,7 @@ export default function InstructorClasses() {
             <LoadingSpinner />
           ) : eligibleStudents.length === 0 ? (
             <p className="text-sm text-gray-400 text-center py-6">
-              No active students found matching this class's Year Level and Section yet.
-              {!enrollClass.year_level || !enrollClass.section
-                ? ' Set both on the class to narrow this list.'
-                : ''}
+              No students in this class yet. Click <b>Add Students</b> to choose them from the advisory class list or import a class list.
             </p>
           ) : (
             <>
@@ -1447,7 +1519,7 @@ export default function InstructorClasses() {
                 <p className="text-[11px] text-gray-400">
                   {eligibleStudents.some((s) => !s.is_enrolled)
                     ? `${eligibleStudents.filter((s) => s.is_enrolled).length} already enrolled · ${eligibleStudents.filter((s) => !s.is_enrolled).length} not yet enrolled`
-                    : `${eligibleStudents.length} student(s) enrolled — matched automatically by Year Level + Section`}
+                    : `${eligibleStudents.length} student(s) enrolled — from this class's class list`}
                 </p>
                 {eligibleStudents.some((s) => !s.is_enrolled) && (
                   <button
@@ -1488,12 +1560,27 @@ export default function InstructorClasses() {
                         <p className="text-[13px] font-semibold">{formatPersonName(s.name)}</p>
                         {s.is_enrolled && <Badge variant="green"><Icons.Check className="w-3 h-3" /> Enrolled</Badge>}
                       </div>
-                      <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
-                        <RegularityBadge status={s.student_status} />
-                        <StudentTypeBadge status={s.student_type} />
-                      </div>
                       <p className="text-[11px] text-gray-500 mt-0.5">{s.student_no} · Year {s.year_level}{s.section ? ` · Section ${s.section}` : ''}</p>
                     </div>
+                    {s.is_enrolled && (
+                      <button
+                        type="button"
+                        className="btn btn-outline btn-sm text-red-600 border-red-200 hover:bg-red-50 flex items-center gap-1 flex-shrink-0"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          requestConfirm({
+                            title: 'Unenroll Student',
+                            message: `Remove ${formatPersonName(s.name)} from ${enrollClass.subject?.code || 'this class'}? Any scores already entered for them in this class's Class Record are removed too.`,
+                            confirmText: 'Unenroll',
+                            variant: 'red',
+                            action: () => handleUnenroll(s),
+                          });
+                        }}
+                        title="Remove this student from the class"
+                      >
+                        <Icons.X className="w-3.5 h-3.5" /> Unenroll
+                      </button>
+                    )}
                   </label>
                 ))}
               </div>
@@ -1502,12 +1589,22 @@ export default function InstructorClasses() {
         </Modal>
       )}
 
+      {addStudentsClass && (
+        <AddStudentsModal
+          cls={addStudentsClass}
+          onClose={() => setAddStudentsClass(null)}
+          onImport={(c) => setImportClass(c)}
+          onAdded={loadClasses}
+        />
+      )}
+
       {confirmAction && (
         <ConfirmDialog
           title={confirmAction.title}
           message={confirmAction.message}
           confirmText={confirmAction.confirmText}
           variant={confirmAction.variant}
+          warning={!!confirmAction.warning}
           onConfirm={runConfirmedAction}
           onCancel={() => setConfirmAction(null)}
         />
@@ -1520,13 +1617,23 @@ export default function InstructorClasses() {
         <Modal
           title={`${DOC[preview.type].label} — ${preview.cls.subject?.code}${preview.cls.section ? ` Sec ${preview.cls.section}` : ''}`}
           onClose={() => setPreview(null)}
-          size="max-w-5xl"
+          size="max-w-[98vw]"
+          footer={(
+            <button
+              className="btn btn-gold"
+              onClick={() => exportReleased(preview.cls, preview.type)}
+              disabled={!!exportingDoc || !preview.cls.student_count}
+              title={preview.cls.student_count ? '' : 'Add the class list first'}
+            >
+              <Icons.Download className="w-4 h-4" /> {exportingDoc ? 'Exporting…' : `Export ${DOC[preview.type].label}`}
+            </button>
+          )}
         >
           <iframe
             key={`${preview.cls.id}-${preview.type}`}
             src={`${DOC[preview.type].path}/${preview.cls.id}?preview=1`}
             title="Document preview"
-            style={{ width: '100%', height: '65vh', border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
+            style={{ width: '100%', height: 'calc(90vh - 200px)', minHeight: 360, border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
           />
         </Modal>
       )}

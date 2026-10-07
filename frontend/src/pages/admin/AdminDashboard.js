@@ -1,12 +1,17 @@
 import { useState, useEffect, useRef } from 'react';
-import { Icons, Avatar, Badge, StatCard, LoadingSpinner, CurrentSemesterTag, FacultyProgramTags, ProgramDot, programShortLabel, formatPersonName } from '../../components/common';
+import { Icons, Avatar, Badge, StatCard, LoadingSpinner, CurrentSemesterTag, ProgramDot, programShortLabel, formatPersonName } from '../../components/common';
 import ArchivedActivitiesModal from '../../components/common/ArchivedActivitiesModal';
 import { GradeDistributionChart } from '../../components/charts/GradeCharts';
-import { ProgramStudentsChart, ProgramFacultyChart, ProgramClassesChart, ProgramPassRateChart, ProgramGWAChart, FacultyApprovalBySection } from '../../components/charts/AdminAnalyticsCharts';
-import { dashboardService, gradeService, promotionService } from '../../services';
+import { ProgramStudentsChart, ProgramFacultyChart, ProgramClassesChart, ProgramPassRateChart, ProgramGWAChart } from '../../components/charts/AdminAnalyticsCharts';
+import { dashboardService, gradeService } from '../../services';
 import { useNavigate } from 'react-router-dom';
 import { usePageState } from '../../hooks/usePageState';
-import socket from '../../services/socket';
+import socket, { onGradesUpdated } from '../../services/socket';
+import FacultyProgressRow from '../../components/common/FacultyProgressRow';
+import SemesterEndingBanner from '../../components/admin/SemesterEndingBanner';
+import ReleaseGradesCard from '../../components/admin/ReleaseGradesCard';
+import AdviserSummaryCard from '../../components/admin/AdviserSummaryCard';
+import { useSemesterLabels } from '../../utils/semesterLabels';
 
 // Excluded from grouping (same as UserManagement.js) — GE is a bonus tag every
 // program's faculty can carry, not a program of its own to bucket people under.
@@ -38,28 +43,6 @@ const sortLeastDoneFirst = (a, b) => {
   return pctA - pctB; // least-done first — the ones needing a nudge surface at the top
 };
 
-function FacultyProgressRow({ f }) {
-  const done = f.classes.filter((c) => c.sent).length;
-  const total = f.classes.length;
-  const complete = total > 0 && done === total;
-  return (
-    <div className="flex items-center gap-3 p-2.5 rounded-lg hover:bg-gray-50 transition-colors">
-      <Avatar letter={f.instructor.avatar || f.instructor.name?.[0]} className="bg-purple-500 text-white flex-shrink-0" size="w-8 h-8 text-xs" />
-      <div className="flex-1 min-w-0">
-        <p className="text-sm font-medium truncate">{formatPersonName(f.instructor.name)}</p>
-        <div className="w-full h-1.5 bg-gray-100 rounded-full overflow-hidden mt-1">
-          <div
-            className={`h-full rounded-full ${complete ? 'bg-green-500' : 'bg-amber-400'}`}
-            style={{ width: `${total > 0 ? (done / total) * 100 : 0}%` }}
-          />
-        </div>
-      </div>
-      <Badge variant={complete ? 'green' : 'gray'} className="flex-shrink-0">
-        {complete && <Icons.Check className="w-3 h-3" />} {done}/{total}
-      </Badge>
-    </div>
-  );
-}
 
 const ACTIVITY_BOXES = [
   { role: 'Faculty', label: 'Faculty', icon: 'User', header: 'bg-purple-600' },
@@ -71,10 +54,10 @@ const ACTIVITY_BOXES = [
 export default function AdminDashboard() {
   const [stats, setStats] = useState(null);
   const [activities, setActivities] = useState([]);
-  const [facultyApprovalBySection, setFacultyApprovalBySection] = useState([]);
   const [facultyReview, setFacultyReview] = useState([]);
   const [programBreakdown, setProgramBreakdown] = useState([]);
   const [currentSemester, setCurrentSemester] = useState(null);
+  const { abbrFor } = useSemesterLabels();
   const [distribution, setDistribution] = useState(null);
   const [loading, setLoading] = useState(true);
   // "" = All Semesters; otherwise `${academic_year}::${semester}` — combined
@@ -95,17 +78,13 @@ export default function AdminDashboard() {
   }, [showArchivedSemesters]);
   const [showArchive, setShowArchive] = useState(false);
   const [showLoginArchive, setShowLoginArchive] = useState(false);
-  const [promotionHistory, setPromotionHistory] = useState([]);
-  const [promotionOverview, setPromotionOverview] = useState(null);
-  // Faculty Submission Progress / Faculty Pending Review both start
-  // collapsed — usePageState (not plain useState) so navigating away and
-  // back within the session remembers whatever Admin last left each one
-  // as, starting collapsed the very first time.
+  // Faculty Submission Progress starts collapsed — usePageState (not plain
+  // useState) so navigating away and back within the session remembers
+  // whatever Admin last left it as, starting collapsed the very first time.
   const [progressExpanded, setProgressExpanded] = usePageState('AdminDashboard.progressExpanded', false);
-  const [pendingReviewExpanded, setPendingReviewExpanded] = usePageState('AdminDashboard.pendingReviewExpanded', false);
   const navigate = useNavigate();
 
-  useEffect(() => { loadDashboard(); loadPromotionHistory(); loadPromotionOverview(); loadFacultyReview(); }, []);
+  useEffect(() => { loadDashboard(); loadFacultyReview(); }, []);
   useEffect(() => { loadDistribution(); }, [semesterKey]);
 
   // Live refresh — same 'gradesUpdated' socket event GradeApproval.js (this
@@ -118,8 +97,7 @@ export default function AdminDashboard() {
   // every grade change would be wasted work.
   useEffect(() => {
     const handler = () => { loadDashboard(); loadFacultyReview(); };
-    socket.on('gradesUpdated', handler);
-    return () => socket.off('gradesUpdated', handler);
+    return onGradesUpdated(handler);
   }, []);
 
   // 'gradesUpdated' above only reaches this page WHILE the socket is
@@ -164,38 +142,12 @@ export default function AdminDashboard() {
     }
   };
 
-  // Promoted students stop showing up in Promotion Management's own lists
-  // once they're done (see promotionController's last_promoted_semester
-  // check) — this is where that activity is actually visible afterward,
-  // instead of just disappearing with no record of it happening.
-  const loadPromotionHistory = async () => {
-    try {
-      const { data } = await promotionService.getHistory();
-      setPromotionHistory(data?.history || []);
-    } catch (err) {
-      console.error('Promotion history error:', err);
-    }
-  };
-
-  // Live status counts across the current semester's whole student body —
-  // same numbers Promotion Management's own Evaluate would produce, without
-  // anyone having to go click Evaluate first just to see where things stand.
-  const loadPromotionOverview = async () => {
-    try {
-      const { data } = await promotionService.getOverview();
-      setPromotionOverview(data);
-    } catch (err) {
-      console.error('Promotion overview error:', err);
-    }
-  };
-
   const loadDashboard = async () => {
     try {
       setLoading(true);
       const { data } = await dashboardService.getAdmin();
       setStats(data?.stats || {});
       setActivities(data?.recent_activities || []);
-      setFacultyApprovalBySection(data?.faculty_approval_by_section || []);
       setProgramBreakdown(data?.program_breakdown || []);
       setCurrentSemester(data?.current_semester || null);
     } catch (err) {
@@ -273,6 +225,7 @@ export default function AdminDashboard() {
 
   return (
     <>
+      <SemesterEndingBanner />
       <div className="mb-6">
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <h2 className="text-2xl font-bold text-navy">Welcome back, Administrator!</h2>
@@ -284,7 +237,7 @@ export default function AdminDashboard() {
       {/* Stats */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
         <StatCard
-          label="Total Students Verified" value={stats?.total_students || 0} icon={<Icons.Users />}
+          label="Total Students" value={stats?.total_students || 0} icon={<Icons.Users />}
           iconBg="bg-blue-50 text-blue-500" accent="border-blue-400"
         />
         <StatCard
@@ -354,6 +307,12 @@ export default function AdminDashboard() {
         </div>
       </div>
 
+      {/* Approved classes — release their grades to the students. */}
+      <ReleaseGradesCard />
+
+      {/* Every adviser's section — students, set-up accounts, retakes, promoted. */}
+      <AdviserSummaryCard />
+
       {/* Faculty Submission Progress — "3/15" per instructor: how many of
           their own classes/sections this semester are fully submitted
           (c.sent), out of how many they're teaching in total. Same widget
@@ -369,7 +328,7 @@ export default function AdminDashboard() {
         >
           <div>
             <h3 className="font-semibold text-navy">Faculty Submission Progress</h3>
-            <p className="text-xs text-gray-400 mt-0.5">Sections fully submitted, out of how many each instructor is teaching this semester — every program, including a teaching Chairperson's own classes.</p>
+            <p className="text-xs text-gray-400 mt-0.5">Sections fully submitted, out of how many each faculty is teaching this semester — every program, including a teaching Chairperson's own classes.</p>
           </div>
           {progressExpanded ? <Icons.ChevronUp className="w-4 h-4 text-gray-400 flex-shrink-0" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />}
         </button>
@@ -388,7 +347,7 @@ export default function AdminDashboard() {
                       <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">{programShortLabel(program)}</h4>
                     </div>
                     <div className="space-y-1">
-                      {list.slice().sort(sortLeastDoneFirst).map((f) => <FacultyProgressRow key={f.instructor.id} f={f} />)}
+                      {list.slice().sort(sortLeastDoneFirst).map((f) => <FacultyProgressRow key={f.instructor.id} f={f} gradeApprovalPath="/admin/grade-approval" />)}
                     </div>
                   </div>
                 ))}
@@ -399,7 +358,7 @@ export default function AdminDashboard() {
                     <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Part Timer</h4>
                   </div>
                   <div className="space-y-1">
-                    {groupedFacultyReview.partTime.slice().sort(sortLeastDoneFirst).map((f) => <FacultyProgressRow key={f.instructor.id} f={f} />)}
+                    {groupedFacultyReview.partTime.slice().sort(sortLeastDoneFirst).map((f) => <FacultyProgressRow key={f.instructor.id} f={f} gradeApprovalPath="/admin/grade-approval" />)}
                   </div>
                 </div>
               )}
@@ -409,193 +368,6 @@ export default function AdminDashboard() {
         )}
       </div>
 
-      {/* Pending Registrations + Faculty Pending Review — side by side since
-          both are "what's still outstanding" snapshots: new student sign-ups
-          awaiting a Chairperson's review, and Faculty's own grade-submission
-          status per class (same panel the Chairperson dashboard shows, just
-          system-wide here instead of scoped to one Chairperson's program(s)). */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
-        <div className="card">
-          <div className="card-header">
-            <h3 className="font-semibold text-navy">Pending Registrations</h3>
-          </div>
-          <div className="card-body flex flex-col items-center justify-center py-8">
-            <div className="w-16 h-16 rounded-full bg-amber-50 text-amber-500 flex items-center justify-center mb-3">
-              <Icons.Clock className="w-7 h-7" />
-            </div>
-            <p className="text-3xl font-bold text-navy">{stats?.pending_registrations || 0}</p>
-            <p className="text-xs text-gray-400 mt-1 text-center">Student sign-up{stats?.pending_registrations === 1 ? '' : 's'} awaiting Chairperson review</p>
-          </div>
-        </div>
-
-        <div className="card lg:col-span-2">
-          <button
-            onClick={() => setPendingReviewExpanded((prev) => !prev)}
-            className="card-header w-full flex items-center justify-between gap-3 border-none bg-transparent cursor-pointer font-sans text-left"
-          >
-            <div>
-              <h3 className="font-semibold text-navy">Faculty Pending Review</h3>
-              <p className="text-xs text-gray-400 mt-0.5">Grade submission status per instructor, across every program.</p>
-            </div>
-            {pendingReviewExpanded ? <Icons.ChevronUp className="w-4 h-4 text-gray-400 flex-shrink-0" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />}
-          </button>
-          {pendingReviewExpanded && (
-          <div className="card-body space-y-3 max-h-[360px] overflow-y-auto">
-            {facultyReview.length === 0 ? (
-              <p className="text-center py-8 text-gray-400 text-sm">No active classes found.</p>
-            ) : facultyReview.map((f) => {
-              const allSent = f.classes.length > 0 && f.classes.every((c) => c.sent);
-              return (
-                <div key={f.instructor.id} className="border border-gray-100 rounded-xl p-4 hover:shadow-sm transition-shadow">
-                  <div className="flex items-center justify-between mb-2.5">
-                    <div className="flex items-center gap-3">
-                      <Avatar letter={f.instructor.avatar || f.instructor.name?.[0]} className="bg-purple-500 text-white" size="w-8 h-8 text-xs" />
-                      <div>
-                        <p className="text-sm font-semibold">{formatPersonName(f.instructor.name)}</p>
-                        <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
-                          <p className="text-xs text-gray-500">{f.classes.length} class{f.classes.length !== 1 ? 'es' : ''} ·</p>
-                          <FacultyProgramTags user={f.instructor} />
-                        </div>
-                      </div>
-                    </div>
-                    <Badge variant={allSent ? 'green' : 'yellow'}>
-                      {allSent ? <><Icons.Check className="w-3 h-3" /> Grades Sent</> : <><Icons.Clock className="w-3 h-3" /> Pending</>}
-                    </Badge>
-                  </div>
-                  <div className="border-t border-gray-50 pt-2.5 mt-2.5 space-y-1.5">
-                    {f.classes.map((c) => (
-                      <div key={c.class_id} className="flex items-center justify-between text-xs">
-                        <span className="text-gray-600">{c.subject_code}{c.year_level ? ` · Year ${c.year_level}` : ''}{c.section ? ` · Sec ${c.section}` : ''}</span>
-                        {c.sent ? (
-                          <div className="flex gap-1.5">
-                            <Badge variant="green">{c.passed} Passed</Badge>
-                            <Badge variant="yellow">{c.inc} INC</Badge>
-                            <Badge variant="gray">{c.dropped} Dropped</Badge>
-                          </div>
-                        ) : (
-                          <span className="text-gray-400">{c.submitted_count}/{c.total_students} submitted</span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          )}
-        </div>
-      </div>
-
-      {/* Faculty Grade Approval by Section — downstream of the row above:
-          that tracks whether Faculty has SENT the documents; this tracks
-          whether Admin has actually finished APPROVING them. */}
-      <div className="card mb-6">
-        <div className="card-header">
-          <h3 className="font-semibold text-navy">Faculty Grade Approval — by Section</h3>
-          <p className="text-xs text-gray-400 mt-0.5">Which of each Faculty's sections have cleared Grade Approval (Class Record &amp; Grade Sheet both Admin-approved).</p>
-        </div>
-        <div className="card-body max-h-[360px] overflow-y-auto">
-          <FacultyApprovalBySection rows={facultyApprovalBySection} />
-        </div>
-      </div>
-
-      {/* Promotions Going — a live status overview of the whole Promotion
-          Management module (same summary counts Evaluate itself would
-          produce, computed here automatically so nobody has to go run it
-          just to see where things stand), plus the recent activity log
-          underneath. promoteStudents also hides a student from Promotion
-          Management's own lists the moment they're processed (nothing left
-          to do there), so this is the only place that activity stays
-          visible afterward instead of just disappearing with no record. */}
-      <div className="card mb-6">
-        <div className="card-header flex items-center justify-between">
-          <div>
-            <h3 className="font-semibold text-navy">Promotions Going</h3>
-            <p className="text-xs text-gray-400 mt-0.5">
-              {promotionOverview?.semester ? `Status overview — ${promotionOverview.semester}` : 'Status overview across Promotion Management'}
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
-            {/* Same "View Archived" modal System Activities below opens —
-                promotion/regularization entries age out of this card's own
-                Recent Activity after 24h (see promotionActivityRecentWhere),
-                and that shared modal already surfaces them once they do, so
-                there's no need for a second, promotion-only archive view. */}
-            <button
-              onClick={() => setShowArchive(true)}
-              className="text-xs text-gold font-medium bg-transparent border-none cursor-pointer font-sans hover:underline flex items-center gap-1"
-            >
-              <Icons.Clock className="w-3 h-3" /> View Archived
-            </button>
-            <button
-              onClick={() => navigate('/admin/promotions')}
-              className="text-xs text-gold font-medium bg-transparent border-none cursor-pointer font-sans hover:underline"
-            >
-              Go to Promotions →
-            </button>
-          </div>
-        </div>
-        <div className="card-body">
-          {!promotionOverview?.summary ? (
-            <p className="text-sm text-gray-400 text-center py-6">No current semester set — nothing to evaluate yet.</p>
-          ) : (
-            // Everything — stat grid, total line, and the activity feed
-            // below it — scrolls together inside one fixed-height window
-            // instead of the card just growing taller and taller (9 tiles
-            // wrapping to multiple rows on a narrow screen, on top of a
-            // whole activity list) and pushing the rest of the dashboard down.
-            <div className="max-h-[420px] overflow-y-auto pr-1">
-              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 mb-5">
-                {[
-                  { label: 'Eligible', value: promotionOverview.summary.eligible, color: 'text-green-600', bg: 'bg-green-50 border-green-100' },
-                  { label: 'Retake Required', value: promotionOverview.summary.retake_required, color: 'text-amber-600', bg: 'bg-amber-50 border-amber-100' },
-                  { label: 'Retake Blocked', value: promotionOverview.summary.retake_blocked_by_prereq, color: 'text-red-500', bg: 'bg-red-50 border-red-100' },
-                  { label: 'Missing Prereqs', value: promotionOverview.summary.missing_prerequisites, color: 'text-red-500', bg: 'bg-red-50 border-red-100' },
-                  { label: 'Incomplete', value: promotionOverview.summary.incomplete, color: 'text-orange-500', bg: 'bg-orange-50 border-orange-100' },
-                  { label: 'Pending Verify', value: promotionOverview.summary.pending_verification, color: 'text-blue-600', bg: 'bg-blue-50 border-blue-100' },
-                  { label: 'No Grades', value: promotionOverview.summary.no_grades, color: 'text-amber-600', bg: 'bg-amber-50 border-amber-100' },
-                  { label: 'Graduating', value: promotionOverview.summary.graduating, color: 'text-purple-600', bg: 'bg-purple-50 border-purple-100' },
-                  { label: 'Already Promoted', value: promotionOverview.summary.already_promoted, color: 'text-gray-500', bg: 'bg-gray-50 border-gray-100' },
-                ].map((tile) => (
-                  <div key={tile.label} className={`rounded-xl p-3 text-center border ${tile.bg}`}>
-                    <p className={`text-xl font-bold ${tile.color}`}>{tile.value || 0}</p>
-                    <p className="text-[11px] text-gray-500 mt-0.5 leading-tight">{tile.label}</p>
-                  </div>
-                ))}
-              </div>
-              <p className="text-[11px] text-gray-400 mb-4">
-                {promotionOverview.summary.total} total students evaluated this semester.
-              </p>
-
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Recent Activity</p>
-              {promotionHistory.length === 0 ? (
-                <p className="text-sm text-gray-400 text-center py-6">No promotions run yet this term.</p>
-              ) : (
-                <div className="space-y-0">
-                  {promotionHistory.map((h) => {
-                    const userName = h.user?.name;
-                    const actionText = (userName && h.action?.toLowerCase().startsWith(userName.toLowerCase()))
-                      ? h.action.slice(userName.length).trim()
-                      : h.action;
-                    return (
-                      <div key={h.id} className="flex items-center gap-3 py-2.5 border-b border-gray-50 last:border-0">
-                        <Avatar letter={h.user?.avatar || userName?.[0] || '?'} className="bg-gold text-white" size="w-8 h-8 text-xs" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-[13px]">
-                            <span className="font-semibold text-navy">{userName || 'System'}</span>{' '}
-                            <span className="text-gray-600">{actionText}</span>
-                          </p>
-                          <p className="text-[11px] text-gray-400">{formatDateTime(h.created_at || h.createdAt)}</p>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
 
       {/* System Activities */}
       <div className="mb-6">
@@ -608,7 +380,7 @@ export default function AdminDashboard() {
             <div className="flex items-center gap-3">
               {currentSemester && (
                 <span className="text-xs text-gray-500">
-                  {currentSemester.term || currentSemester.name} · A.Y. {currentSemester.academic_year}
+                  {currentSemester.term || currentSemester.name} · {abbrFor(currentSemester)} {currentSemester.academic_year}
                 </span>
               )}
               <button
@@ -729,7 +501,7 @@ export default function AdminDashboard() {
               <p className="text-xs text-gray-400 mt-0.5">
                 {isViewingCurrent ? (
                   <>
-                    Showing <span className="font-medium text-gray-600">{currentSemester.term} · A.Y. {currentSemester.academic_year}</span> — the current semester
+                    Showing <span className="font-medium text-gray-600">{currentSemester.term} · {abbrFor(currentSemester)} {currentSemester.academic_year}</span> — the current semester
                     {formatSemesterDate(currentSemester.end_date) && <> · ends {formatSemesterDate(currentSemester.end_date)}</>}
                   </>
                 ) : (
@@ -780,7 +552,7 @@ export default function AdminDashboard() {
                           onClick={() => { setSemesterKey(key); setShowArchivedSemesters(false); }}
                           className={`w-full text-left px-4 py-2.5 text-sm border-none bg-transparent cursor-pointer font-sans hover:bg-gray-50 ${semesterKey === key ? 'text-navy font-semibold bg-blue-50' : 'text-gray-600'}`}
                         >
-                          {s.academic_year ? `A.Y. ${s.academic_year} · ${s.semester}` : s.semester}
+                          {s.academic_year ? `${abbrFor(s.semester)} ${s.academic_year} · ${s.semester}` : s.semester}
                         </button>
                       );
                     })}

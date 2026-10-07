@@ -1,14 +1,31 @@
+const { emitGradesUpdated } = require('../utils/realtime');
 const { GradeComponent, ComponentItem, ComponentScore, Class, Subject, Enrollment, Grade, User } = require('../models');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { logActivity } = require('../utils/activityLogger');
 const { actsAsInstructor } = require('../utils/teachingAuth');
+const { archivedClassMessage } = require('../utils/archiveGuard');
+const notifyAdmins = (...args) => require('./notificationController').notifyAdmins(...args);
+
+// Why a class's scores can't be edited freely anymore (null = still open):
+// it is archived (itself or its whole semester), or it was already submitted
+// to the Chairperson and not returned for revision. Its INC students can
+// still be completed — see saveScores.
+const closedClassMessage = async (cls) => {
+  const archived = await archivedClassMessage(cls);
+  if (archived) return archived;
+  if (cls.sent_to_chairperson && !cls.awaiting_faculty_revision) {
+    return 'This class was already submitted, so its Class Record is closed.';
+  }
+  return null;
+};
 
 // ── SSU Class Record formula ────────────────────────────────────────────────
 // Item Rate: linear transmutation of a raw score into a Rate. Kept at full
 // precision (unrounded) all the way through Rate → Average → Weighted →
-// Composite — only the final GWA (via toGWA below) is rounded, to 1
-// decimal. Whole-number/1-decimal display of Rate/Average/Weighted happens
-// in the frontend, purely cosmetic — it never feeds back into this math.
+// Composite — only then is the composite rounded to a whole-number Term
+// Grade, whose equivalent is looked up (toGWA below). Whole-number display
+// of Rate/Average/Weighted happens in the frontend, purely cosmetic — it
+// never feeds back into this math.
 // Which formula applies is a per-Class choice (Class.rate_formula, set from
 // Grade Component Setup) — '50_45' is the SSU default (Rate = (score/max)*45
 // + 50, range 50-95), '60_35' is the alternate (Rate = (score/max)*35 + 60,
@@ -32,13 +49,37 @@ const itemRate = (score, maxScore, isRateDirect, formula = RATE_FORMULAS['50_45'
   return (s / m) * formula.range + formula.base;
 };
 
-// Composite (0–100ish) -> continuous GWA, clamped to the SSU 1.0–5.0 scale.
-// Exact — composite is never floored/truncated first, so this reads the
-// real computed composite, not one already thrown off by an earlier
-// rounding step.
-const compositeToGWA = (composite) => {
-  const gwa = 10.5 - 0.1 * composite;
+// Grade equivalent of a WHOLE-NUMBER term/overall grade, clamped to the SSU
+// 1.0–5.0 scale: 95+ → 1.0, 79 → 2.6, 75 → 3.0, 74 → 3.1, 55- → 5.0.
+// (105 − grade) / 10 rather than 10.5 − 0.1 × grade so a whole grade gives
+// an exact one-decimal equivalent. Mirrors classRecordExcel.js on the
+// frontend — keep the two in sync.
+const compositeToGWA = (grade) => {
+  const gwa = (105 - grade) / 10;
   return Math.min(5.0, Math.max(1.0, gwa));
+};
+
+// A composite rounded off to a whole number (half up) — the Term Grade /
+// Overall Grade exactly as the Class Record shows it. Epsilon only cleans
+// up floating-point noise (a true 79.5 stored as 79.49999999999999).
+const roundGrade = (composite) => Math.round(composite + 1e-9);
+
+// A period's own GWA (Grade.midterm / Grade.finals) — the equivalent of its
+// whole-number Term Grade.
+const toGWA = (composite) => compositeToGWA(roundGrade(composite));
+
+// Grade.average / Passed-Failed — the equivalent of the whole-number Overall
+// Grade: the TRUE average of both periods' exact composites, rounded ONCE
+// at the end (never each Term Grade first, which could push the Overall
+// Grade a point off). Matches the Class Record's own
+// Overall Grade / Final Grade columns (classRecordExcel.js's
+// overallComposite). NOT an average of the two already-clamped period GWAs
+// (what Grade.js's beforeSave hook falls back to for manual-entry classes) —
+// combining the grades first and clamping once avoids a Midterm of 96
+// clamping its own GWA to 1.0 before ever being averaged.
+const combinedGWA = (midComposite, finComposite) => {
+  if (midComposite === null || midComposite === undefined || finComposite === null || finComposite === undefined) return null;
+  return toGWA((midComposite + finComposite) / 2);
 };
 
 // A student may only view their own class record, and only once their instructor
@@ -95,6 +136,9 @@ const saveComponents = asyncHandler(async (req, res) => {
   if (actsAsInstructor(req.user) && cls.instructor_id !== req.user.id) {
     return res.status(403).json({ message: 'Access denied.' });
   }
+  // An archived class's class record is kept as it is — no setup changes.
+  const archivedMsg = await require('../utils/archiveGuard').archivedClassMessage(cls);
+  if (archivedMsg) return res.status(400).json({ message: archivedMsg });
 
   // Which Rate scale this class's Class Record uses — set here from Grade
   // Component Setup's own selector. Optional in the request body so any
@@ -275,7 +319,24 @@ const saveScores = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'Access denied.' });
   }
 
-  if (cls.class_record_locked) {
+  // A class that already went through the pipeline (submitted to the
+  // Chairperson, released, or archived with its semester) is closed for
+  // editing — EXCEPT its students still marked INC, whose missing scores the
+  // faculty can still enter (Resolve INC: one student, lock:false). Nobody
+  // else's scores or grades can be touched on that path.
+  const closedMsg = await closedClassMessage(cls);
+  let incOnlyStudents = null;
+  if (closedMsg) {
+    const ids = Object.keys(scores || {}).map((id) => parseInt(id, 10)).filter(Boolean);
+    const theirGrades = ids.length ? await Grade.findAll({ where: { class_id: cls.id, student_id: ids } }) : [];
+    // INC, or INC just reopened by Resolve INC (undoINC → Pending, unsubmitted).
+    const completing = (g) => g.status === 'INC' || (g.status === 'Pending' && !g.submitted);
+    const allIncomplete = ids.length > 0 && lock === false && ids.every((id) => theirGrades.some((g) => g.student_id === id && completing(g)));
+    if (!allIncomplete) {
+      return res.status(400).json({ message: `${closedMsg} Only students marked INC can still be completed — use "Resolve INC" on that student.` });
+    }
+    incOnlyStudents = new Set(ids);
+  } else if (cls.class_record_locked) {
     return res.status(400).json({ message: 'The Class Record is locked. Click "Edit Scores" to unlock it before making changes.' });
   }
 
@@ -376,33 +437,29 @@ const saveScores = asyncHandler(async (req, res) => {
 
   for (const enrollment of enrollments) {
     const sid = enrollment.student_id;
+    // Completing an INC in a closed class recomputes that student only —
+    // everyone else's submitted / released grade is left exactly as it is.
+    if (incOnlyStudents && !incOnlyStudents.has(sid)) continue;
 
     let midtermGWA = null;
     let finalsGWA = null;
-    // GWA is reported to 1 decimal place school-wide (per the Registrar's own
-    // instruction) — matches classRecordExcel.js's periodGWA on the frontend,
-    // so the live grid,
-    // the exports, and this stored value never disagree. Both Grade.midterm
-    // and Grade.finals are each period's OWN GWA, graded
-    // in isolation — this is deliberately NOT the course's cumulative Final
-    // Grade (see classRecordExcel.js's finalGWA): the Class Record's own
-    // "Final Grade" column is computed live from BOTH periods' composites
-    // combined and never reads this stored field at all (ClassRecordView.js/
-    // GradeEncoding.js), while the Grade Sheet's "Average" is deliberately
-    // the simple (Grade.midterm + Grade.finals) / 2 of these two isolated
-    // per-period numbers — a different, simpler figure the Grade Sheet asks
-    // for on purpose. Storing the cumulative Final Grade in Grade.finals
-    // instead would silently break that Grade Sheet average by double-
-    // blending Midterm into an already-cumulative number.
-    const toGWA = (composite) => Math.round(compositeToGWA(composite) * 10) / 10;
+    let midComposite = null;
+    let finComposite = null;
+    // toGWA (top of file) matches classRecordExcel.js's periodGWA on the
+    // frontend, so the live grid, the exports, and this stored value never
+    // disagree. Both Grade.midterm and Grade.finals are each period's OWN
+    // GWA, graded in isolation — kept that way since the Grade Sheet's
+    // Midterm/Final Term Grade columns are still each period's own figure.
+    // Grade.average (below) is the different, cumulative one — see
+    // combinedGWA.
 
     if (midtermComps.length > 0) {
-      const composite = computePeriodComposite(midtermComps, sid);
-      if (composite !== null) midtermGWA = toGWA(composite);
+      midComposite = computePeriodComposite(midtermComps, sid);
+      if (midComposite !== null) midtermGWA = toGWA(midComposite);
     }
     if (finalsComps.length > 0) {
-      const composite = computePeriodComposite(finalsComps, sid);
-      if (composite !== null) finalsGWA = toGWA(composite);
+      finComposite = computePeriodComposite(finalsComps, sid);
+      if (finComposite !== null) finalsGWA = toGWA(finComposite);
     }
 
     if (midtermGWA !== null || finalsGWA !== null) {
@@ -419,8 +476,74 @@ const saveScores = asyncHandler(async (req, res) => {
         if (midtermGWA !== null) grade.midterm = midtermGWA;
         if (finalsGWA !== null) grade.finals = finalsGWA;
         grade.is_draft = true;
-        await grade.save();
       }
+
+      // Both periods complete (and not manually marked INC/DRP): work out
+      // Grade.average/status ourselves from the combined composites, and
+      // tell the model's beforeSave hook to leave it alone (skipAutoAverage)
+      // instead of immediately overwriting it with its own naive
+      // (midterm+finals)/2 of the two already-clamped GWAs above. Runs
+      // whether this row was just created or already existed, in case both
+      // periods happened to complete in the very same recompute.
+      let skipAutoAverage = false;
+      if (midComposite !== null && finComposite !== null && grade.status !== 'INC' && grade.status !== 'DRP') {
+        grade.average = combinedGWA(midComposite, finComposite);
+        // <=3.01, not 3.0 — matches the real official spreadsheet's own
+        // Remarks formula (IF(BU15<=3.01,"PASSED","FAILED")) exactly.
+        grade.status = grade.average >= 1.0 && grade.average <= 3.01 ? 'Passed' : 'Failed';
+        skipAutoAverage = true;
+      }
+
+      if (!created || skipAutoAverage) {
+        await grade.save({ skipAutoAverage });
+      }
+    }
+  }
+
+  // A student marked INC whose scores are now all in is complete — turn
+  // their stored grade back into a real one so it matches this Class Record.
+  await resolveCompletedINCs(parseInt(classId));
+
+  // In a closed class there is no "Submit Grades" left to click, so a
+  // completed INC grade is final the moment the faculty resolves it:
+  // submitted, carrying the class's existing approval, and — when the class's
+  // grades were already released — released to the student right away. No
+  // Admin step. (A class not released yet just rejoins the rest of the class:
+  // the Admin releases it with everyone else's.) An INC nobody resolves by
+  // its compliance deadline becomes 5.0 instead — utils/incLapse.js.
+  if (incOnlyStudents) {
+    const done = await Grade.findAll({ where: { class_id: cls.id, student_id: [...incOnlyStudents], status: ['Passed', 'Failed'], submitted: false } });
+    if (done.length) {
+      const approved = !!(cls.admin_class_record_approved && cls.admin_grade_sheet_approved);
+      const classReleased = (await Grade.count({ where: { class_id: cls.id, released: true } })) > 0;
+      const now = new Date();
+      await Grade.update(
+        { submitted: true, submitted_date: now, is_draft: false, admin_approved: approved, admin_approved_date: approved ? now : null, released: classReleased, released_date: classReleased ? now : null },
+        { where: { id: done.map((g) => g.id) } }
+      );
+      const label = `${cls.subject?.code || 'a class'}${cls.section ? ` ${cls.year_level || ''}-${cls.section}` : ''}`;
+      const students = await User.findAll({ where: { id: done.map((g) => g.student_id) }, attributes: ['id', 'name'] });
+      const names = students.map((u) => u.name).join(', ');
+      await logActivity(req.user.id, `completed the INC of ${names} in ${label} (${cls.semester})${classReleased ? ' — grade released to the student' : ''}`, 'Class', cls.id);
+      if (classReleased) {
+        const { createNotification } = require('./notificationController');
+        await Promise.all(done.map((g) => createNotification(req.app, {
+          userId: g.student_id,
+          title: 'INC Completed — Grade Released',
+          message: `Your INC in ${label} (${cls.semester}) was completed. Your final grade is ${Number(g.average).toFixed(2)} (${g.status}).`,
+          type: 'grade',
+          link: '/student/grades',
+        })));
+        // Passing it may make them Regular again / clear a retake.
+        await require('../utils/enrollmentChecks').syncRegularity(req.app, done.map((g) => g.student_id), req.user.id).catch(() => {});
+      }
+      // The Admin is told, for the record — nothing for them to do.
+      await notifyAdmins(req.app, {
+        title: 'INC completed',
+        message: `${req.user.name} completed the INC of ${names} in ${label} (${cls.semester}).${classReleased ? ' The grade was released to the student automatically.' : ''}`,
+        type: 'grade',
+        link: '/admin',
+      });
     }
   }
 
@@ -434,9 +557,12 @@ const saveScores = asyncHandler(async (req, res) => {
 
   await logActivity(req.user.id, `saved component scores for ${cls.subject?.code}`, 'Class', classId);
 
+  // An explicit save (not a keystroke autosave) — Chairperson and Admin
+  // dashboards show each class's encoding progress, so they hear about it
+  // too ('pipeline' reaches them and drops the cached dashboard numbers).
   const io = req.app.get('io');
   if (io) {
-    io.emit('gradesUpdated', { class_id: parseInt(classId), message: 'Component scores updated' });
+    emitGradesUpdated(io, { class_id: parseInt(classId), message: 'Component scores saved' }, 'pipeline');
   }
 
   res.json({ message: 'Scores saved and grades computed.' });
@@ -455,6 +581,11 @@ const unlockScores = asyncHandler(async (req, res) => {
   if (actsAsInstructor(req.user) && cls.instructor_id !== req.user.id) {
     return res.status(403).json({ message: 'Access denied.' });
   }
+  // A closed class is never reopened as a whole — only its INC students.
+  const closedMsg = await closedClassMessage(cls);
+  if (closedMsg) {
+    return res.status(400).json({ message: `${closedMsg} Only students marked INC can still be completed — use "Resolve INC" on that student.` });
+  }
 
   cls.class_record_locked = false;
   await cls.save();
@@ -463,7 +594,7 @@ const unlockScores = asyncHandler(async (req, res) => {
 
   const io = req.app.get('io');
   if (io) {
-    io.emit('gradesUpdated', { class_id: parseInt(classId), message: 'Class Record unlocked' });
+    emitGradesUpdated(io, { class_id: parseInt(classId), message: 'Class Record unlocked' }, 'pipeline');
   }
 
   res.json({ message: 'Class Record unlocked — you can edit scores again.' });
@@ -487,6 +618,9 @@ const resetClassGrades = asyncHandler(async (req, res) => {
   if (actsAsInstructor(req.user) && cls.instructor_id !== req.user.id) {
     return res.status(403).json({ message: 'Access denied.' });
   }
+  // Never on an archived class — its scores and grades are a kept record.
+  const archivedMsg = await require('../utils/archiveGuard').archivedClassMessage(cls);
+  if (archivedMsg) return res.status(400).json({ message: archivedMsg });
 
   const components = await GradeComponent.findAll({
     where: { class_id: classId },
@@ -509,6 +643,10 @@ const resetClassGrades = asyncHandler(async (req, res) => {
       inc_remarks: null,
       inc_deadline: null,
       inc_resolved_date: null,
+      inc_lapsed_at: null,
+      inc_lapsed_period: null,
+      inc_midterm: false,
+      inc_finals: false,
       submitted: false,
       submitted_date: null,
       is_draft: true,
@@ -541,11 +679,156 @@ const resetClassGrades = asyncHandler(async (req, res) => {
 
   const io = req.app.get('io');
   if (io) {
-    io.emit('gradesUpdated', { class_id: parseInt(classId), message: 'Grades reset' });
+    emitGradesUpdated(io, { class_id: parseInt(classId), message: 'Grades reset' }, 'pipeline');
   }
 
   res.json({ message: 'Grades and scores cleared — you can start encoding again.' });
 });
+
+// ================= AUTO-COMPLETE INC =================
+// The Class Record is the source of truth: a student still marked INC whose
+// scores are now ALL in (every item of every Midterm and Finals component) is
+// not incomplete anymore, so the stored grade has to say so — otherwise the
+// Grade Sheet, its exports, and the Chairperson/Admin views keep showing INC
+// for a student the Class Record already shows as complete.
+//
+// Turns the grade back into a normal, computed one exactly the way undoINC +
+// a score save would (status -> Pending, then the Grade model's own hook
+// works out average/Passed/Failed from the two GWAs): unsubmitted so Faculty
+// resubmits it, and with release/approval cleared since the completed grade
+// hasn't been through either yet. Idempotent and a cheap no-op when the class
+// has no INC students. Returns how many were completed.
+const resolveCompletedINCs = async (classId) => {
+  const incGrades = await Grade.findAll({ where: { class_id: classId, status: 'INC' } });
+  if (incGrades.length === 0) return 0;
+
+  const cls = await Class.findByPk(classId);
+  if (!cls) return 0;
+  const rateFormula = getRateFormula(cls);
+
+  const components = await GradeComponent.findAll({
+    where: { class_id: classId },
+    include: [{ model: ComponentItem, as: 'items', separate: true }],
+  });
+  const midtermComps = components.filter((c) => c.period === 'Midterm');
+  const finalsComps = components.filter((c) => c.period === 'Finals');
+  // The overall average (and so Passed/Failed) needs both periods.
+  if (midtermComps.length === 0 || finalsComps.length === 0) return 0;
+
+  const itemIds = components.flatMap((c) => c.items.map((i) => i.id));
+  if (itemIds.length === 0) return 0;
+  const scores = await ComponentScore.findAll({
+    where: { item_id: itemIds, student_id: incGrades.map((g) => g.student_id) },
+  });
+  const scoreByStudentAndItem = {};
+  scores.forEach((s) => {
+    if (!scoreByStudentAndItem[s.student_id]) scoreByStudentAndItem[s.student_id] = {};
+    scoreByStudentAndItem[s.student_id][s.item_id] = s.score !== null ? parseFloat(s.score) : null;
+  });
+
+  // Same computation saveScores uses: null until every item in every
+  // component of the period has a score. Split into the raw composite and
+  // its GWA conversion (rather than one function returning just the GWA) so
+  // the raw composites are still around below to feed combinedGWA — same
+  // reason saveScores keeps midComposite/finComposite around.
+  const periodComposite = (periodComps, studentId) => {
+    const studentScores = scoreByStudentAndItem[studentId] || {};
+    let composite = 0;
+    for (const comp of periodComps) {
+      if (comp.items.length === 0) return null;
+      if (!comp.items.every((i) => studentScores[i.id] !== null && studentScores[i.id] !== undefined)) return null;
+      const rates = comp.items.map((i) => itemRate(studentScores[i.id], i.max_score, i.is_rate_direct, rateFormula));
+      composite += (rates.reduce((s, r) => s + r, 0) / rates.length) * (parseFloat(comp.weight) / 100);
+    }
+    return composite;
+  };
+  // Faculty can mark a period INC even when its scores are already all in
+  // (Mark INC is never blocked), so "scores are complete" alone can't mean the
+  // INC is done — that would clear it the instant it was marked. A flagged
+  // period only auto-clears when its scores were entered AFTER it was marked
+  // (the mark stamps submitted_date), i.e. the student actually completed it.
+  const periodOfItem = {};
+  components.forEach((c) => c.items.forEach((i) => { periodOfItem[i.id] = c.period; }));
+  const latestScoreAt = {};
+  scores.forEach((s) => {
+    const key = `${s.student_id}|${periodOfItem[s.item_id]}`;
+    const t = new Date(s.updatedAt).getTime();
+    if (!latestScoreAt[key] || t > latestScoreAt[key]) latestScoreAt[key] = t;
+  });
+  const enteredAfterMark = (grade, period) => {
+    const markedAt = grade.submitted_date ? new Date(grade.submitted_date).getTime() : 0;
+    return (latestScoreAt[`${grade.student_id}|${period}`] || 0) > markedAt;
+  };
+
+  // INC is per period (Grade.inc_midterm / inc_finals): each flagged period
+  // clears on its own once ITS scores are all in, and the student only stops
+  // being INC when no period is flagged anymore. A row from before the flags
+  // existed (INC, neither set) counts as flagged in both.
+  let completed = 0;
+  for (const grade of incGrades) {
+    const midComposite = periodComposite(midtermComps, grade.student_id);
+    const finComposite = periodComposite(finalsComps, grade.student_id);
+    const midterm = midComposite !== null ? toGWA(midComposite) : null;
+    const finals = finComposite !== null ? toGWA(finComposite) : null;
+    const legacy = !grade.inc_midterm && !grade.inc_finals;
+    let incMid = grade.inc_midterm;
+    let incFin = grade.inc_finals;
+
+    let changed = false;
+    if (legacy) {
+      // A row marked INC before the per-period flags existed doesn't say which
+      // period it was for, and reading it as "both" is what made the Finals
+      // show INC when only the Midterm was ever marked. Settle it once, here:
+      // INC in the earliest period still missing scores (a fully scored one
+      // isn't INC at all and resolves below).
+      incMid = midterm === null;
+      incFin = midterm !== null && finals === null;
+      changed = true;
+      // (Neither period incomplete = a fully scored row from the old flow —
+      // resolves below like before.)
+    } else {
+      if (incMid && midterm !== null && enteredAfterMark(grade, 'Midterm')) { incMid = false; changed = true; }
+      if (incFin && finals !== null && enteredAfterMark(grade, 'Finals')) { incFin = false; changed = true; }
+    }
+    if (!changed) continue;
+
+    // The Class Record is the truth — keep any completed period's GWA stored.
+    if (midterm !== null) grade.midterm = midterm;
+    if (finals !== null) grade.finals = finals;
+    grade.inc_midterm = incMid;
+    grade.inc_finals = incFin;
+
+    if (!incMid && !incFin) {
+      grade.status = 'Pending'; // not INC anymore — the beforeSave hook computes average + Passed/Failed once both GWAs exist
+      grade.submitted = false;
+      grade.submitted_date = null;
+      grade.is_draft = true;
+      grade.released = false;
+      grade.released_date = null;
+      grade.admin_approved = false;
+      grade.admin_approved_date = null;
+      grade.inc_remarks = null;
+      grade.inc_deadline = null;
+      grade.inc_resolved_date = new Date();
+      completed += 1;
+    }
+
+    // Both periods complete (this resolve or an earlier one) and not INC/DRP
+    // anymore: work out Grade.average/status from the combined composites
+    // ourselves — same reasoning as saveScores' own combinedGWA call.
+    let skipAutoAverage = false;
+    if (midComposite !== null && finComposite !== null && grade.status !== 'INC' && grade.status !== 'DRP') {
+      grade.average = combinedGWA(midComposite, finComposite);
+      // <=3.01, not 3.0 — matches the real official spreadsheet's own
+      // Remarks formula exactly.
+      grade.status = grade.average >= 1.0 && grade.average <= 3.01 ? 'Passed' : 'Failed';
+      skipAutoAverage = true;
+    }
+
+    await grade.save({ skipAutoAverage });
+  }
+  return completed;
+};
 
 module.exports = {
   getComponents,
@@ -554,6 +837,9 @@ module.exports = {
   saveScores,
   unlockScores,
   resetClassGrades,
+  resolveCompletedINCs,
   itemRate,
   compositeToGWA,
+  toGWA,
+  combinedGWA,
 };

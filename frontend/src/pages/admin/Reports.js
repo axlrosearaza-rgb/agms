@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react';
-import { Icons, Badge, LoadingSpinner, ProgramBadge } from '../../components/common';
+import { Icons, Badge, LoadingSpinner, ProgramBadge, formatPersonName } from '../../components/common';
 import { reportService } from '../../services';
 import toast from 'react-hot-toast';
 import { useAuth } from '../../context/AuthContext';
-import { exportGradesMonitoringFormDocx } from '../../utils/gradesMonitoringFormDocx';
+import { exportGradesMonitoringFormDocx, withFacultySpans } from '../../utils/gradesMonitoringFormDocx';
 
 export default function Reports() {
   const { user } = useAuth();
@@ -109,9 +109,15 @@ export default function Reports() {
                       </tr>
                     </thead>
                     <tbody>
-                      {p.class_breakdown.map((c) => (
+                      {/* On screen: "Surname, First M.", alphabetical. A
+                          faculty member with several classes is named once,
+                          spanning all their rows. The exported form keeps its
+                          own First M. Surname order. */}
+                      {withFacultySpans(p.class_breakdown).map(({ c, span }) => (
                         <tr key={c.class_id} className="border-b border-gray-50">
-                          <td className="px-4 py-2.5">{c.instructor_name || '—'}</td>
+                          {span > 0 && (
+                            <td className="px-4 py-2.5 align-top" rowSpan={span}>{c.instructor_name ? formatPersonName(c.instructor_name) : '—'}</td>
+                          )}
                           <td className="px-2 py-2.5">
                             <span className="font-semibold">{c.subject_code}</span>
                             <span className="text-gray-400"> — {c.subject_name}</span>

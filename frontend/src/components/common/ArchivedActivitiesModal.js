@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { dashboardService } from '../../services';
-import { Avatar, Badge, LoadingSpinner, Modal } from '../common';
+import { Avatar, Badge, LoadingSpinner, Modal, ClearSearchButton } from '../common';
 
 // Shared by the Admin Dashboard's "View Archived" (Activity + Login History)
 // and the Chairperson Dashboard's own Activity Log — all three are the same
@@ -61,13 +61,16 @@ export default function ArchivedActivitiesModal({ onClose, action, title = 'Arch
       <p className="text-xs text-gray-500 -mt-2 mb-3">
         {action ? 'Logins' : 'Activity'} older than {windowLabel} — {total} record{total !== 1 ? 's' : ''} total.
       </p>
-      <input
-        type="text"
-        value={searchInput}
-        onChange={(e) => setSearchInput(e.target.value)}
-        placeholder="Search by name or action..."
-        className="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 mb-4 focus:outline-none focus:ring-2 focus:ring-navy/20 focus:border-navy"
-      />
+      <div className="relative mb-4">
+        <input
+          type="text"
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+          placeholder="Search by name or action..."
+          className="w-full text-sm border border-gray-200 rounded-lg pl-3 pr-9 py-2 focus:outline-none focus:ring-2 focus:ring-navy/20 focus:border-navy"
+        />
+        <ClearSearchButton value={searchInput} onClear={() => setSearchInput('')} />
+      </div>
       {loading ? (
         <LoadingSpinner />
       ) : rows.length === 0 ? (

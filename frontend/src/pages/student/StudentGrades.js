@@ -1,26 +1,28 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, AlignmentType, ShadingType, BorderStyle, VerticalAlign, ImageRun } from 'docx';
-import { saveAs } from 'file-saver';
+import { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, TableBorders, WidthType, AlignmentType, ShadingType, BorderStyle, VerticalAlign, ImageRun } from 'docx';
+import { docxBlobToPdf } from '../../utils/docxToPdf';
 import { useAuth } from '../../context/AuthContext';
-import { LoadingSpinner, ConfidentialityBanner, ProgramBadge, RegularityBadge, Modal, Icons, programShortLabel } from '../../components/common';
+import { LoadingSpinner, ConfidentialityBanner, ProgramBadge, RegularityBadge, Modal, Icons, programShortLabel, formatPersonName, formatPersonNameFirstLast, ClearSearchButton } from '../../components/common';
 import ProspectusTable from '../../components/student/ProspectusTable';
 import { exportEvaluationOfGradesDocx } from '../../utils/evaluationOfGradesDocx';
 import { gradeService, semesterService } from '../../services';
-import socket from '../../services/socket';
+import { onGradesUpdated } from '../../services/socket';
 import { usePageState } from '../../hooks/usePageState';
+import { formatGrade } from '../../utils/classRecordExcel';
+import { getSemesterFor, yearLabelOf } from '../../utils/semesterLabels';
 
 // ── Word export helpers ──────────────────────────────────────────────────────
-const CELL_BORDER = { style: BorderStyle.SINGLE, size: 4, color: '999999' };
+const CELL_BORDER = { style: BorderStyle?.SINGLE || 'single', size: 4, color: '999999' };
 const CELL_BORDERS = { top: CELL_BORDER, bottom: CELL_BORDER, left: CELL_BORDER, right: CELL_BORDER };
 const HEADER_SHADE = 'F3F4F6';
 
-function cell(text, { bold = false, shade = null, rowSpan, columnSpan, align = AlignmentType.CENTER, color } = {}) {
+function cell(text, { bold = false, shade = null, rowSpan, columnSpan, align = (AlignmentType?.CENTER || 'center'), color } = {}) {
   return new TableCell({
     rowSpan,
     columnSpan,
     borders: CELL_BORDERS,
-    verticalAlign: VerticalAlign.CENTER,
-    shading: shade ? { fill: shade, type: ShadingType.CLEAR } : undefined,
+    verticalAlign: VerticalAlign?.CENTER || 'center',
+    shading: shade ? { fill: shade, type: ShadingType?.CLEAR || 'clear' } : undefined,
     children: [new Paragraph({ alignment: align, children: [new TextRun({ text: String(text ?? ''), bold, size: 18, color })] })],
   });
 }
@@ -58,8 +60,7 @@ export default function StudentGrades() {
   useEffect(() => { fetchProspectus(); }, [fetchProspectus]);
 
   useEffect(() => {
-    socket.on('gradesUpdated', () => fetchProspectus());
-    return () => socket.off('gradesUpdated');
+    return onGradesUpdated(() => fetchProspectus());
   }, [fetchProspectus]);
 
   // Grade Slip — a per-semester export (unlike Evaluation of Grades above,
@@ -112,13 +113,39 @@ export default function StudentGrades() {
           fetch('/assets/logos/ssu-logo.png').then((r) => r.arrayBuffer()),
           fetch('/assets/logos/cas-logo.png').then((r) => r.arrayBuffer()),
         ]);
-        children.push(new Paragraph({
-          alignment: AlignmentType.CENTER,
-          children: [
-            new ImageRun({ type: 'png', data: sealBuf, transformation: { width: 60, height: 60 } }),
-            new TextRun({ text: '   ' }),
-            new ImageRun({ type: 'png', data: casBuf, transformation: { width: 60, height: 60 } }),
-          ],
+        // A plain inline Paragraph (two ImageRuns either side of a literal
+        // "   " TextRun) used to place both seals — but inline images
+        // anchor to the surrounding text's baseline, not to each other, so
+        // two DIFFERENT-height images (60 vs 56, see below) never actually
+        // landed level with each other, and the gap between them was just
+        // however wide three space characters happened to render. A
+        // borderless one-row, two-cell table sidesteps both problems: each
+        // cell's own `verticalAlign: CENTER` centers its image within the
+        // shared row height regardless of the two images' own differing
+        // sizes, and the gap is the two cells meeting in the middle of a
+        // fixed-width table instead of font-dependent whitespace.
+        const sealCell = (imageRun, align) => new TableCell({
+          width: { size: 50, type: WidthType?.PERCENTAGE || 'pct' },
+          verticalAlign: VerticalAlign?.CENTER || 'center',
+          children: [new Paragraph({ alignment: align, children: [imageRun] })],
+        });
+        children.push(new Table({
+          width: { size: 40, type: WidthType?.PERCENTAGE || 'pct' },
+          alignment: AlignmentType?.CENTER || 'center',
+          borders: TableBorders?.NONE || { top: { style: 'none' }, bottom: { style: 'none' }, left: { style: 'none' }, right: { style: 'none' } },
+          rows: [new TableRow({
+            children: [
+              sealCell(new ImageRun({ type: 'png', data: sealBuf, transformation: { width: 60, height: 60 } }), AlignmentType?.RIGHT || 'right'),
+              // Same box height as the SSU seal (60), but a hair narrower —
+              // ssu-logo.png's own seal fills ~92% of its transparent canvas
+              // while cas-logo.png's fills ~99% of its (see RegisterPage's
+              // own measurement of the same two files), so an identical
+              // 60x60 box for both reads as CAS being visibly the bigger
+              // seal. 56 makes the two seals' own visible diameters — not
+              // just their boxes — come out the same.
+              sealCell(new ImageRun({ type: 'png', data: casBuf, transformation: { width: 56, height: 56 } }), AlignmentType.LEFT),
+            ],
+          })],
         }));
       } catch (imgErr) {
         console.error('Seal image(s) failed to load — continuing without them:', imgErr);
@@ -126,7 +153,7 @@ export default function StudentGrades() {
       children.push(new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: 'SAMAR STATE UNIVERSITY', bold: true, size: 28 })] }));
       children.push(new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: 'Arteche Blvd., Catbalogan City, Philippines 6700', size: 18 })] }));
       children.push(new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: 'College of Arts and Sciences', size: 18 })] }));
-      children.push(headingParagraph('OFFICIAL GRADE SLIP', { size: 30, spacingBefore: 300 }));
+      children.push(headingParagraph('GRADE SLIP', { size: 30, spacingBefore: 300 }));
 
       // Each field its own line (not paired up via tabs). Year Level prefers
       // the actual CLASS's own year_level for this term over the student's
@@ -151,12 +178,13 @@ export default function StudentGrades() {
           new TextRun({ text: value, size: 20 }),
         ],
       }));
-      infoField('NAME', (student.name || '').toUpperCase());
+      infoField('NAME', formatPersonName(student.name).toUpperCase());
       infoField('STUDENT ID NUMBER', student.student_no || '—');
       infoField('YEAR LEVEL', firstClass?.year_level ? `Year ${firstClass.year_level}` : (student.year_level ? `Year ${student.year_level}` : '—'));
       infoField('SECTION', firstClass?.section || student.section || '—');
       infoField('SEMESTER', semesterName);
-      infoField('ACADEMIC YEAR', academicYear, 200);
+      // "ACADEMIC YEAR" or "SCHOOL YEAR" — this semester's own label.
+      infoField(yearLabelOf(await getSemesterFor(slipSemester)).toUpperCase(), academicYear, 200);
 
       if (rows.length === 0) {
         children.push(new Paragraph({ children: [new TextRun({ text: 'No released grades for this semester yet.', italics: true, size: 20 })] }));
@@ -175,12 +203,12 @@ export default function StudentGrades() {
           children: [
             cell(r.class?.subject?.code || '—', { align: AlignmentType.LEFT }),
             cell(r.class?.subject?.name || '—', { align: AlignmentType.LEFT }),
-            cell(r.class?.instructor?.name || '—', { align: AlignmentType.LEFT }),
-            cell(r.grade?.average != null ? parseFloat(r.grade.average).toFixed(1) : '—', { bold: true }),
+            cell(formatPersonNameFirstLast(r.class?.instructor?.name) || '—', { align: AlignmentType.LEFT }),
+            cell(r.grade?.average != null ? formatGrade(r.grade.average) : '—', { bold: true }),
             cell(r.grade?.status || '—', { bold: true }),
           ],
         }));
-        children.push(new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows: [headerRow, ...dataRows] }));
+        children.push(new Table({ width: { size: 100, type: WidthType?.PERCENTAGE || 'pct' }, rows: [headerRow, ...dataRows] }));
       }
 
       // Signature — just the one space asked for, not the two-signatory
@@ -188,7 +216,7 @@ export default function StudentGrades() {
       // copy, not an official transcript).
       children.push(new Paragraph({ text: '', spacing: { before: 500 } }));
       children.push(new Paragraph({
-        border: { top: { style: BorderStyle.SINGLE, size: 4, color: '333333' } },
+        border: { top: { style: BorderStyle?.SINGLE || 'single', size: 4, color: '333333' } },
         // A paragraph border spans its full line width by default — the
         // whole page's content width, which read as a stray line running
         // edge to edge. Indenting both sides shrinks just the border (and
@@ -203,10 +231,10 @@ export default function StudentGrades() {
       const doc = new Document({ sections: [{ children }] });
       const blob = await Packer.toBlob(doc);
       const yearSuffix = slipYear === 'all' ? '' : `_Year${slipYear}`;
-      saveAs(blob, `${(student.student_no || student.name || 'GradeSlip').replace(/\s+/g, '_')}_GradeSlip_${slipSemester.replace(/\s+/g, '_')}${yearSuffix}.docx`);
+      await docxBlobToPdf(blob, `${(student.student_no || student.name || 'GradeSlip').replace(/\s+/g, '_')}_GradeSlip_${slipSemester.replace(/\s+/g, '_')}${yearSuffix}.pdf`);
       setShowSlipModal(false);
     } catch (err) {
-      console.error('Failed to export Grade Slip to Word:', err);
+      console.error('Failed to export Grade Slip to PDF:', err);
     } finally {
       setExportingSlip(false);
     }
@@ -221,7 +249,7 @@ export default function StudentGrades() {
     if (!data) return;
     setExporting(true);
     try {
-      await exportEvaluationOfGradesDocx({ student: data.student || user, years: data.years || {}, chairperson: data.chairperson });
+      await exportEvaluationOfGradesDocx({ student: data.student || user, years: data.years || {}, chairperson: data.chairperson, adviser: data.adviser, format: 'pdf' });
     } finally {
       setExporting(false);
     }
@@ -243,12 +271,15 @@ export default function StudentGrades() {
 
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-5 gap-3 no-print">
         <div>
-          <div className="flex items-center gap-2 flex-wrap">
-            <h2 className="text-lg font-bold text-navy">My Grades</h2>
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <h2 className="text-xl font-bold text-navy dark:text-sky-300">Prospectus</h2>
             <RegularityBadge status={user?.student_status} />
           </div>
-          <p className="text-[13px] text-gray-500 flex items-center gap-1.5 flex-wrap">
-            <ProgramBadge program={user?.program} bs /> · Prospectus{summary.gwa && <span className="ml-2 font-semibold text-navy">· GWA: {summary.gwa}</span>}
+          <p className="text-sm font-medium text-gray-600 dark:text-gray-300 mt-1 flex items-center gap-2 flex-wrap">
+            <span className="font-semibold text-gray-800 dark:text-gray-100">{user?.program || '—'}</span>
+            {summary.gwa && !data?.account_setup_pending && !(!student?.account_setup_at) && (
+              <span className="font-bold text-navy dark:text-sky-400">· GWA: {summary.gwa}</span>
+            )}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -257,7 +288,7 @@ export default function StudentGrades() {
             className="px-4 py-2 text-sm font-semibold rounded-lg cursor-pointer border-none font-sans text-white disabled:opacity-60"
             style={{ background: '#b8860b' }}
           >
-            Export Grade Slip (Word)
+            Export Grade Slip (PDF)
           </button>
           <button
             onClick={exportEvaluationOfGrades}
@@ -265,7 +296,7 @@ export default function StudentGrades() {
             className="px-4 py-2 text-sm font-semibold rounded-lg cursor-pointer border-none font-sans text-white disabled:opacity-60"
             style={{ background: '#1a3a5c' }}
           >
-            {exporting ? 'Exporting…' : 'Export Evaluation of Grades (Word)'}
+            {exporting ? 'Exporting…' : 'Export Evaluation of Grades (PDF)'}
           </button>
         </div>
       </div>
@@ -274,15 +305,28 @@ export default function StudentGrades() {
         <ConfidentialityBanner />
       </div>
 
+      {(data?.account_setup_pending || !student?.account_setup_at) && (
+        <div className="mb-5 p-4 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-xl text-sm text-amber-800 dark:text-amber-300 flex items-center gap-3 no-print">
+          <Icons.AlertCircle className="w-5 h-5 flex-shrink-0 text-amber-600 dark:text-amber-400" />
+          <div>
+            <p className="font-bold">Account Setup Incomplete</p>
+            <p className="text-xs mt-0.5">Your account setup has not been completed. Grades will become visible once you finish setting up your account (change password and verify email).</p>
+          </div>
+        </div>
+      )}
+
       {/* Search */}
       <div className="flex flex-wrap gap-3 mb-5 no-print">
-        <input
-          type="text"
-          placeholder="Search subject by code or name..."
-          className="form-input text-sm flex-1 min-w-[240px]"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
+        <div className="relative flex-1 min-w-[240px]">
+          <input
+            type="text"
+            placeholder="Search subject by code or name..."
+            className="form-input text-sm w-full pr-9"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <ClearSearchButton value={search} onClear={() => setSearch('')} />
+        </div>
       </div>
 
       {/* Summary Cards */}
@@ -339,13 +383,15 @@ export default function StudentGrades() {
         <p style={{ textAlign: 'center', fontSize: 11, margin: '0 0 16px' }}>Revised 2023</p>
 
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 20 }}>
-          <p style={{ margin: 0 }}><b style={{ textDecoration: 'underline' }}>NAME:</b> <span style={{ textDecoration: 'underline' }}>{student.name?.toUpperCase()}</span></p>
+          <p style={{ margin: 0 }}><b style={{ textDecoration: 'underline' }}>NAME:</b> <span style={{ textDecoration: 'underline' }}>{formatPersonName(student.name).toUpperCase()}</span></p>
           <p style={{ margin: 0, fontWeight: 700, textDecoration: 'underline' }}>{student.student_no}</p>
         </div>
 
         <ProspectusTable years={data?.years || {}} studentId={user.id} search={search} collapsible={false} />
 
-        {/* Matches the Word export exactly: Evaluated By (Adviser, blank)
+        {/* Matches the Word export exactly: Evaluated By (the student's
+            adviser — the Faculty member assigned to their Program / Year /
+            Section, blank until one is)
             and Noted By (the named Dean signatory) side by side with a
             visible gap, then Verified By (the student's own program's
             actual Chairperson, looked up server-side) on its own row
@@ -353,19 +399,21 @@ export default function StudentGrades() {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 40, fontSize: 12, marginTop: 50 }}>
           <div>
             <p style={{ margin: '0 0 24px', fontWeight: 700 }}>Evaluated By:</p>
-            <p style={{ borderTop: '1px solid #333', paddingTop: 4, margin: 0, fontWeight: 700, minHeight: '1em' }}>&nbsp;</p>
+            <p style={{ display: 'inline-block', borderBottom: '1px solid #333', padding: '0 16px 3px 0', minWidth: 240, margin: 0, fontWeight: 700, minHeight: '1em' }}>
+              {data?.adviser?.name ? formatPersonNameFirstLast(data.adviser.name).toUpperCase() : ' '}
+            </p>
             <p style={{ fontSize: 10, margin: '4px 0 0' }}>Adviser</p>
           </div>
           <div>
             <p style={{ margin: '0 0 24px', fontWeight: 700 }}>Noted By:</p>
-            <p style={{ borderTop: '1px solid #333', paddingTop: 4, margin: 0, fontWeight: 700 }}>SWEET MERCY F. PACOLOR, DIT</p>
+            <p style={{ display: 'inline-block', borderBottom: '1px solid #333', padding: '0 16px 3px 0', minWidth: 240, margin: 0, fontWeight: 700, minHeight: '1em' }}>SWEET MERCY F. PACOLOR, DIT</p>
             <p style={{ fontSize: 10, margin: '4px 0 0' }}>Dean, College of Arts and Sciences</p>
           </div>
         </div>
 
         <div style={{ fontSize: 12, marginTop: 36 }}>
           <p style={{ margin: '0 0 24px', fontWeight: 700 }}>Verified By:</p>
-          <p style={{ borderTop: '1px solid #333', paddingTop: 4, margin: 0, fontWeight: 700, maxWidth: 260, minHeight: '1em' }}>{data?.chairperson?.name?.toUpperCase() || ' '}</p>
+          <p style={{ display: 'inline-block', borderBottom: '1px solid #333', padding: '0 16px 3px 0', minWidth: 240, margin: 0, fontWeight: 700, minHeight: '1em' }}>{data?.chairperson?.name ? formatPersonNameFirstLast(data.chairperson.name).toUpperCase() : ' '}</p>
           <p style={{ fontSize: 10, margin: '4px 0 0' }}>Chairperson{student.program ? `, ${programShortLabel(student.program)}` : ''}</p>
         </div>
 

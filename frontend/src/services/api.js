@@ -1,9 +1,17 @@
 import axios from 'axios';
 import { getToken, clearAuth } from './authStorage';
 
-// ✅ Base URL — uses Render backend in production, falls back to dynamic hostname for local dev
+// ✅ Base URL — prefers an explicit REACT_APP_API_URL (a real deployment,
+// where the frontend and backend live on different hosts/domains), but for
+// local/LAN development — where both run on this same machine — falls back
+// to whatever host the browser actually used to load this page. That makes
+// the app reachable from any device on any Wi-Fi network without ever
+// needing to hardcode/update an IP in .env again: load the page via
+// 192.168.x.x:3000 and it talks to 192.168.x.x:5000; load it via
+// localhost:3000 and it talks to localhost:5000 — it just follows whatever
+// address got you here.
 const API_BASE_URL =
-  process.env.REACT_APP_API_URL || `https://agms.onrender.com/api`;
+  process.env.REACT_APP_API_URL || `http://${window.location.hostname}:5000/api`;
 
 // ✅ Create axios instance
 const api = axios.create({
@@ -42,9 +50,11 @@ const LIVE_URL_PATTERNS = [
   '/chat/',
   '/notifications',
   'pending-approval-count',
-  '/users/pending',
-  '/verification-assignments/mine',
   '/dashboard/',
+  '/student-enrollment',
+  // The once-per-semester status pop-up must never come back from a cached
+  // "not declared yet" answer after the student has saved it.
+  '/account-setup',
 ];
 const isLiveUrl = (url = '') => LIVE_URL_PATTERNS.some((p) => url.includes(p));
 
@@ -87,9 +97,17 @@ api.interceptors.request.use(
 );
 
 // ✅ Global response handler and caching
+// Requests that change nothing a list would show (sign-in checks, read
+// receipts, chat, presence, look-ups) — they don't trigger a page refresh.
+const QUIET_CHANGE = /\/auth\/|\/notifications|\/chat|\/presence|check-student-nos|\/account-setup\/(password|email)/;
+
 api.interceptors.response.use(
   (response) => {
     const method = (response.config.method || 'get').toLowerCase();
+    // Something was saved → pages reload their lists (hooks/useAutoRefresh.js).
+    if (['post', 'put', 'patch', 'delete'].includes(method) && !QUIET_CHANGE.test(response.config.url || '') && typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('agms:data-changed'));
+    }
     if (method === 'get' && !response.config.skipCache && !isLiveUrl(response.config.url) && response.status === 200) {
       const cacheKey = `${response.config.url}?${JSON.stringify(response.config.params || {})}`;
       const ttl = response.config.cacheTTL || DEFAULT_CACHE_TTL_MS;

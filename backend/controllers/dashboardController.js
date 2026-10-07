@@ -2,6 +2,7 @@ const { User, Class, Grade, Subject, Enrollment, ActivityLog, Semester } = requi
 const { Op } = require('sequelize');
 const { sequelize } = require('../config/database');
 const { asyncHandler } = require('../middleware/errorHandler');
+const { encodingCounts, encodingFields } = require('../utils/encodingProgress');
 const { activityRetentionWhere, chairpersonActivityRetentionWhere } = require('../utils/activityLogger');
 
 const PROGRAMS = [
@@ -15,7 +16,7 @@ const PROGRAMS = [
 const getAdminDashboard = asyncHandler(async (req, res) => {
   const { semester } = req.query;
 
-  const totalStudents = await User.count({ where: { role: 'Student', status: 'Active' } });
+  const totalStudents = await User.count({ where: { role: 'Student', status: 'Active', graduated_at: null } });
   const totalFaculty = await User.count({ where: { role: 'Faculty', status: 'Active' } });
   const totalChairpersons = await User.count({ where: { role: 'Chairperson', status: 'Active' } });
   // Part-Time faculty aren't tied to any one program (tagged with all four
@@ -33,14 +34,19 @@ const getAdminDashboard = asyncHandler(async (req, res) => {
   // grades specifically, never Failed/INC/DRP, so filtering by it would
   // zero those three buckets out entirely regardless of real approval
   // status.)
+  // Only the three columns actually read below, as plain rows: this scans every
+  // approved grade in the system (tens of thousands), and building a full
+  // Sequelize model instance per row was most of this endpoint's runtime.
   const allGrades = await Grade.findAll({
     where: { submitted: true },
+    attributes: ['student_id', 'status', 'average'],
     include: [{
       model: Class,
       as: 'class',
       attributes: [],
       where: { admin_class_record_approved: true, admin_grade_sheet_approved: true },
     }],
+    raw: true,
   });
   const passRate = allGrades.length > 0
     ? Math.round((allGrades.filter((g) => g.status === 'Passed').length / allGrades.length) * 100)
@@ -90,13 +96,27 @@ const getAdminDashboard = asyncHandler(async (req, res) => {
   });
   const activeClassIds = activeClasses.map((c) => c.id);
   const gradesForActiveClasses = activeClassIds.length > 0
-    ? await Grade.findAll({ where: { class_id: activeClassIds }, attributes: ['class_id', 'submitted'] })
+    ? await Grade.findAll({ where: { class_id: activeClassIds }, attributes: ['class_id', 'submitted'], raw: true })
     : [];
   const gradesByClassId = {};
   gradesForActiveClasses.forEach((g) => {
     if (!gradesByClassId[g.class_id]) gradesByClassId[g.class_id] = [];
     gradesByClassId[g.class_id].push(g);
   });
+  // A Grade row is only ever created once a score is actually saved for that
+  // student (gradeComponentController.saveScores) — a student enrolled but
+  // never touched yet has no Grade row at all. Counting "total students" off
+  // Grade rows alone (clsGrades.length) undercounts a class that still has
+  // real, ungraded enrollees, so a class could read as 100% submitted while
+  // some of its actual roster was never graded in the first place. Enrollment
+  // is the real headcount — every student who's actually IN the class,
+  // graded yet or not — so `sent` below is checked against that instead
+  // (same fix as getChairpersonFacultyReview's own copy of this).
+  const enrollmentsForActiveClasses = activeClassIds.length > 0
+    ? await Enrollment.findAll({ where: { class_id: activeClassIds }, attributes: ['class_id'], raw: true })
+    : [];
+  const enrollmentCountByClassId = {};
+  enrollmentsForActiveClasses.forEach((e) => { enrollmentCountByClassId[e.class_id] = (enrollmentCountByClassId[e.class_id] || 0) + 1; });
   const submissionByProgramInstructor = {};
   activeClasses.forEach((cls) => {
     const instr = cls.instructor;
@@ -114,14 +134,15 @@ const getAdminDashboard = asyncHandler(async (req, res) => {
     }
     const clsGrades = gradesByClassId[cls.id] || [];
     const submittedCount = clsGrades.filter((g) => g.submitted).length;
+    const totalStudents = enrollmentCountByClassId[cls.id] || 0;
     submissionByProgramInstructor[key].classes.push({
       class_id: cls.id,
       subject_code: cls.subject?.code,
       section: cls.section,
       year_level: cls.year_level,
-      total_students: clsGrades.length,
+      total_students: totalStudents,
       submitted_count: submittedCount,
-      sent: clsGrades.length > 0 && submittedCount === clsGrades.length,
+      sent: totalStudents > 0 && submittedCount === totalStudents,
     });
   });
   const facultySubmissionStatus = Object.values(submissionByProgramInstructor).sort((a, b) =>
@@ -193,7 +214,7 @@ const getAdminDashboard = asyncHandler(async (req, res) => {
 
   // Students by department
   const studentsByDept = await User.findAll({
-    where: { role: 'Student', status: 'Active' },
+    where: { role: 'Student', status: 'Active', graduated_at: null },
     attributes: ['department', [sequelize.fn('COUNT', sequelize.col('id')), 'count']],
     group: ['department'],
     raw: true,
@@ -204,7 +225,7 @@ const getAdminDashboard = asyncHandler(async (req, res) => {
 
   // Per-program breakdown: enrolled students, faculty, active classes, pass rate, avg GWA
   const programBreakdown = await Promise.all(PROGRAMS.map(async (program) => {
-    const students = await User.count({ where: { role: 'Student', status: 'Active', program } });
+    const students = await User.count({ where: { role: 'Student', status: 'Active', graduated_at: null, program } });
     // Part-Time faculty are tagged with every program just so they're findable
     // from a single "Part-Time Faculty" list (see User Management) — they're
     // not really staffed to any one program, so counting them here too would
@@ -295,7 +316,7 @@ const getAdminAnalytics = asyncHandler(async (req, res) => {
 
   // Active students by program (bar)
   const programCounts = await User.findAll({
-    where: { role: 'Student', status: 'Active', program: { [Op.ne]: null } },
+    where: { role: 'Student', status: 'Active', graduated_at: null, program: { [Op.ne]: null } },
     attributes: ['program', [sequelize.fn('COUNT', sequelize.col('id')), 'count']],
     group: ['program'],
     raw: true,
@@ -425,6 +446,12 @@ const getAdminAnalytics = asyncHandler(async (req, res) => {
 // entry, not just promotion actions, moves into that role's own "View
 // Archived" the day after it happens. Admin's side of this same endpoint
 // (always called with archived=true, never without) is untouched.
+const CHAIRPERSON_HIDDEN_ACTIONS = [
+  'saved draft grades%',
+  'saved component scores%',
+  'unlocked the Class Record%',
+];
+
 const getActivities = asyncHandler(async (req, res) => {
   const { page = 1, limit = 20, archived, action, search } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -447,7 +474,31 @@ const getActivities = asyncHandler(async (req, res) => {
       attributes: ['id'],
     });
 
-    where.user_id = { [Op.in]: users.map((u) => u.id) };
+    // Cross-department teaching: a Faculty tagged for another program can
+    // teach a subject that belongs to this Chairperson's program, and their
+    // grade submission / grading sheet goes to THIS Chairperson (see
+    // reportController.notifyGradingSheetSent, matched on subject program).
+    // Their user account falls outside the program scope above, so also
+    // pull in every Class-level entry for classes in this Chairperson's own
+    // program(s), regardless of who performed it.
+    const classes = await Class.findAll({
+      include: [{ model: Subject, as: 'subject', where: { program: { [Op.in]: myPrograms } }, attributes: [] }],
+      attributes: ['id'],
+    });
+
+    where[Op.and] = [
+      ...(where[Op.and] || []),
+      {
+        [Op.or]: [
+          { user_id: { [Op.in]: users.map((u) => u.id) } },
+          { entity_type: 'Class', entity_id: { [Op.in]: classes.map((c) => c.id) } },
+        ],
+      },
+      // Routine draft work (saving drafts/scores, unlocking the Class Record
+      // to keep editing) isn't something the Chairperson needs to see —
+      // only the actual submissions and pipeline steps.
+      ...CHAIRPERSON_HIDDEN_ACTIONS.map((p) => ({ action: { [Op.notILike]: p } })),
+    ];
   }
 
   // Free-text search box on the Archived Activities modal — matches either
@@ -536,6 +587,19 @@ const getChairpersonFacultyReview = asyncHandler(async (req, res) => {
     if (!gradesByClass[g.class_id]) gradesByClass[g.class_id] = [];
     gradesByClass[g.class_id].push(g);
   });
+  // A Grade row is only ever created once a score is actually saved for that
+  // student (gradeComponentController.saveScores) — a student enrolled but
+  // never touched yet has no Grade row at all. Counting "total students" off
+  // Grade rows alone (clsGrades.length) undercounts a class that still has
+  // real, ungraded enrollees, so a class could read as 100% submitted while
+  // some of its actual roster was never graded in the first place. Enrollment
+  // is the real headcount — every student who's actually IN the class,
+  // graded yet or not — so `sent` below is checked against that instead.
+  const enrollments = classIds.length > 0 ? await Enrollment.findAll({ where: { class_id: classIds }, attributes: ['class_id'] }) : [];
+  const enrollmentCountByClass = {};
+  enrollments.forEach((e) => { enrollmentCountByClass[e.class_id] = (enrollmentCountByClass[e.class_id] || 0) + 1; });
+
+  const encodedByClass = await encodingCounts(classIds);
 
   const byInstructor = {};
   classes.forEach((cls) => {
@@ -548,6 +612,7 @@ const getChairpersonFacultyReview = asyncHandler(async (req, res) => {
 
     const clsGrades = gradesByClass[cls.id] || [];
     const submittedCount = clsGrades.filter((g) => g.submitted).length;
+    const totalStudents = enrollmentCountByClass[cls.id] || 0;
 
     byInstructor[inst.id].classes.push({
       class_id: cls.id,
@@ -556,9 +621,12 @@ const getChairpersonFacultyReview = asyncHandler(async (req, res) => {
       program: cls.subject?.program,
       year_level: cls.year_level,
       section: cls.section,
-      total_students: clsGrades.length,
+      total_students: totalStudents,
       submitted_count: submittedCount,
-      sent: clsGrades.length > 0 && submittedCount === clsGrades.length,
+      ...(() => { const e = encodingFields(encodedByClass.get(cls.id), totalStudents); return { ...e, progress: e.encoding_progress }; })(),
+      chairperson_verified: !!cls.chairperson_verified,
+      admin_approved: !!(cls.admin_class_record_approved && cls.admin_grade_sheet_approved),
+      sent: totalStudents > 0 && submittedCount === totalStudents,
       passed: clsGrades.filter((g) => g.status === 'Passed').length,
       inc: clsGrades.filter((g) => g.status === 'INC').length,
       dropped: clsGrades.filter((g) => g.status === 'DRP').length,

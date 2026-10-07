@@ -3,15 +3,13 @@ import api from './api';
 // ============ AUTH SERVICE ============
 export const authService = {
   login: (identifier, password) => api.post('/auth/login', { identifier, password }),
-  register: (data) => api.post('/auth/register', data),
-  verifyEmail: (student_no, code) => api.post('/auth/verify-email', { student_no, code }),
-  resendVerificationCode: (student_no) => api.post('/auth/resend-verification-code', { student_no }),
   getMe: () => api.get('/auth/me'),
   changeUsername: (data) => api.put('/auth/username', data),
   requestEmailChange: (data) => api.put('/auth/email/request', data),
   confirmEmailChange: (data) => api.put('/auth/email/confirm', data),
   verifyPassword: (password) => api.post('/auth/verify-password', { password }),
   changePassword: (data) => api.put('/auth/password', data),
+  setFirstPassword: (newPassword, confirmPassword) => api.post('/auth/first-password', { newPassword, confirmPassword }),
   acceptPrivacyPolicy: () => api.post('/auth/accept-privacy'),
   forgotPassword: (email) => api.post('/auth/forgot-password', { email }),
   resetPassword: (data) => api.post('/auth/reset-password', data),
@@ -21,10 +19,19 @@ export const authService = {
 export const userService = {
   getAll: (params) => api.get('/users', { params }),
   getById: (id) => api.get(`/users/${id}`),
-  getPending: () => api.get('/users/pending'),
+  getMyAdvisory: () => api.get('/users/my-advisory'),
+  updateAdvisee: (studentId, data) => api.put(`/users/my-advisory/students/${studentId}`, data),
+  // The adviser's own section class list (section = { program, year_level, section }).
+  importAdvisoryList: (section, students, rowOffset = 0) => api.post('/users/my-advisory/import', { ...section, students, row_offset: rowOffset }, { timeout: 5 * 60 * 1000 }),
+  setAdvisory: (id, data) => api.put(`/users/${id}/advisory`, data),
+  importAdvisories: (data) => api.post('/users/advisories/import', data),
   create: (data) => api.post('/users', data),
+  checkStudentNos: (studentNos, names = []) => api.post('/users/check-student-nos', { student_nos: studentNos, names }),
   update: (id, data) => api.put(`/users/${id}`, data),
-  delete: (id) => api.delete(`/users/${id}`),
+  getAdviserSummary: () => api.get('/users/advisers/summary'),
+  // Accounts are archived, never deleted.
+  archive: (id) => api.put(`/users/${id}/archive`),
+  restore: (id) => api.put(`/users/${id}/restore`),
   setRegularizationSubjects: (id, subjectIds) => api.put(`/users/${id}/regularization-subjects`, { subject_ids: subjectIds }),
   getPresence: (ids) => api.get('/users/presence', { params: { ids: ids.join(',') } }),
 };
@@ -35,7 +42,7 @@ export const subjectService = {
   getById: (id) => api.get(`/subjects/${id}`),
   create: (data) => api.post('/subjects', data),
   update: (id, data) => api.put(`/subjects/${id}`, data),
-  delete: (id) => api.delete(`/subjects/${id}`),
+  archive: (id, archived = true) => api.put(`/subjects/${id}/archive`, { archived }),
 };
 
 // ============ CLASS SERVICE ============
@@ -43,11 +50,16 @@ export const classService = {
   getAll: (params) => api.get('/classes', { params }),
   getById: (id) => api.get(`/classes/${id}`),
   getInstructorClasses: (instructorId, params) => api.get(`/classes/instructor/${instructorId}`, { params }),
+  getMyDisputes: () => api.get('/classes/disputes/mine'),
+  dismissDispute: (id) => api.post(`/classes/disputes/${id}/dismiss`),
   create: (data) => api.post('/classes', data),
   update: (id, data) => api.put(`/classes/${id}`, data),
   archive: (id, archived) => api.put(`/classes/${id}/archive`, { archived }),
-  delete: (id) => api.delete(`/classes/${id}`),
+  importClassList: (classId, students, rowOffset = 0) => api.post(`/classes/${classId}/import-class-list`, { students, row_offset: rowOffset }, { timeout: 5 * 60 * 1000 }),
   enroll: (id, studentIds) => api.post(`/classes/${id}/enroll`, { student_ids: studentIds }),
+  unenroll: (id, studentId) => api.delete(`/classes/${id}/students/${studentId}`),
+  // Students already in the system for one Program / Year / Section (their adviser's list).
+  getSectionStudents: (id, params) => api.get(`/classes/${id}/section-students`, { params }),
   getEligibleStudents: (id) => api.get(`/classes/${id}/eligible-students`),
   getPendingApprovalCount: () => api.get('/classes/pending-approval-count'),
 };
@@ -65,6 +77,8 @@ export const gradeService = {
   approveClass: (classId) => api.post(`/grades/class/${classId}/approve`),
   approveDocument: (classId, type) => api.post(`/grades/class/${classId}/approve-document`, { type }),
   releaseClass: (classId) => api.post(`/grades/class/${classId}/release`),
+  // Faculty's own still-INC students in already-released classes
+  getMyIncStudents: () => api.get('/grades/inc/mine'),
 };
 
 // ============ ENDORSEMENT SERVICE ============
@@ -92,7 +106,6 @@ export const semesterService = {
   getAll: (params) => api.get('/semesters', { params }),
   create: (data) => api.post('/semesters', data),
   update: (id, data) => api.put(`/semesters/${id}`, data),
-  delete: (id) => api.delete(`/semesters/${id}`),
   setCurrent: (id) => api.put(`/semesters/${id}/current`),
 };
 
@@ -111,9 +124,10 @@ export const reportService = {
 };
 
 // ============ PROMOTION SERVICE ============
+// Advisers promote their own section (My Advisory).
 export const promotionService = {
-  getHistory: () => api.get('/promotions/history'),
-  getOverview: () => api.get('/promotions/overview'),
+  evaluate: (params) => api.get('/promotions/evaluate', { params }),
+  promote: (data) => api.post('/promotions/promote', data),
 };
 
 // ============ CHAT SERVICE ============
@@ -144,13 +158,21 @@ export const notificationService = {
   delete: (id) => api.delete(`/notifications/${id}`),
 };
 
-// ============ VERIFICATION ASSIGNMENT SERVICE ============
-// Chairperson delegates a pending student's Approve/Reject decision to one or
-// more verifiers (Faculty, or another already-Active Student).
-export const verificationService = {
-  assign: (studentId, verifierIds) => api.post('/verification-assignments', { student_id: studentId, verifier_ids: verifierIds }),
-  unassign: (assignmentId) => api.delete(`/verification-assignments/${assignmentId}`),
-  getMine: () => api.get('/verification-assignments/mine'),
-  getMyCount: () => api.get('/verification-assignments/mine/count'),
-  decide: (studentId, status) => api.post(`/verification-assignments/${studentId}/decide`, { status }),
+
+// ============ STUDENT ACCOUNT SETUP (first login) ============
+export const accountSetupService = {
+  setPassword: (newPassword, confirmPassword) => api.post('/account-setup/password', { newPassword, confirmPassword }),
+  requestEmailCode: (email) => api.post('/account-setup/email/request', { email }),
+  confirmEmailCode: (code) => api.post('/account-setup/email/confirm', { code }),
+  getStatus: () => api.get('/account-setup/status'),
+  declareStatus: (student_status, student_type) => api.post('/account-setup/status', { student_status, student_type }),
+  getClassConfirmations: () => api.get('/account-setup/class-confirmations'),
+  getContacts: () => api.get('/account-setup/contacts'),
+  getRetakes: () => api.get('/account-setup/retakes'),
+  answerClassConfirmation: (enrollmentId, answer) => api.post(`/account-setup/class-confirmations/${enrollmentId}`, { answer }),
+};
+
+// ============ STUDENT: MY CLASSES THIS SEMESTER (from faculty class lists) ============
+export const studentEnrollmentService = {
+  getMine: () => api.get('/student-enrollment'),
 };

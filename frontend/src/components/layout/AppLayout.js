@@ -1,11 +1,17 @@
   import { useState, useEffect, useCallback, useRef } from 'react';
   import { Link, useLocation, useNavigate } from 'react-router-dom';
   import { useAuth } from '../../context/AuthContext';
+  import { useTheme } from '../../context/ThemeContext';
   import { Avatar, Icons, roleLabel, ConfirmDialog } from '../common';
   import PrivacyConsentModal from '../common/PrivacyConsentModal';
+  import AccountSetupWizard from '../student/AccountSetupWizard';
+  import StatusDeclarationModal from '../student/StatusDeclarationModal';
+  import ClassConfirmationModal from '../student/ClassConfirmationModal';
+  import FirstPasswordModal from '../auth/FirstPasswordModal';
   import Footer from '../common/Footer';
-  import { notificationService, userService, classService, chatService, verificationService, authService } from '../../services';
-  import socket from '../../services/socket';
+  import { notificationService, classService, chatService, authService, accountSetupService } from '../../services';
+  import socket, { onGradesUpdated } from '../../services/socket';
+  import API from '../../services/api';
   import { playNotificationSound } from '../../utils/notificationSound';
   import { getLastActivity, markActivity, isLockedState, setLockedState } from '../../services/authStorage';
 
@@ -17,16 +23,69 @@
   };
 
   export default function AppLayout({ children, navItems }) {
-    const { user, logout, needsPrivacyConsent, acceptPrivacyPolicy } = useAuth();
+    const { user, logout, needsPrivacyConsent, acceptPrivacyPolicy, updateUser } = useAuth();
+    const { isDark, toggleTheme } = useTheme();
+    const needsAccountSetup = user?.role === 'Student' && !user?.account_setup_at;
+    const needsFirstPassword = !!user && ['Faculty', 'Chairperson', 'Admin'].includes(user.role) && !user.password_changed_at;
+    // After setup (and the Privacy Notice), a student declares Regular/Irregular
+    // + student type once per semester — checked with the server on load.
+    const [statusDeclaration, setStatusDeclaration] = useState(null);
+    const checkStatus = user?.role === 'Student' && !!user?.account_setup_at && !needsPrivacyConsent;
+    useEffect(() => {
+      if (!checkStatus) return;
+      accountSetupService.getStatus().then(({ data }) => setStatusDeclaration(data)).catch(() => {});
+    }, [checkStatus, user?.id]);
+    // Classes the student was put in outside their own Year + Section — they
+    // confirm each one ("Is this your class?"). Re-checked on a new
+    // notification, since a faculty may add them while they're signed in.
+    const [classConfirmations, setClassConfirmations] = useState([]);
+    useEffect(() => {
+      if (!checkStatus) return undefined;
+      const load = () => accountSetupService.getClassConfirmations().then(({ data }) => setClassConfirmations(data.pending || [])).catch(() => {});
+      load();
+      socket.on('notification:new', load);
+      return () => socket.off('notification:new', load);
+    }, [checkStatus, user?.id]);
     const location = useLocation();
     const navigate = useNavigate();
-    const INACTIVITY_LOCK_MS = 5 * 60 * 1000;
+    // Staff choose their own idle lock time in Settings (User.idle_lock_minutes):
+    // unset = 5 minutes, 0 = never lock.
+    const idleLockMinutes = user?.idle_lock_minutes == null ? 5 : Number(user.idle_lock_minutes);
+    const INACTIVITY_LOCK_MS = idleLockMinutes * 60 * 1000;
     const autoLockRoles = new Set(['Admin', 'Chairperson', 'Faculty']);
-    const shouldAutoLock = !!user && autoLockRoles.has(user.role);
+    const shouldAutoLock = !!user && autoLockRoles.has(user.role) && idleLockMinutes > 0;
     const [isLocked, setIsLocked] = useState(shouldAutoLock && isLockedState());
     const [unlockPassword, setUnlockPassword] = useState('');
+    const [showUnlockPassword, setShowUnlockPassword] = useState(false);
     const [unlockError, setUnlockError] = useState('');
+    // Right after unlocking: "lock again after how long?" — the same setting
+    // as Settings → Screen Lock, offered here so it's easy to change.
+    const [showIdleChooser, setShowIdleChooser] = useState(false);
+    const [savingIdle, setSavingIdle] = useState(false);
+    const IDLE_CHOICES = [
+      { value: 5, label: '5 minutes' },
+      { value: 10, label: '10 minutes' },
+      { value: 15, label: '15 minutes' },
+      { value: 30, label: '30 minutes' },
+      { value: 60, label: '1 hour' },
+      { value: 0, label: 'Never lock' },
+    ];
+    const chooseIdle = async (minutes) => {
+      if (minutes === idleLockMinutes) { setShowIdleChooser(false); return; }
+      setSavingIdle(true);
+      try {
+        const { data } = await API.put('/auth/preferences', { idle_lock_minutes: minutes });
+        markActivity();
+        updateUser(data.user);
+        setShowIdleChooser(false);
+      } catch (err) {
+        setShowIdleChooser(false);
+      } finally {
+        setSavingIdle(false);
+      }
+    };
     const [unlocking, setUnlocking] = useState(false);
+    const unlockInputRef = useRef(null);
 
     useEffect(() => {
       if (!shouldAutoLock) {
@@ -42,7 +101,7 @@
         setLockedState(false);
         setIsLocked(false);
       }
-    }, [shouldAutoLock, user?.id]);
+    }, [shouldAutoLock, user?.id, INACTIVITY_LOCK_MS]);
 
     const resetInactivityTimer = useCallback(() => {
       if (!shouldAutoLock || isLocked) return;
@@ -77,12 +136,21 @@
         });
         window.clearInterval(timerId);
       };
-    }, [shouldAutoLock, isLocked, resetInactivityTimer]);
+    }, [shouldAutoLock, isLocked, resetInactivityTimer, INACTIVITY_LOCK_MS]);
+
+    useEffect(() => {
+      if (isLocked) {
+        setTimeout(() => {
+          unlockInputRef.current?.focus();
+        }, 80);
+      }
+    }, [isLocked]);
 
     const handleUnlock = async (event) => {
       event.preventDefault();
       if (!unlockPassword.trim()) {
         setUnlockError('Enter your password to continue.');
+        unlockInputRef.current?.focus();
         return;
       }
 
@@ -94,10 +162,19 @@
         markActivity();
         setLockedState(false);
         setIsLocked(false);
+        setShowIdleChooser(true);
         setUnlockPassword('');
         setUnlockError('');
+        setShowUnlockPassword(false);
       } catch (error) {
         setUnlockError(error?.response?.data?.message || 'Incorrect password.');
+        // Make it immediately inputable again: refocus and select text so the user can immediately type
+        setTimeout(() => {
+          if (unlockInputRef.current) {
+            unlockInputRef.current.focus();
+            unlockInputRef.current.select();
+          }
+        }, 50);
       } finally {
         setUnlocking(false);
       }
@@ -131,7 +208,6 @@
     const [showArchived, setShowArchived] = useState(false);
     const [archivedNotifications, setArchivedNotifications] = useState(null);
     const [loadingArchived, setLoadingArchived] = useState(false);
-    const [pendingStudents, setPendingStudents] = useState(0);
     // "Grade Approval" badge — Admin's own queue (/admin/grade-approval) and
     // Chairperson's (/chairperson/grading-sheets) are two different counts
     // under the same nav label, both from the one pending-approval-count
@@ -139,12 +215,6 @@
     const [pendingApprovals, setPendingApprovals] = useState(0);
     // "Messages" badge — total unread across every conversation, any role.
     const [unreadMessages, setUnreadMessages] = useState(0);
-    // "Assigned Work" badge (Faculty/Student) — how many pending
-    // registrations a Chairperson delegated to THIS person specifically to
-    // verify (verificationAssignmentController.assignVerifiers already
-    // notifies them the moment they're assigned; this is the standing count
-    // so it's visible in the sidebar too, not just a one-time notification).
-    const [assignedWork, setAssignedWork] = useState(0);
 
     // `matchAlso` lets a nav item claim a sibling route that isn't nested
     // under its own path — e.g. Grade Encoding (/faculty/encode/:classId)
@@ -174,18 +244,6 @@
       } catch (err) {}
     }, []);
 
-    // Pending-registration badge belongs to the Chairperson's nav item — they
-    // approve/reject registrations directly (see PendingRegistrations.js). Once
-    // Active, Faculty find those students by Year/Section when enrolling them
-    // into a class (see InstructorClasses.js), no separate verification step.
-    const loadPendingCount = useCallback(async () => {
-      if (user?.role !== 'Chairperson') return;
-      try {
-        const { data } = await userService.getPending();
-        setPendingStudents(data.users?.length || 0);
-      } catch (err) {}
-    }, [user?.role]);
-
     const loadPendingApprovals = useCallback(async () => {
       if (user?.role !== 'Admin' && user?.role !== 'Chairperson') return;
       try {
@@ -214,29 +272,13 @@
       } catch (err) {}
     }, []);
 
-    const loadAssignedWork = useCallback(async () => {
-      if (user?.role !== 'Faculty' && user?.role !== 'Student') return;
-      try {
-        const { data } = await verificationService.getMyCount();
-        setAssignedWork(data.count || 0);
-      } catch (err) {}
-    }, [user?.role]);
-
     useEffect(() => {
       if (user) {
         loadNotifications();
-        loadPendingCount();
         loadPendingApprovals();
         loadUnreadMessages();
-        loadAssignedWork();
       }
-    }, [user, loadNotifications, loadPendingCount, loadPendingApprovals, loadUnreadMessages, loadAssignedWork]);
-
-    useEffect(() => {
-      if (user?.role === 'Chairperson') {
-        loadPendingCount();
-      }
-    }, [location.pathname, user?.role, loadPendingCount]);
+    }, [user, loadNotifications, loadPendingApprovals, loadUnreadMessages]);
 
     // Re-syncs both badges on every navigation — cheap COUNT-only endpoints,
     // and this is what catches "read some messages / approved a class,
@@ -245,8 +287,7 @@
     useEffect(() => {
       loadUnreadMessages();
       if (user?.role === 'Admin' || user?.role === 'Chairperson') loadPendingApprovals();
-      if (user?.role === 'Faculty' || user?.role === 'Student') loadAssignedWork();
-    }, [location.pathname, user?.role, loadUnreadMessages, loadPendingApprovals, loadAssignedWork]);
+    }, [location.pathname, user?.role, loadUnreadMessages, loadPendingApprovals]);
 
     // Same reasoning as Messages.js's own polling fallback — the socket
     // event that normally bumps this badge live can silently miss (dropped
@@ -256,8 +297,20 @@
     // even if nothing "live" ever reaches it.
     useEffect(() => {
       if (!user) return undefined;
-      const interval = setInterval(() => { if (document.visibilityState === 'visible') loadUnreadMessages(); }, 2500);
-      return () => clearInterval(interval);
+      // Fallback only: while the live socket is connected, 'chat:message' and
+      // 'notification:new' already refresh this the instant anything arrives,
+      // so re-asking every few seconds just multiplies load by the number of
+      // signed-in users (thousands of identical requests). Slow when the socket
+      // is up, quick when it's down.
+      const interval = setInterval(() => {
+        if (document.visibilityState !== 'visible') return;
+        if (socket.connected) return;
+        loadUnreadMessages();
+      }, 5000);
+      const slow = setInterval(() => {
+        if (document.visibilityState === 'visible') loadUnreadMessages();
+      }, 30000);
+      return () => { clearInterval(interval); clearInterval(slow); };
     }, [user, loadUnreadMessages]);
 
     useEffect(() => {
@@ -272,9 +325,7 @@
         // grades released/approved, registrations, endorsements,
         // promotions, regularization, chat, etc.
         playNotificationSound();
-        if (user.role === 'Chairperson') loadPendingCount();
         if (user.role === 'Admin' || user.role === 'Chairperson') loadPendingApprovals();
-        if (user.role === 'Faculty' || user.role === 'Student') loadAssignedWork();
         loadUnreadMessages();
       };
       // Room-scoped server-side (`user:${id}`, joined on connect) rather than
@@ -282,7 +333,7 @@
       // notificationController.js's createNotification.
       socket.on('notification:new', handleNewNotification);
       return () => { socket.off('notification:new', handleNewNotification); };
-    }, [user, loadPendingCount, loadPendingApprovals, loadUnreadMessages, loadAssignedWork]);
+    }, [user, loadPendingApprovals, loadUnreadMessages]);
 
     // The Messages badge was only ever refreshing off 'notification:new' —
     // one hop slower than the bell it's sitting right next to, since a chat
@@ -299,7 +350,7 @@
       return () => socket.off('chat:message', handleChatMessage);
     }, [user, loadUnreadMessages]);
 
-    // The sidebar's own Grade Approval / Assigned Work badges were only
+    // The sidebar's own Grade Approval badge were only
     // refreshing off a notification actually landing for THIS viewer — but
     // several of the actions that change these counts (a Chairperson
     // forwarding a class to Admin, a class getting sent back, etc.) don't
@@ -313,13 +364,10 @@
     useEffect(() => {
       if (!user) return undefined;
       const handler = () => {
-        if (user.role === 'Chairperson') loadPendingCount();
         if (user.role === 'Admin' || user.role === 'Chairperson') loadPendingApprovals();
-        if (user.role === 'Faculty' || user.role === 'Student') loadAssignedWork();
       };
-      socket.on('gradesUpdated', handler);
-      return () => socket.off('gradesUpdated', handler);
-    }, [user, loadPendingCount, loadPendingApprovals, loadAssignedWork]);
+      return onGradesUpdated(handler);
+    }, [user, loadPendingApprovals]);
 
     // Every live-update path above only reacts to an event that arrives
     // WHILE the socket is connected — this is what "worked for a second,
@@ -336,14 +384,12 @@
       if (!user) return undefined;
       const handleConnect = () => {
         loadNotifications();
-        loadPendingCount();
         loadPendingApprovals();
         loadUnreadMessages();
-        loadAssignedWork();
       };
       socket.on('connect', handleConnect);
       return () => socket.off('connect', handleConnect);
-    }, [user, loadNotifications, loadPendingCount, loadPendingApprovals, loadUnreadMessages, loadAssignedWork]);
+    }, [user, loadNotifications, loadPendingApprovals, loadUnreadMessages]);
 
     // Browsers throttle timers hard in a backgrounded/unfocused tab — the
     // 8-second unread-messages poll below can end up firing far less often
@@ -358,14 +404,12 @@
       const handleVisibility = () => {
         if (document.visibilityState !== 'visible') return;
         loadNotifications();
-        loadPendingCount();
         loadPendingApprovals();
         loadUnreadMessages();
-        loadAssignedWork();
       };
       document.addEventListener('visibilitychange', handleVisibility);
       return () => document.removeEventListener('visibilitychange', handleVisibility);
-    }, [user, loadNotifications, loadPendingCount, loadPendingApprovals, loadUnreadMessages, loadAssignedWork]);
+    }, [user, loadNotifications, loadPendingApprovals, loadUnreadMessages]);
 
     const handleMarkAsRead = async (id) => {
       try {
@@ -497,21 +541,45 @@
               <div className="text-center">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-gold">Session Locked</p>
                 <h2 className="mt-2 text-2xl font-bold text-navy">Enter your password</h2>
-                <p className="mt-2 text-sm text-gray-500">You were inactive for 5 minutes. Sign in again to continue.</p>
+                <p className="mt-2 text-sm text-gray-500">You were inactive for {idleLockMinutes === 60 ? '1 hour' : `${idleLockMinutes} minutes`}. Sign in again to continue.</p>
               </div>
 
               <form className="mt-6" onSubmit={handleUnlock}>
                 <label className="block text-[11px] font-semibold uppercase tracking-wide text-gray-500 mb-2">
                   Password
                 </label>
-                <input
-                  type="password"
-                  autoFocus
-                  className="w-full border border-gray-200 rounded-lg px-3 py-2.5 outline-none focus:border-gold focus:ring-2 focus:ring-gold/30 text-sm"
-                  value={unlockPassword}
-                  onChange={(e) => setUnlockPassword(e.target.value)}
-                  placeholder="Enter your password"
-                />
+                <div className="relative">
+                  <input
+                    ref={unlockInputRef}
+                    type={showUnlockPassword ? 'text' : 'password'}
+                    autoFocus
+                    className={`w-full border rounded-lg pl-3 pr-10 py-2.5 outline-none text-sm transition-all ${
+                      unlockError
+                        ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-200'
+                        : 'border-gray-200 focus:border-gold focus:ring-2 focus:ring-gold/30'
+                    }`}
+                    value={unlockPassword}
+                    onChange={(e) => {
+                      setUnlockPassword(e.target.value);
+                      if (unlockError) setUnlockError('');
+                    }}
+                    placeholder="Enter your password"
+                    disabled={unlocking}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowUnlockPassword((s) => !s)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 focus:outline-none p-1 flex items-center justify-center cursor-pointer"
+                    title={showUnlockPassword ? 'Hide password' : 'Show password'}
+                    tabIndex={-1}
+                  >
+                    {showUnlockPassword ? (
+                      <Icons.EyeOff className="w-4 h-4" />
+                    ) : (
+                      <Icons.Eye className="w-4 h-4" />
+                    )}
+                  </button>
+                </div>
                 {unlockError && <p className="mt-2 text-xs font-medium text-red-600">{unlockError}</p>}
                 <div className="mt-4 flex gap-2">
                   <button
@@ -530,6 +598,36 @@
                   </button>
                 </div>
               </form>
+            </div>
+          </div>
+        )}
+        {showIdleChooser && !isLocked && shouldAutoLock && (
+          <div className="fixed inset-0 z-[2000] bg-slate-950/50 backdrop-blur-sm flex items-center justify-center px-4" onClick={() => setShowIdleChooser(false)}>
+            <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl p-6" onClick={(e) => e.stopPropagation()}>
+              <div className="text-center">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-green-600">Unlocked</p>
+                <h2 className="mt-2 text-xl font-bold text-navy">Lock the screen after…</h2>
+                <p className="mt-1 text-sm text-gray-500">How long can you be inactive before the screen locks again?</p>
+              </div>
+              <div className="mt-5 grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {IDLE_CHOICES.map((c) => (
+                  <button
+                    key={c.value}
+                    type="button"
+                    disabled={savingIdle}
+                    onClick={() => chooseIdle(c.value)}
+                    className={`rounded-lg border-2 px-3 py-2.5 text-sm font-semibold cursor-pointer font-sans transition-all disabled:opacity-60 ${
+                      idleLockMinutes === c.value ? 'border-navy bg-navy text-white' : 'border-gray-200 bg-white text-gray-700 hover:border-navy/50'
+                    }`}
+                  >
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+              <button type="button" className="mt-4 w-full rounded-lg border border-gray-200 px-4 py-2.5 font-semibold text-sm text-gray-700 hover:bg-gray-50" onClick={() => setShowIdleChooser(false)}>
+                Keep {idleLockMinutes === 60 ? '1 hour' : `${idleLockMinutes} minutes`}
+              </button>
+              <p className="mt-3 text-[11px] text-gray-400 text-center">You can also change this any time in Settings → Screen Lock.</p>
             </div>
           </div>
         )}
@@ -618,17 +716,14 @@
                       <span className="flex-1">{item.label}</span>
                     )}
                     {(() => {
-                      // Pending Registrations (Chairperson), Grade Approval
-                      // (Admin's /admin/grade-approval AND Chairperson's own
-                      // /chairperson/grading-sheets under the same nav
-                      // label), Messages (every role), and Assigned Work
-                      // (Faculty/Student) each get the same badge treatment
-                      // off whichever count actually applies to this nav item.
+                      // Grade Approval (Admin's /admin/grade-approval AND
+                      // Chairperson's own /chairperson/grading-sheets under
+                      // the same nav label) and Messages (every role) each
+                      // get the same badge treatment off whichever count
+                      // actually applies to this nav item.
                       const count =
-                        item.path === '/chairperson/pending-students' ? pendingStudents :
                         (item.path === '/admin/grade-approval' || item.path === '/chairperson/grading-sheets') ? pendingApprovals :
                         item.path.endsWith('/messages') ? unreadMessages :
-                        item.path.endsWith('/assigned-students') ? assignedWork :
                         0;
                       if (count <= 0) return null;
                       // key={count} restarts the pop animation from scratch
@@ -678,11 +773,39 @@
             </div>
             <p className="text-[13px] opacity-80 hidden lg:block truncate mx-4 flex-shrink">Academic Grade Management System</p>
             <div className="flex items-center gap-4 flex-shrink-0">
+              {/* Theme Toggle Button */}
+              <button
+                type="button"
+                onClick={toggleTheme}
+                title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+                aria-label="Toggle theme mode"
+                className="relative bg-transparent border-none outline-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 active:outline-none active:bg-transparent text-white cursor-pointer opacity-80 hover:opacity-100 p-1 flex items-center justify-center transition-opacity shadow-none"
+                style={{
+                  outline: 'none',
+                  boxShadow: 'none',
+                  border: 'none',
+                  background: 'transparent',
+                }}
+              >
+                {isDark ? (
+                  <Icons.Sun className="w-5 h-5 text-amber-300" />
+                ) : (
+                  <Icons.Moon className="w-5 h-5 text-sky-200" />
+                )}
+              </button>
+
               {/* Notification Bell */}
               <div className="relative">
                 <button
+                  type="button"
                   onClick={handleBellClick}
-                  className="relative bg-transparent border-none text-white cursor-pointer opacity-80 hover:opacity-100 p-1"
+                  className="relative bg-transparent border-none outline-none focus:outline-none focus:ring-0 focus-visible:outline-none active:outline-none text-white cursor-pointer opacity-80 hover:opacity-100 p-1 shadow-none"
+                  style={{
+                    outline: 'none',
+                    boxShadow: 'none',
+                    border: 'none',
+                    background: 'transparent',
+                  }}
                 >
                   <Icons.Bell />
                   {unreadCount > 0 && (
@@ -831,24 +954,25 @@
           {dropdownOpen && (
             <>
               <div className="fixed inset-0 z-[998]" onClick={() => setDropdownOpen(false)} />
-              <div className="fixed top-[52px] right-4 lg:right-7 bg-white rounded-lg shadow-xl min-w-[200px] p-2 z-[999] border border-gray-100">
-                <div className="px-3 py-2.5 border-b border-gray-100 mb-1">
-                  <p className="text-sm font-semibold text-gray-900">{user?.name}</p>
-                  <p className="text-xs text-gray-500">{user?.email}</p>
+              <div className="fixed top-[52px] right-4 lg:right-7 bg-white dark:bg-slate-800 rounded-lg shadow-xl min-w-[210px] p-2 z-[999] border border-gray-100 dark:border-slate-700">
+                <div className="px-3 py-2.5 border-b border-gray-100 dark:border-slate-700 mb-1">
+                  <p className="text-sm font-semibold text-gray-900 dark:text-white truncate">{user?.name}</p>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 truncate">{user?.email}</p>
                 </div>
+
                 <button
                   onClick={() => { setDropdownOpen(false); navigate(`${roleBase}/profile`); }}
-                  className="w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-[13px] text-gray-700 bg-transparent border-none cursor-pointer hover:bg-gray-50 font-sans"
+                  className="w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-[13px] text-gray-700 dark:text-gray-300 bg-transparent border-none cursor-pointer hover:bg-gray-50 dark:hover:bg-slate-700/50 font-sans"
                 >
                   <Icons.User className="w-4 h-4" /> My Profile
                 </button>
                 <button
                   onClick={() => { setDropdownOpen(false); navigate(`${roleBase}/settings`); }}
-                  className="w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-[13px] text-gray-700 bg-transparent border-none cursor-pointer hover:bg-gray-50 font-sans"
+                  className="w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-[13px] text-gray-700 dark:text-gray-300 bg-transparent border-none cursor-pointer hover:bg-gray-50 dark:hover:bg-slate-700/50 font-sans"
                 >
                   <Icons.Settings className="w-4 h-4" /> Settings
                 </button>
-                <button onClick={() => { setDropdownOpen(false); setConfirmLogout(true); }} className="w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-[13px] text-red-500 bg-transparent border-none cursor-pointer hover:bg-red-50 font-sans">
+                <button onClick={() => { setDropdownOpen(false); setConfirmLogout(true); }} className="w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-[13px] text-red-500 bg-transparent border-none cursor-pointer hover:bg-red-50 dark:hover:bg-red-950/30 font-sans">
                   <Icons.LogOut className="w-4 h-4" /> Logout
                 </button>
               </div>
@@ -873,7 +997,27 @@
         {/* Data Privacy Act (RA 10173) — shown once, blocks nothing else once accepted.
             Rendered inside .theme-scope (fixed positioning means nesting depth
             doesn't affect its on-screen placement) so it also picks up dark mode. */}
-        {needsPrivacyConsent && <PrivacyConsentModal onAccept={acceptPrivacyPolicy} />}
+        {/* A student who hasn't finished first-login setup (new password +
+            verified Gmail) gets the setup wizard as a blocking pop-up over
+            their dashboard; the Privacy Notice follows once it's done. */}
+        {needsAccountSetup && <AccountSetupWizard />}
+        {/* Staff: replace the password the account was created with, on first sign-in. */}
+        {needsFirstPassword && <FirstPasswordModal />}
+        {needsPrivacyConsent && !needsAccountSetup && !needsFirstPassword && <PrivacyConsentModal onAccept={acceptPrivacyPolicy} />}
+        {checkStatus && statusDeclaration?.needs_declaration && (
+          <StatusDeclarationModal
+            semester={statusDeclaration.current_semester}
+            initial={statusDeclaration}
+            onDone={() => setStatusDeclaration((d) => ({ ...d, needs_declaration: false }))}
+          />
+        )}
+        {checkStatus && !statusDeclaration?.needs_declaration && classConfirmations.length > 0 && (
+          <ClassConfirmationModal
+            pending={classConfirmations}
+            user={user}
+            onAnswered={(id) => setClassConfirmations((list) => list.filter((c) => c.enrollment_id !== id))}
+          />
+        )}
         {confirmLogout && (
           <ConfirmDialog
             title="Log out?"

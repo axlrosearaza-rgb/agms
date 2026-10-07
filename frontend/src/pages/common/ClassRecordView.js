@@ -1,17 +1,27 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { gradeService } from '../../services';
 import API from '../../services/api';
-import { LoadingSpinner, programShortLabel, comparePeopleNames, formatPersonName } from '../../components/common';
+import { LoadingSpinner, programShortLabel, comparePeopleNames, formatPersonName, formatPersonNameFirstLast } from '../../components/common';
 import {
   itemRate,
   componentAverage,
   periodComposite,
+  periodGWA,
+  gwaFromComposite,
+  formatComposite,
+  halfComposite,
+  overallComposite,
+  formatGrade,
+  fmtTrimmed,
+  stripYearFromSemester,
   GROUP_COLORS,
   componentColorIndex,
   GWA_HEADER_COLOR,
   GWA_DATA_COLOR,
   remarksFor,
+  remarksText,
+  isLapsedInc,
   remarksStyle,
   dropSequence,
   dropCellStyle,
@@ -19,6 +29,7 @@ import {
   getRateFormula,
 } from '../../utils/classRecordExcel';
 import toast from 'react-hot-toast';
+import { useSemesterLabels } from '../../utils/semesterLabels';
 
 // GROUP_COLORS/GWA_HEADER_COLOR/GWA_DATA_COLOR/FINAL_GWA_HEADER_COLOR come
 // from utils/classRecordExcel.js — the same palette drives the live editable
@@ -31,9 +42,7 @@ const NAME_COLOR = '#AEABAB';
 const COMPOSITE_COLOR = '#7B7B7B';   // "Midterm/Final Term Grade" (raw 0-100 composite)
 const HALF_COLOR = '#ADB9CA';        // "Overall 1/2" (composite * 50%)
 const OVERALL_COLOR = '#00B0F0';     // "Overall Grade" (combined composite, both periods)
-const REMARKS_COLOR = '#CCFFCC';
-
-const fmt = (n, d = 0) => (n === null || n === undefined ? '' : n.toFixed(d));
+const REMARKS_COLOR = '#548235';
 
 // A direct-rate item (item.is_rate_direct) has no raw score at all — just
 // the one Rate column, not the usual Score+Rate pair — so every column
@@ -46,7 +55,7 @@ const fmt = (n, d = 0) => (n === null || n === undefined ? '' : n.toFixed(d));
 // PeriodDataCells), so a viewer still sees which items exist and what
 // they're called, just not every number if the Faculty chose to withhold
 // it.
-const itemColSpan = (item) => (item.is_rate_direct ? 1 : 2);
+const itemColSpan = (item) => (item.is_rate_direct ? (item.show_rate !== false ? 1 : 0) : (item.show_rate !== false ? 2 : 1));
 // show_ave freely shows/hides a component's own Ave column — fully
 // user-controlled (Grade Component Setup's own "Show Ave" checkbox), no
 // automatic override tied to how many items the component has. A
@@ -70,59 +79,68 @@ const compColSpan = (c) => (c.items || []).reduce((s, item) => s + itemColSpan(i
 // here so a repetition of the word only ever starts if there's room across
 // the entire row (components + tail) to finish it, not just this component's
 // own slice of it.
-const PeriodDataCells = ({ comps, studentId, componentScores, isDropped, dropSeq, formula = RATE_FORMULAS['50_45'] }) => {
+// `zeroFillMissing` — opt-in, passed true ONLY for an already-INC-flagged
+// period (see periodComposite's own comment on why) — a still-missing
+// item's Rate cell then shows the floor value (50 for the default formula)
+// instead of blank, letting Ave/Weighted/Composite/GWA all show a real
+// preview number instead of the whole period going blank until every last
+// item is in. The SCORE cell shows 0 for an incomplete period.
+const PeriodDataCells = ({ comps, studentId, componentScores, isDropped, dropSeq, formula = RATE_FORMULAS['50_45'], zeroFillMissing = false }) => {
   const compNames = comps.map((c) => c.name);
   let dropIdx = 0;
   const dropTd = (key, letter) => (
     <td key={key} style={{ ...dropCellStyle(letter), textAlign: 'center', fontWeight: 700 }}>{letter}</td>
   );
   return (
-  <>
-    {comps.flatMap((c, ci) => {
-      const color = GROUP_COLORS[componentColorIndex(c.name, ci, compNames)].data;
-      const avg = componentAverage(c, studentId, componentScores, formula);
-      // Exact (unrounded) — only the displayed cell below floors it.
-      const weighted = avg !== null ? avg * (parseFloat(c.weight) / 100) : null;
-      return [
-        ...(c.items || []).flatMap((item) => {
-          // A direct-rate item has just the one Rate column — no raw score
-          // at all — so it only ever consumes ONE cell (and one DROPPED
-          // letter), not the usual Score+Rate pair.
-          if (isDropped) {
-            if (item.is_rate_direct) return [dropTd(`${item.id}-r`, dropSeq[dropIdx++])];
-            return [
-              dropTd(`${item.id}-s`, dropSeq[dropIdx++]),
-              dropTd(`${item.id}-r`, dropSeq[dropIdx++]),
+    <>
+      {comps.flatMap((c, ci) => {
+        const color = GROUP_COLORS[componentColorIndex(c.name, ci, compNames)].data;
+        const avg = componentAverage(c, studentId, componentScores, formula, zeroFillMissing);
+        // Exact (unrounded) — only the displayed cell below rounds it.
+        const weighted = avg !== null ? avg * (parseFloat(c.weight) / 100) : null;
+        return [
+          ...(c.items || []).flatMap((item) => {
+            const hasRateCol = item.show_rate !== false;
+            if (isDropped) {
+              if (item.is_rate_direct) {
+                if (!hasRateCol) return [];
+                return [dropTd(`${item.id}-r`, dropSeq[dropIdx++])];
+              }
+              const cells = [dropTd(`${item.id}-s`, dropSeq[dropIdx++])];
+              if (hasRateCol) cells.push(dropTd(`${item.id}-r`, dropSeq[dropIdx++]));
+              return cells;
+            }
+            const rawScore = componentScores[studentId]?.[item.id];
+            const hasScore = rawScore !== undefined && rawScore !== null && rawScore !== '';
+            const score = hasScore ? rawScore : (zeroFillMissing ? 0 : null);
+            const rate = itemRate(hasScore ? rawScore : (zeroFillMissing ? 0 : null), item.max_score, item.is_rate_direct, formula, zeroFillMissing);
+            if (item.is_rate_direct) {
+              if (!hasRateCol) return [];
+              return [<td key={`${item.id}-r`} style={{ background: color, textAlign: 'center', fontWeight: 600, width: 56, minWidth: 56 }}>{rate !== null ? fmtTrimmed(rate, 0) : ''}</td>];
+            }
+            const cells = [
+              <td key={`${item.id}-s`} style={{ background: color, textAlign: 'center', width: 50, minWidth: 50 }}>{score !== null ? score : ''}</td>,
             ];
-          }
-          const score = componentScores[studentId]?.[item.id];
-          const rate = itemRate(score, item.max_score, item.is_rate_direct, formula);
-          // The actual SCORE a student earned always shows regardless —
-          // show_score only controls the item's MAX (see the header row
-          // above), not this number. show_rate still blanks the RATE
-          // number, though — the column itself (and its SCORE/RATE header)
-          // always stays either way, see itemColSpan's own comment above.
-          if (item.is_rate_direct) {
-            return [<td key={`${item.id}-r`} style={{ background: color, textAlign: 'center', color: '#FF0000' }}>{item.show_rate !== false && rate !== null ? Math.round(rate) : ''}</td>];
-          }
-          return [
-            <td key={`${item.id}-s`} style={{ background: color, textAlign: 'center' }}>{score ?? ''}</td>,
-            <td key={`${item.id}-r`} style={{ background: color, textAlign: 'center', color: '#FF0000' }}>{item.show_rate !== false && rate !== null ? Math.round(rate) : ''}</td>,
-          ];
-        }),
-        ...(showAveCol(c) ? [isDropped ? (
-          dropTd(`${c.id}-ave`, dropSeq[dropIdx++])
-        ) : (
-          <td key={`${c.id}-ave`} style={{ background: color, textAlign: 'center', fontWeight: 600 }}>{avg !== null ? Math.round(avg) : ''}</td>
-        )] : []),
-        isDropped ? (
-          dropTd(`${c.id}-w`, dropSeq[dropIdx++])
-        ) : (
-          <td key={`${c.id}-w`} style={{ background: color, textAlign: 'center', fontWeight: 600 }}>{weighted !== null ? (Math.round(weighted * 10) / 10).toFixed(1) : ''}</td>
-        ),
-      ];
-    })}
-  </>
+            if (hasRateCol) {
+              cells.push(
+                <td key={`${item.id}-r`} style={{ background: color, textAlign: 'center', color: '#FF0000', fontWeight: 600, width: 45, minWidth: 45 }}>{rate !== null ? fmtTrimmed(rate, 0) : ''}</td>
+              );
+            }
+            return cells;
+          }),
+          ...(showAveCol(c) ? [isDropped ? (
+            dropTd(`${c.id}-ave`, dropSeq[dropIdx++])
+          ) : (
+            <td key={`${c.id}-ave`} style={{ background: color, textAlign: 'center', fontWeight: 600, width: 50, minWidth: 50 }}>{fmtTrimmed(avg, 0)}</td>
+          )] : []),
+          isDropped ? (
+            dropTd(`${c.id}-w`, dropSeq[dropIdx++])
+          ) : (
+            <td key={`${c.id}-w`} style={{ background: color, textAlign: 'center', fontWeight: 600, width: 50, minWidth: 50 }}>{fmtTrimmed(weighted, 0)}</td>
+          ),
+        ];
+      })}
+    </>
   );
 };
 
@@ -138,44 +156,37 @@ function PeriodHeader({ title, classData, subject }) {
   const courseYearParts = [programShortLabel(subject.program), classData.year_level ? String(classData.year_level) : null].filter(Boolean);
   let courseYearSection = courseYearParts.join(' ');
   if (classData.section) courseYearSection += (courseYearSection ? '-' : '') + classData.section;
-  // classData.academic_year is a separate, sometimes-unset column — the
-  // Semester record's own name (classData.semester, e.g. "First Semester
-  // 2026-2027") already carries the year regardless, so pull it from there
-  // rather than ever showing "AY" with nothing after it.
   const academicYear = classData.academic_year || (classData.semester || '').match(/\d{4}-\d{4}/)?.[0] || '';
+  const { shortFor } = useSemesterLabels();
 
   return (
-    <>
-      {/* Seals sit near the block's own left/right edges (space-between),
-          not tight against the text, but with real margin from the true
-          edge (padding) rather than flush against it — matches both the
-          real spreadsheet's own letterhead and the Excel export's own
-          inset anchoring (utils/classRecordExcel.js's writeLetterhead).
-          Real small seals (the actual ones embedded in the official
-          spreadsheet), not the app's own generic full-size
-          ssu-logo.png/cas-logo.png used elsewhere (e.g. the login page). */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 14px' }}>
-        <img src="/assets/logos/ssu-seal-real.jpg" alt="SSU" style={{ width: 58, height: 58, flexShrink: 0 }} />
-        <div style={{ textAlign: 'center', flex: 1 }}>
-          <p style={{ fontWeight: 700, fontSize: 11, margin: 0 }}>Republic of the Philippines</p>
-          <p style={{ fontWeight: 700, fontSize: 15, margin: 0 }}>SAMAR STATE UNIVERSITY</p>
-          <p style={{ fontWeight: 700, fontSize: 12, margin: 0 }}>COLLEGE OF ARTS AND SCIENCES</p>
+    <div style={{ width: '100%', marginBottom: 6 }}>
+      {/* Seals sit at left and right with university info centered */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 8px', marginBottom: 4 }}>
+        <img src="/assets/logos/ssu-seal-real.jpg" alt="SSU" style={{ width: 44, height: 44, flexShrink: 0, objectFit: 'contain' }} />
+        <div style={{ textAlign: 'center', flex: 1, padding: '0 12px' }}>
+          <p style={{ fontWeight: 700, fontSize: 11, margin: 0, lineHeight: 1.3 }}>Republic of the Philippines</p>
+          <p style={{ fontWeight: 700, fontSize: 14, margin: 0, lineHeight: 1.3 }}>SAMAR STATE UNIVERSITY</p>
+          <p style={{ fontWeight: 700, fontSize: 12, margin: 0, lineHeight: 1.3 }}>COLLEGE OF ARTS AND SCIENCES</p>
         </div>
-        <img src="/assets/logos/cas-seal-real.png" alt="CAS" style={{ width: 58, height: 58, flexShrink: 0 }} />
+        <img src="/assets/logos/cas-seal-real.png" alt="CAS" style={{ width: 44, height: 44, flexShrink: 0, objectFit: 'contain' }} />
       </div>
-      <h3 style={{ textAlign: 'center', fontWeight: 700, fontSize: 13, margin: '10px 0' }}>{title}</h3>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '2px 16px', fontSize: 10.5, fontWeight: 700, marginBottom: 8, whiteSpace: 'nowrap' }}>
-        <p style={{ margin: 0 }}>Name of Faculty: {(classData.instructor?.name || '').toUpperCase()}</p>
-        <p style={{ margin: 0 }}>Course, Year and Section: {courseYearSection || '—'}</p>
-        <p style={{ margin: 0 }}>AY {academicYear}</p>
-        <p style={{ margin: 0 }}>Subject: {subject.code} ({subject.name})</p>
-        {/* Schedule isn't a feature this system tracks — left blank rather
-            than removed outright, so Semester stays in its own column
-            lined up under AY above it instead of the grid reflowing. */}
-        <p style={{ margin: 0 }} />
-        <p style={{ margin: 0 }}>{classData.semester}</p>
+      <h3 style={{ textAlign: 'center', fontWeight: 700, fontSize: 13, margin: '3px 0 5px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{title}</h3>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', fontSize: 10.5, fontWeight: 700, padding: '0 4px', whiteSpace: 'nowrap', gap: 16 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <div>Name of Faculty: <span style={{ fontWeight: 700 }}>{formatPersonNameFirstLast(classData.instructor?.name).toUpperCase()}</span></div>
+          <div>Subject: <span style={{ fontWeight: 700 }}>{subject.code} ({subject.name})</span></div>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <div>Course, Year and Section: <span style={{ fontWeight: 700 }}>{courseYearSection || '—'}</span></div>
+          {classData.schedule ? <div>Schedule: <span style={{ fontWeight: 700 }}>{classData.schedule}</span></div> : <div style={{ height: 16 }} />}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, textAlign: 'right' }}>
+          <div>{shortFor(classData.semester)} {academicYear}</div>
+          <div>{stripYearFromSemester(classData.semester, academicYear)}</div>
+        </div>
       </div>
-    </>
+    </div>
   );
 }
 
@@ -183,10 +194,45 @@ function PeriodHeader({ title, classData, subject }) {
 // narrow by rotating their header text vertically instead of wrapping it
 // horizontally — this is what actually makes that block of columns read as a
 // compact strip instead of ballooning the table's width.
-function RotatedTh({ background, color = '#1a1a1a', children }) {
+function RotatedTh({ background, color = '#1a1a1a', children, width = 34, height = 115 }) {
   return (
-    <th rowSpan={4} style={{ background, color, width: 30, padding: '4px 2px' }}>
-      <div style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block' }}>{children}</div>
+    <th
+      rowSpan={4}
+      style={{
+        background,
+        color,
+        width,
+        minWidth: width,
+        maxWidth: width,
+        height,
+        padding: '4px 2px',
+        verticalAlign: 'middle',
+        textAlign: 'center',
+        boxSizing: 'border-box',
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          height: '100%',
+          width: '100%',
+        }}
+      >
+        <span
+          style={{
+            transform: 'rotate(-90deg)',
+            whiteSpace: 'nowrap',
+            display: 'inline-block',
+            lineHeight: 1,
+            fontSize: '10px',
+            fontWeight: 700,
+          }}
+        >
+          {children}
+        </span>
+      </div>
     </th>
   );
 }
@@ -201,7 +247,7 @@ function PeriodBlock({ variant, title, comps, otherComps, classData, subject, st
   const compNames = comps.map((c) => c.name);
   const formula = getRateFormula(classData);
   return (
-    <div style={{ flex: '0 0 auto' }}>
+    <div style={{ flex: '0 0 auto', width: 'max-content' }}>
       <PeriodHeader title={title} classData={classData} subject={subject} />
       <div style={{ overflowX: 'auto' }}>
         <table className="cr-table">
@@ -214,28 +260,40 @@ function PeriodBlock({ variant, title, comps, otherComps, classData, subject, st
               <th rowSpan={4} style={{ background: NO_COLOR, color: '#fff', minWidth: 70 }}>Student No.</th>
               <th rowSpan={4} style={{ background: NAME_COLOR, minWidth: 150, textAlign: 'left' }}>Name</th>
               {comps.map((c, ci) => (
-                <th key={c.id} colSpan={compColSpan(c)} style={{ background: GROUP_COLORS[componentColorIndex(c.name, ci, compNames)].header }}>
+                <th key={c.id} colSpan={compColSpan(c)} style={{ background: GROUP_COLORS[componentColorIndex(c.name, ci, compNames)].header, padding: '3px 4px', fontSize: 10 }}>
                   {c.name}
                 </th>
               ))}
               {!isFinals ? (
                 <>
-                  <RotatedTh background={COMPOSITE_COLOR} color="#fff">Midterm Term Grade</RotatedTh>
-                  <RotatedTh background={HALF_COLOR}>Overall 1/2</RotatedTh>
-                  <RotatedTh background={GWA_HEADER_COLOR} color="#fff">Midterm Grade</RotatedTh>
+                  <RotatedTh background={COMPOSITE_COLOR} color="#fff" width={34}>Midterm Term Grade</RotatedTh>
+                  <RotatedTh background={HALF_COLOR} color="#1a1a1a" width={34}>Overall 1/2</RotatedTh>
+                  <RotatedTh background={GWA_HEADER_COLOR} color="#fff" width={34}>Midterm Grade</RotatedTh>
                 </>
               ) : (
                 <>
-                  <RotatedTh background={COMPOSITE_COLOR} color="#fff">Final Term Grade</RotatedTh>
-                  <RotatedTh background={HALF_COLOR}>Overall 1/2</RotatedTh>
-                  <RotatedTh background={OVERALL_COLOR} color="#fff">Overall Grade</RotatedTh>
-                  {/* The Final Term's own raw grade — same treatment as
-                      Midterm's "Midterm Grade" column above, not the combined
-                      average of both periods. That combined average
-                      (Grade.average) is the Grade Sheet's job to show (see
-                      pages/common/GradingSheet.js), not the Class Record's. */}
-                  <RotatedTh background={GWA_HEADER_COLOR} color="#fff">Final Grade</RotatedTh>
-                  <RotatedTh background={REMARKS_COLOR}>Remarks</RotatedTh>
+                  <RotatedTh background={COMPOSITE_COLOR} color="#fff" width={34}>Final Term Grade</RotatedTh>
+                  <RotatedTh background={HALF_COLOR} color="#1a1a1a" width={34}>Overall 1/2</RotatedTh>
+                  <RotatedTh background={OVERALL_COLOR} color="#fff" width={34}>Overall Grade</RotatedTh>
+                  <RotatedTh background={GWA_HEADER_COLOR} color="#fff" width={34}>Final Grade</RotatedTh>
+                  <th
+                    rowSpan={4}
+                    style={{
+                      background: REMARKS_COLOR,
+                      color: '#fff',
+                      width: 75,
+                      minWidth: 75,
+                      maxWidth: 75,
+                      verticalAlign: 'middle',
+                      textAlign: 'center',
+                      fontSize: 11,
+                      fontWeight: 700,
+                      padding: '4px',
+                      boxSizing: 'border-box',
+                    }}
+                  >
+                    Remarks
+                  </th>
                 </>
               )}
             </tr>
@@ -254,10 +312,19 @@ function PeriodBlock({ variant, title, comps, otherComps, classData, subject, st
                     // .cr-table's own CSS, so just the width + padding need
                     // matching here for the two to read as one consistent
                     // style, not two different ones.
+                    const span = itemColSpan(item);
+                    if (span === 0) return [];
                     if (item.is_rate_direct) {
+                      const isShort = (item.name || '').length <= 5;
                       return [
-                        <th key={`${item.id}-s`} rowSpan={3} style={{ background: color, fontSize: 9, width: 30, padding: '4px 2px' }}>
-                          <div style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block' }}>{item.name}</div>
+                        <th key={`${item.id}-s`} rowSpan={3} style={{ background: color, fontSize: 10, width: 56, minWidth: 56, padding: '2px', verticalAlign: 'middle', textAlign: 'center' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', width: '100%' }}>
+                            {isShort ? (
+                              <span style={{ fontWeight: 700, whiteSpace: 'nowrap' }}>{item.name}</span>
+                            ) : (
+                              <span style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1, fontWeight: 700 }}>{item.name}</span>
+                            )}
+                          </div>
                         </th>,
                       ];
                     }
@@ -268,15 +335,15 @@ function PeriodBlock({ variant, title, comps, otherComps, classData, subject, st
                     // empty. Row 4 (SCORE/RATE) still sits below normally.
                     if (item.show_score === false) {
                       return [
-                        <th key={`${item.id}-s`} colSpan={itemColSpan(item)} rowSpan={2} style={{ background: color, fontSize: 9 }}>{item.name}</th>,
+                        <th key={`${item.id}-s`} colSpan={span} rowSpan={2} style={{ background: color, fontSize: 9 }}>{item.name}</th>,
                       ];
                     }
                     return [
-                      <th key={`${item.id}-s`} colSpan={itemColSpan(item)} style={{ background: color, fontSize: 9 }}>{item.name}</th>,
+                      <th key={`${item.id}-s`} colSpan={span} style={{ background: color, fontSize: 9 }}>{item.name}</th>,
                     ];
                   }),
-                  ...(showAveCol(c) ? [<th key={`${c.id}-ave`} rowSpan={3} style={{ background: color, fontSize: 9 }}>Ave</th>] : []),
-                  <th key={`${c.id}-w`} rowSpan={3} style={{ background: color, fontSize: 9 }}>{parseFloat(c.weight)}%</th>,
+                  ...(showAveCol(c) ? [<th key={`${c.id}-ave`} rowSpan={3} style={{ background: color, fontSize: 9, width: 50, minWidth: 50, textAlign: 'center', verticalAlign: 'middle', fontWeight: 700 }}>Ave</th>] : []),
+                  <th key={`${c.id}-w`} rowSpan={3} style={{ background: color, fontSize: 9, width: 50, minWidth: 50, textAlign: 'center', verticalAlign: 'middle', fontWeight: 700 }}>{parseFloat(c.weight)}%</th>,
                 ];
               })}
             </tr>
@@ -286,11 +353,9 @@ function PeriodBlock({ variant, title, comps, otherComps, classData, subject, st
                 // A rate-only item's own header cell already rowSpans over
                 // this row (folded into the name cell above), so it emits
                 // nothing here at all — not even a blank cell. Same when
-                // Max is hidden (show_score === false) — the name cell
-                // above already grew a rowSpan to cover this row instead
-                // of leaving it as an empty gap.
-                return (c.items || []).flatMap((item) => (item.is_rate_direct || item.show_score === false ? [] : [
-                  <th key={`${item.id}-max`} colSpan={2} style={{ background: color, fontSize: 10 }}>{parseFloat(item.max_score)}</th>,
+                // Max is hidden (show_score === false) or item has 0 columns.
+                return (c.items || []).flatMap((item) => (item.is_rate_direct || item.show_score === false || itemColSpan(item) === 0 ? [] : [
+                  <th key={`${item.id}-max`} colSpan={itemColSpan(item)} style={{ background: color, fontSize: 10 }}>{parseFloat(item.max_score)}</th>,
                 ]));
               })}
             </tr>
@@ -299,44 +364,72 @@ function PeriodBlock({ variant, title, comps, otherComps, classData, subject, st
                 const color = GROUP_COLORS[componentColorIndex(c.name, ci, compNames)].header;
                 // Same as row 3 above — a rate-only item's header is already
                 // fully covered by its rowSpan-3 name cell.
-                // `transform: rotate(...)` is paint-only — it never affects
-                // layout/box sizing, so a row holding only rotated text is
-                // otherwise sized as if that text were still horizontal (one
-                // short line) and the rotated glyphs spill out over whatever
-                // sits above/below instead of actually fitting. An explicit
-                // height here is what the row itself sizes off of.
-                return (c.items || []).flatMap((item) => (item.is_rate_direct ? [] : [
-                  <th key={`${item.id}-score`} style={{ background: color, fontSize: 9, fontWeight: 400, padding: '2px', height: 40 }}>
-                    <div style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>SCORE</div>
-                  </th>,
-                  <th key={`${item.id}-rate`} style={{ background: color, fontSize: 9, fontWeight: 400, padding: '2px', height: 40 }}>
-                    <div style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>RATE</div>
-                  </th>,
-                ]));
+                // When show_rate is false, only SCORE is emitted and RATE is omitted.
+                return (c.items || []).flatMap((item) => {
+                  if (item.is_rate_direct || itemColSpan(item) === 0) return [];
+                  const cells = [
+                    <th key={`${item.id}-score`} style={{ background: color, fontSize: 9, fontWeight: 600, padding: '2px', height: 36, width: 50, minWidth: 50, verticalAlign: 'middle', textAlign: 'center' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', width: '100%' }}>
+                        <span style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>SCORE</span>
+                      </div>
+                    </th>,
+                  ];
+                  if (item.show_rate !== false) {
+                    cells.push(
+                      <th key={`${item.id}-rate`} style={{ background: color, fontSize: 9, fontWeight: 600, padding: '2px', height: 36, width: 45, minWidth: 45, verticalAlign: 'middle', textAlign: 'center' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', width: '100%' }}>
+                          <span style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>RATE</span>
+                        </div>
+                      </th>
+                    );
+                  }
+                  return cells;
+                });
               })}
             </tr>
           </thead>
           <tbody>
             {studentGrades.map((g, idx) => {
               const sid = g.student.id;
-              const isIncomplete = g.status === 'INC';
-              // A Dropped student's cells read 'DROP' in red, the same way an
-              // Incomplete one already reads 'INC' — rather than falling
-              // through to whatever raw composite/midterm/finals numbers
-              // happen to still be sitting in componentScores/grade, which
-              // would misleadingly show a graded-looking figure for someone
-              // who was actually dropped from the class.
-              const isDropped = g.status === 'DRP';
-              const blankStatus = isIncomplete ? 'INC' : isDropped ? 'DROP' : null;
-              const blankColor = isIncomplete ? undefined : isDropped ? '#9C0006' : undefined;
               const composite = periodComposite(comps, sid, componentScores, formula);
-              // Half is exactly the DISPLAYED Composite ÷ 2, not the raw
-              // unrounded composite — rounding first means Overall 1/2
-              // always relates to the "Midterm/Final Term Grade" number a
-              // viewer actually sees, instead of silently drifting a few
-              // tenths off it (e.g. Composite shown as 68 but Half
-              // computed from 67.6).
-              const half = composite !== null ? Math.round(composite) * 0.5 : null;
+              // INC is per period — a student marked INC whose scores for
+              // THIS period are all in still shows their real figures here;
+              // only the period that's actually missing scores reads INC.
+              // Which period(s) are INC comes from the per-period flags
+              // (marked/resolved independently — INC in the Midterm never
+              // makes the Finals INC, and vice versa); a row from before the
+              // flags existed falls back to "INC where scores are incomplete".
+              const hasIncFlags = !!(g.grade?.inc_midterm || g.grade?.inc_finals || g.inc_midterm || g.inc_finals);
+              const isIncStatus = g.status === 'INC' || g.status === 'Incomplete';
+              // (No flags = older data: INC in the earliest period still
+              // missing scores, same as the server settles it.)
+              const isIncomplete = isIncStatus && (hasIncFlags
+                ? !!(isFinals ? (g.grade?.inc_finals ?? g.inc_finals) : (g.grade?.inc_midterm ?? g.inc_midterm))
+                : (isFinals ? (composite === null && periodComposite(otherComps, sid, componentScores, formula) !== null) : composite === null));
+              // An INC student's stored grade.midterm/finals is null, so a
+              // completed period's GWA is recomputed from its own scores.
+              const incPeriodGwa = g.status === 'INC' ? periodGWA(comps, sid, componentScores, formula) : null;
+              // A still-missing item counts as a literal 0 for this
+              // period's own preview figures ONLY (never saved, never fed
+              // into anything but this row's own display) — so an INC
+              // student's Composite/Half/GWA show a real, if provisional,
+              // number instead of sitting blank until every last item is
+              // in. Same composite when NOT incomplete — this is purely
+              // the INC case's own preview path.
+              const previewComposite = isIncomplete ? periodComposite(comps, sid, componentScores, formula, true) : composite;
+              // A Dropped student's cells read 'DROP' in red — rather than
+              // falling through to whatever raw composite/midterm/finals
+              // numbers happen to still be sitting in componentScores/
+              // grade, which would misleadingly show a graded-looking
+              // figure for someone who was actually dropped from the
+              // class. INC no longer blanks this way — see
+              // previewComposite above — so this is DROP-only now.
+              const isDropped = g.status === 'DRP';
+              const blankStatus = isDropped ? 'DROP' : null;
+              const blankColor = isDropped ? '#9C0006' : (isIncomplete ? '#D97706' : undefined);
+              // Half of the TRUE (unrounded) Term Grade (79.26 → 39.6), so
+              // Midterm's half + Finals' half is the true Overall Grade.
+              const half = halfComposite(previewComposite);
               // Continues the exact same left-to-right "DROPPED" band
               // PeriodDataCells already spelled across every item/Ave/
               // Weighted cell — 2 cells per item plus 2 (Ave, Weighted) per
@@ -363,26 +456,71 @@ function PeriodBlock({ variant, title, comps, otherComps, classData, subject, st
                   <td style={{ background: '#f2f2f2', textAlign: 'center' }}>{idx + 1}</td>
                   <td style={{ textAlign: 'center' }}>{g.student.student_no}</td>
                   <td>{formatPersonName(g.student.name)}</td>
-                  <PeriodDataCells comps={comps} studentId={sid} componentScores={componentScores} isDropped={isDropped} dropSeq={dropSeq} formula={formula} />
+                  <PeriodDataCells comps={comps} studentId={sid} componentScores={componentScores} isDropped={isDropped} dropSeq={dropSeq} formula={formula} zeroFillMissing={isIncomplete} />
                   {!isFinals ? (
-                    <>
-                      <td style={dropTailSx(0, { background: '#EFEFEF', textAlign: 'center', fontWeight: 700, color: blankColor })}>{dropOr(0, blankStatus || fmt(composite))}</td>
-                      <td style={dropTailSx(1, { background: '#EEF1F5', textAlign: 'center' })}>{dropOr(1, blankStatus ? '' : fmt(half, 1))}</td>
-                      <td style={dropTailSx(2, { background: GWA_DATA_COLOR, textAlign: 'center', fontWeight: 700, color: blankColor })}>{dropOr(2, blankStatus || fmt(g.grade?.midterm ? parseFloat(g.grade.midterm) : null, 1))}</td>
-                    </>
-                  ) : (
                     (() => {
-                      const midComposite = periodComposite(otherComps, sid, componentScores, formula);
-                      const midHalf = midComposite !== null ? Math.round(midComposite) * 0.5 : null;
-                      const overall = (midHalf !== null && half !== null) ? midHalf + half : null;
-                      const rStyle = remarksStyle(g.status);
+                      // Live-recomputed from the CURRENT composite (same as
+                      // Finals' own Final Grade below), not the stored
+                      // Grade.midterm — that DB value only reflects whatever
+                      // was last actually saved, so it can silently disagree
+                      // with the "Midterm Term Grade" composite shown right
+                      // next to it the moment scores are edited without
+                      // saving first. The equivalent of the whole-number
+                      // Midterm Term Grade shown beside it (previewComposite
+                      // is zero-filled for an INC period).
+                      const midtermGrade = previewComposite !== null
+                        ? gwaFromComposite(previewComposite)
+                        : (g.grade?.midterm ? parseFloat(g.grade.midterm) : incPeriodGwa);
                       return (
                         <>
-                          <td style={dropTailSx(0, { background: '#EFEFEF', textAlign: 'center', fontWeight: 700, color: blankColor })}>{dropOr(0, blankStatus || fmt(composite))}</td>
-                          <td style={dropTailSx(1, { background: '#EEF1F5', textAlign: 'center' })}>{dropOr(1, blankStatus ? '' : fmt(half, 1))}</td>
-                          <td style={dropTailSx(2, { background: '#DCF1FB', textAlign: 'center', fontWeight: 700, color: blankColor })}>{dropOr(2, blankStatus || fmt(overall))}</td>
-                          <td style={dropTailSx(3, { background: GWA_DATA_COLOR, textAlign: 'center', fontWeight: 700, color: blankColor })}>{dropOr(3, blankStatus || fmt(g.grade?.finals ? parseFloat(g.grade.finals) : null, 1))}</td>
-                          <td style={{ background: rStyle.bg, color: rStyle.color, textAlign: 'center', fontWeight: 700 }}>{g.grade ? remarksFor(g.status) : ''}</td>
+                          <td style={dropTailSx(0, { background: '#EFEFEF', textAlign: 'center', fontWeight: 700, color: blankColor })}>{dropOr(0, blankStatus || formatComposite(previewComposite))}</td>
+                          <td style={dropTailSx(1, { background: '#EEF1F5', textAlign: 'center', color: blankColor })}>{dropOr(1, blankStatus ? '' : fmtTrimmed(half, 0))}</td>
+                          <td style={dropTailSx(2, { background: GWA_DATA_COLOR, textAlign: 'center', fontWeight: 700, color: blankColor })}>{dropOr(2, blankStatus || formatGrade(midtermGrade))}</td>
+                        </>
+                      );
+                    })()
+                  ) : (
+                    (() => {
+                      // Zero-filled too when the student is INC at all (in
+                      // either period) — so the Overall Grade/Final Grade
+                      // preview below can combine both periods even when
+                      // the OTHER one (Midterm) is the side still missing
+                      // work, not just this one.
+                      const midComposite = periodComposite(otherComps, sid, componentScores, formula, g.status === 'INC');
+                      // TRUE average of both periods' exact composites
+                      // (Midterm's Overall 1/2 + Finals' Overall 1/2) — shown
+                      // rounded once to a whole Overall Grade via formatComposite,
+                      // the same figure the Final Grade's equivalent is
+                      // looked up from.
+                      const overall = overallComposite(midComposite, previewComposite);
+                      const finGwa = g.grade?.finals ? parseFloat(g.grade.finals) : incPeriodGwa;
+                      // Final Grade = the equivalent of the whole Overall
+                      // Grade — not the Finals GWA on its own. Falls back to
+                      // the Finals-only GWA only when there's no Midterm
+                      // block to combine with (otherComps empty).
+                      // INC not completed by its deadline → the recorded 5.0.
+                      const lapsed = isLapsedInc(g.grade);
+                      const finalGrade = lapsed ? 5.0 : (otherComps.length === 0 ? finGwa : gwaFromComposite(overall));
+                      // Only DROP blanks these tail cells now — an INC
+                      // student's own preview (zero-filled) shows here
+                      // instead of blank, same as previewComposite above.
+                      // Remarks is different: the student is still INC
+                      // overall, so it never gets a Passed/Failed verdict
+                      // either way — remarksFor('INC') already renders that
+                      // as blank, same as every other INC row, rather than
+                      // judging Passed/Failed off a Final Grade that's
+                      // still provisional.
+                      // Final Grade reads INC while the student is INC in either period.
+                      const finalBlank = lapsed ? '' : (isIncStatus ? 'INC' : blankStatus);
+                      const finalRemarksKey = isDropped ? 'DRP' : isIncStatus ? 'INC' : (finalGrade !== null ? (finalGrade >= 1.0 && finalGrade <= 3.01 ? 'Passed' : 'Failed') : '');
+                      const rStyle = remarksStyle(finalRemarksKey);
+                      return (
+                        <>
+                          <td style={dropTailSx(0, { background: '#EFEFEF', textAlign: 'center', fontWeight: 700, color: blankColor })}>{dropOr(0, blankStatus || formatComposite(previewComposite))}</td>
+                          <td style={dropTailSx(1, { background: '#EEF1F5', textAlign: 'center', color: blankColor })}>{dropOr(1, blankStatus ? '' : fmtTrimmed(half, 0))}</td>
+                          <td style={dropTailSx(2, { background: '#DCF1FB', textAlign: 'center', fontWeight: 700, color: blankColor })}>{dropOr(2, blankStatus || formatComposite(overall))}</td>
+                          <td style={dropTailSx(3, { background: GWA_DATA_COLOR, textAlign: 'center', fontWeight: 700, color: blankColor })}>{dropOr(3, finalBlank || formatGrade(finalGrade))}</td>
+                          <td style={{ background: rStyle.bg, color: rStyle.color, textAlign: 'center', fontWeight: 700, width: 75, minWidth: 75, maxWidth: 75, padding: '2px 6px' }}>{finalRemarksKey ? ((lapsed || finalRemarksKey === 'INC') && g.grade?.inc_remarks ? <span title={remarksText(finalRemarksKey, g.grade)} style={{ fontSize: 9, lineHeight: 1.15, display: 'block', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{remarksText(finalRemarksKey, g.grade)}</span> : remarksFor(finalRemarksKey)) : ''}</td>
                         </>
                       );
                     })()
@@ -394,11 +532,29 @@ function PeriodBlock({ variant, title, comps, otherComps, classData, subject, st
         </table>
       </div>
 
-      <div style={{ fontSize: 11, marginTop: 40, maxWidth: 260 }}>
-        <p style={{ margin: '0 0 24px' }}>Prepared by:</p>
-        <p style={{ margin: 0, fontWeight: 700 }}>{classData.instructor?.name?.toUpperCase()}</p>
-        <p style={{ fontSize: 10, margin: 0, fontWeight: 700 }}>Instructor</p>
+      {/* Signature block aligned under the Name column */}
+      <div style={{ fontSize: 11, marginTop: 16, paddingLeft: 100, maxWidth: 280 }}>
+        <p style={{ margin: '0 0 16px', fontWeight: 600 }}>Prepared by:</p>
+        <p style={{ margin: 0, fontWeight: 700 }}>{formatPersonNameFirstLast(classData.instructor?.name).toUpperCase()}</p>
+        <p style={{ fontSize: 10, margin: 0, fontWeight: 600, color: '#444' }}>Faculty</p>
       </div>
+    </div>
+  );
+}
+
+const ZOOM_MIN = 30;
+const ZOOM_MAX = 200;
+
+// Floating − / % / + / Fit controls for the preview. Sits outside the zoomed
+// record so it stays the same size.
+function ZoomControls({ pct, isFit, onOut, onIn, onFit }) {
+  const btn = { width: 30, height: 30, border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 18, fontWeight: 700, color: '#1a3a5c', borderRadius: 6, lineHeight: 1 };
+  return (
+    <div className="no-print" style={{ position: 'fixed', top: 10, right: 14, zIndex: 50, display: 'flex', alignItems: 'center', gap: 2, background: '#fff', border: '1px solid #d1d5db', borderRadius: 8, padding: 3, boxShadow: '0 2px 8px rgba(0,0,0,0.12)', fontFamily: 'sans-serif' }}>
+      <button type="button" style={{ ...btn, opacity: pct <= ZOOM_MIN ? 0.35 : 1 }} disabled={pct <= ZOOM_MIN} onClick={onOut} title="Zoom out" aria-label="Zoom out">−</button>
+      <span style={{ minWidth: 46, textAlign: 'center', fontSize: 12, fontWeight: 600, color: '#374151' }}>{pct}%</span>
+      <button type="button" style={{ ...btn, opacity: pct >= ZOOM_MAX ? 0.35 : 1 }} disabled={pct >= ZOOM_MAX} onClick={onIn} title="Zoom in" aria-label="Zoom in">+</button>
+      <button type="button" style={{ ...btn, width: 'auto', padding: '0 10px', fontSize: 12, fontWeight: 600, background: isFit ? '#e8eef5' : 'transparent' }} onClick={onFit} title="Fit the whole width">Fit</button>
     </div>
   );
 }
@@ -417,6 +573,10 @@ export default function ClassRecordView() {
   const [componentScores, setComponentScores] = useState({});
   const [loading, setLoading] = useState(true);
   const hasAutoPrinted = useRef(false);
+  const rootRef = useRef(null);
+  // Preview zoom: null = fit to width (default), else a percentage.
+  const [zoomPct, setZoomPct] = useState(null);
+  const [fitScale, setFitScale] = useState(1);
 
   useEffect(() => {
     (async () => {
@@ -457,6 +617,31 @@ export default function ClassRecordView() {
     return () => clearTimeout(timer);
   }, [isPreview, readyToPrint]);
 
+  // Preview (inside a pop-up): the Midterm + Finals halves side by side are
+  // far wider than the pop-up, so by default the whole record is shrunk to
+  // fit its width — everything visible at once, scrolling only downward.
+  // Re-fitted whenever the pop-up is resized. The zoom buttons override it
+  // (zoomPct); "Fit" goes back. Printing is unaffected.
+  useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (!isPreview || !el) return undefined;
+    const apply = () => {
+      el.style.zoom = '1';
+      const natural = el.scrollWidth;
+      const available = document.documentElement.clientWidth;
+      // A few px of slack so rounding never leaves a sliver of sideways scroll.
+      const fit = natural > available ? (available - 4) / natural : 1;
+      setFitScale(fit);
+      el.style.zoom = String(zoomPct ? zoomPct / 100 : fit);
+    };
+    apply();
+    window.addEventListener('resize', apply);
+    return () => window.removeEventListener('resize', apply);
+  }, [isPreview, loading, classData, components, studentGrades, zoomPct]);
+  const currentPct = Math.round((zoomPct ? zoomPct / 100 : fitScale) * 100);
+  // Steps of 10% from wherever it is now (fit can be any value, e.g. 66%).
+  const zoomBy = (dir) => setZoomPct(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, (dir > 0 ? Math.floor(currentPct / 10) + 1 : Math.ceil(currentPct / 10) - 1) * 10)));
+
   if (loading) return <LoadingSpinner />;
   if (!classData) return <p className="p-10 text-center text-gray-400">Class not found.</p>;
   const midtermComps = midtermCompsForPrint.slice().sort((a, b) => a.order_index - b.order_index);
@@ -464,7 +649,17 @@ export default function ClassRecordView() {
   const hasComponents = midtermComps.length > 0 || finalsComps.length > 0;
 
   return (
-    <div style={{ fontFamily: 'Arial, sans-serif', color: '#111', maxWidth: '100%', margin: '0 auto', padding: '24px' }}>
+    <>
+    {isPreview && hasComponents && (
+      <ZoomControls
+        pct={currentPct}
+        isFit={!zoomPct}
+        onOut={() => zoomBy(-1)}
+        onIn={() => zoomBy(1)}
+        onFit={() => setZoomPct(null)}
+      />
+    )}
+    <div ref={rootRef} style={{ fontFamily: 'Arial, sans-serif', color: '#111', maxWidth: '100%', margin: '0 auto', padding: '12px 14px', ...(isPreview ? { width: 'max-content', minWidth: '100%' } : {}) }}>
       <style>{`
         @page { size: landscape; margin: 8mm; }
         @media print {
@@ -473,9 +668,9 @@ export default function ClassRecordView() {
           .cr-blocks { gap: 12px !important; }
         }
         .cr-table { border-collapse: collapse; font-size: 10px; white-space: nowrap; }
-        .cr-table th, .cr-table td { border: 1px solid #999; padding: 3px 5px; }
+        .cr-table th, .cr-table td { border: 1px solid #777; padding: 2px 4px; box-sizing: border-box; }
         .cr-table th { font-weight: 700; text-align: center; vertical-align: middle; color: #1a1a1a; }
-        .cr-table td { height: 20px; }
+        .cr-table td { height: 20px; vertical-align: middle; }
       `}</style>
 
       {/* Hidden entirely in preview mode (embedded read-only inside Admin's
@@ -495,8 +690,10 @@ export default function ClassRecordView() {
       {!hasComponents ? (
         <p className="p-10 text-center text-gray-400">This class has no Class Record components set up yet.</p>
       ) : (
-        <div style={{ overflowX: 'auto' }}>
-          <div className="cr-blocks" style={{ display: 'flex', gap: 32, alignItems: 'flex-start' }}>
+        // In preview the whole record is shrunk to fit instead (see the
+        // fit-to-width effect above), so it mustn't scroll on its own.
+        <div style={{ overflowX: isPreview ? 'visible' : 'auto' }}>
+          <div className="cr-blocks" style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
             <PeriodBlock
               variant="midterm"
               title="MIDTERM GRADE"
@@ -521,5 +718,6 @@ export default function ClassRecordView() {
         </div>
       )}
     </div>
+    </>
   );
 }

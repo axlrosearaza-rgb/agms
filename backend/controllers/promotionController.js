@@ -1,6 +1,7 @@
+const { USER_SECRET_FIELDS } = require('../utils/userFields');
 const { User, Grade, Class, Subject, Enrollment, Semester } = require('../models');
 const { Op } = require('sequelize');
-const { logActivity, promotionActivityRecentWhere } = require('../utils/activityLogger');
+const { logActivity } = require('../utils/activityLogger');
 const { asyncHandler } = require('../middleware/errorHandler');
 // Shared "notify every Admin" helper — emits the real-time
 // `notification:${userId}` Socket.IO event the frontend bell (and its
@@ -8,6 +9,16 @@ const { asyncHandler } = require('../middleware/errorHandler');
 // would leave it silently sitting there until the recipient's next page
 // load/manual refresh.
 const { notifyAdmins, createNotification } = require('./notificationController');
+
+const { logSectionActivity } = require('../utils/sectionActivity');
+
+// ── Advisers: promotion is done by each section's adviser ────────────────────
+const advisoriesOf = async (userId) => {
+  const me = await User.findByPk(userId, { attributes: ['advisories'] });
+  return Array.isArray(me?.advisories) ? me.advisories : [];
+};
+const sameSection = (a, b) => a.program === b.program && Number(a.year_level) === Number(b.year_level) && a.section === b.section;
+const advisesSection = async (userId, sec) => (await advisoriesOf(userId)).some((a) => sameSection(a, sec));
 
 // ── Helper: detect semester order from name ───────────────────────────────────
 const getSemesterOrder = (semesterName = '') => {
@@ -99,24 +110,26 @@ const getRequiredSubjectsByProgramYear = async (students, semOrder) => {
 // Fetches ALL students and ALL their grades in just 2 queries total.
 // No more 1 query per student — much faster regardless of student count.
 const evaluateStudents = asyncHandler(async (req, res) => {
-  const { semester, program, year_level } = req.query;
+  const { semester, program, year_level, section } = req.query;
 
   if (!semester) {
     return res.status(400).json({ message: 'Semester is required.' });
   }
 
+  // Promotion is the adviser's job, one advisory section at a time.
+  if (!(await advisesSection(req.user.id, { program, year_level, section }))) {
+    return res.status(403).json({ message: 'You can only evaluate your own advisory section.' });
+  }
+
   const semOrder = getSemesterOrder(semester);
 
   // ── Query 1: Get all matching students ───────────────────────────────
-  const studentWhere = { role: 'Student', status: 'Active' };
-  // Chairpersons are always scoped to their own program(s), regardless of what was requested
-  studentWhere.program = req.user.role === 'Chairperson' ? { [Op.in]: req.user.programs || [] } : (program || undefined);
-  if (!studentWhere.program) delete studentWhere.program;
-  if (year_level) studentWhere.year_level = parseInt(year_level);
+  // Graduated students are archived — never re-evaluated for promotion.
+  const studentWhere = { role: 'Student', status: 'Active', graduated_at: null, program, year_level: parseInt(year_level, 10), section };
 
   const students = await User.findAll({
     where: studentWhere,
-    attributes: { exclude: ['password'] },
+    attributes: { exclude: USER_SECRET_FIELDS },
     order: [
       ['program', 'ASC'],
       ['year_level', 'ASC'],
@@ -217,18 +230,19 @@ const evaluateStudents = asyncHandler(async (req, res) => {
     const missingSubjects = requiredSubjects
       ? requiredSubjects.filter((s) => !(passedSubjectIds[student.id] || new Set()).has(s.id) && !retakableFailedSubjectIds.has(s.id))
       : [];
-    // Of those missing subjects, the ones the student can't even enroll in
-    // yet — a prerequisite or co-requisite that hasn't itself been passed —
-    // as opposed to a subject they simply haven't gotten to. Distinct from
-    // ordinary "Incomplete Subjects" below since re-enrolling them in this
-    // subject alone wouldn't work; the prerequisite has to be cleared first.
-    const missingSubjectsBlockedByPrereqs = missingSubjects.filter((s) =>
-      (s.prerequisites || []).some((p) => !passedSet.has(p.id)) ||
-      (s.co_requisites || []).some((p) => !passedSet.has(p.id))
-    );
+    // Prerequisites start checking at the 2nd Semester of system deployment.
+    // In the 1st Semester, students' prior history predates system records, so
+    // prerequisite checks are skipped until 2nd Semester onward.
+    const missingSubjectsBlockedByPrereqs = semOrder === '2nd'
+      ? missingSubjects.filter((s) =>
+          (s.prerequisites || []).some((p) => !passedSet.has(p.id)) ||
+          (s.co_requisites || []).some((p) => !passedSet.has(p.id))
+        )
+      : [];
 
-    const gwa = grades.length > 0
-      ? (grades.reduce((sum, g) => sum + parseFloat(g.average || 0), 0) / grades.length).toFixed(1)
+    const isSetup = !!student.account_setup_at;
+    const gwa = isSetup && grades.length > 0
+      ? (grades.reduce((sum, g) => sum + parseFloat(g.average || 0), 0) / grades.length).toFixed(3)
       : null;
 
     const fullyVerified = isFullyVerified(grades);
@@ -251,29 +265,34 @@ const evaluateStudents = asyncHandler(async (req, res) => {
     // just a distinct, more specific status so a Chairperson can tell
     // "still missing work" apart from "done, just not signed off yet". A
     // Failed grade never blocks on its own anymore — see retakableFailedGrades.
+    // Not passing a subject (or having no grade for one) no longer holds a
+    // student back — it's a retake, and they're still promoted (marked
+    // Irregular). Only unfinished paperwork (verification/approval) waits.
+    const hasRetakes = retakableFailedGrades.length > 0 || missingSubjects.length > 0
+      || grades.some((g) => g.status === 'INC' || g.status === 'DRP');
     let promotionStatus;
     if (grades.length === 0) {
       promotionStatus = 'No Grades';
-    } else if (missingSubjectsBlockedByPrereqs.length > 0) {
-      promotionStatus = 'Missing Prerequisites';
-    } else if (missingSubjects.length > 0) {
-      promotionStatus = 'Incomplete Subjects';
     } else if (!fullyVerified) {
       promotionStatus = 'Pending Verification';
+    } else if (!alreadyReleased) {
+      // Approved, but the Admin hasn't released the grades to the students
+      // yet — the adviser can't promote until they're released.
+      promotionStatus = 'Pending Release';
     } else if (student.last_promoted_semester === semester) {
       // Already processed by a previous Promote run for this exact semester
       // — 1st-semester clearing doesn't change year_level, so without this
       // flag they'd otherwise keep showing up as freshly "Eligible" forever,
       // with no way to tell they were already handled.
       promotionStatus = 'Already Promoted';
-    } else if (student.year_level >= 4 && semOrder === '2nd') {
-      promotionStatus = 'For Graduation';
-    } else if (retakableFailedGrades.length > 0) {
+    } else if (hasRetakes) {
       // Otherwise fully on track, but still owes a retake or two on
       // standalone (no prerequisite/co-requisite) subjects — promotable, but
       // still flagged Irregular once actually promoted (see promoteStudents)
       // since they genuinely have a non-standard subject mix now.
       promotionStatus = 'Eligible (Retake Required)';
+    } else if (student.year_level >= 4 && semOrder === '2nd') {
+      promotionStatus = 'For Graduation';
     } else {
       promotionStatus = 'Eligible';
     }
@@ -296,6 +315,7 @@ const evaluateStudents = asyncHandler(async (req, res) => {
       program: student.program,
       year_level: student.year_level,
       section: student.section,
+      account_setup_at: student.account_setup_at,
       gwa,
       passed_count: passedCount,
       failed_count: failedCount,
@@ -304,8 +324,9 @@ const evaluateStudents = asyncHandler(async (req, res) => {
       // one flags whether its own prerequisite/co-requisite chain is still
       // unmet — that's what actually blocks re-enrolling in it (see
       // unmetPrereqsFor above), not whether the student can advance.
+      // Starts gating at 2nd Semester onward.
       retakable_failed_subjects: retakableFailedGrades.map((g) => {
-        const unmet = unmetPrereqsFor(g.class?.subject, passedSet);
+        const unmet = semOrder === '2nd' ? unmetPrereqsFor(g.class?.subject, passedSet) : [];
         return {
           code: g.class?.subject?.code,
           name: g.class?.subject?.name,
@@ -387,40 +408,34 @@ const evaluateStudents = asyncHandler(async (req, res) => {
   });
 });
 
-// ================= POST /api/promotions/promote =================
-// Also optimized — fetches all grades for selected students in one query.
-const promoteStudents = asyncHandler(async (req, res) => {
-  const { student_ids, semester } = req.body;
-
-  if (!student_ids || student_ids.length === 0) {
-    return res.status(400).json({ message: 'No students selected.' });
-  }
-
+// ================= PROMOTION ENGINE =================
+// One set of rules for both ways a student gets promoted:
+//   - AUTOMATICALLY (auto: true, actor: null) — the system checks on its own:
+//       · when Faculty release a 1st-Semester class's grades
+//         (autoPromoteForClass → cleared for the 2nd Semester), and
+//       · when a semester ends — Admin sets the next one as current
+//         (autoPromoteSemester → year level up / graduation after the 2nd
+//         Semester, so nobody jumps a year mid-semester).
+//   - MANUALLY by the section's adviser (POST /promote).
+//   The automatic paths are switched off (AUTO_PROMOTION below), so today
+//   only the adviser promotes.
+// A student is only promoted once every curriculum subject for their year +
+// semester is verified by the Chairperson and approved by Admin. Not passing
+// a subject never holds a student back — Failed / INC / Dropped subjects, and
+// curriculum subjects with no grade at all, are carried as retakes and the
+// student is marked Irregular. (Per-class automatic checks wait for the whole
+// semester before promoting over a missing subject; the semester-end check
+// and the adviser do not.) A prerequisite still has to be passed before its
+// follow-up subject can be taken — enforced at class-list import
+// (classController.importClassList).
+const runPromotion = async ({ app, students, semester, actor = null, auto = false, final = !auto }) => {
   const semOrder = getSemesterOrder(semester);
-  if (!semOrder) {
-    return res.status(400).json({
-      message: `Cannot determine semester order from: "${semester}". Make sure semester name includes "1st" or "2nd".`,
-    });
-  }
+  const result = { semOrder, processed: 0, graduatedCount: 0, skipped: 0, newlyIrregular: [], resultNames: [] };
+  if (!semOrder || students.length === 0) return result;
 
-  // ── Fetch all selected students, scoped to the Chairperson's own program ──
-  const studentWhere = { id: { [Op.in]: student_ids }, role: 'Student' };
-  if (req.user.role === 'Chairperson') studentWhere.program = { [Op.in]: req.user.programs || [] };
-  const students = await User.findAll({ where: studentWhere });
-
-  // Endorsement used to gate this (only students explicitly Endorsed for the
-  // semester were eligible), but that whole feature — including the only UI
-  // that ever created an Endorsement record — was removed from the app.
-  // Keeping this gate would make it impossible to promote anyone ever again,
-  // so selecting a student here (scoped to the Chairperson's own program,
-  // above) is now itself the affirmative action that used to be "Endorsed".
-
-  // ── Fetch all their grades in one query ──────────────────────────────
+  const studentIds = students.map((s) => s.id);
   const allGrades = await Grade.findAll({
-    where: {
-      student_id: { [Op.in]: student_ids },
-      submitted: true,
-    },
+    where: { student_id: { [Op.in]: studentIds }, submitted: true },
     include: [{
       model: Class,
       as: 'class',
@@ -438,138 +453,164 @@ const promoteStudents = asyncHandler(async (req, res) => {
     }],
   });
 
-  // Group grades by student
   const gradesByStudent = {};
-  allGrades.forEach(g => {
-    const sid = g.student_id;
-    if (!gradesByStudent[sid]) gradesByStudent[sid] = [];
-    gradesByStudent[sid].push(g);
-  });
-  const passedSubjectIds = passedSubjectIdsByStudent(gradesByStudent);
+  allGrades.forEach((g) => { (gradesByStudent[g.student_id] = gradesByStudent[g.student_id] || []).push(g); });
 
-  // Same "must have actually completed every required subject" rule as
-  // evaluateStudents — re-checked here server-side regardless of what the
-  // frontend already filtered to, so promoting can never be tricked into
-  // advancing someone who's merely un-Failed rather than actually done.
+  // Every class each student is enrolled in this semester. The automatic
+  // per-class check (not final) only acts once ALL of them have released
+  // grades — one released class must never clear a student for the next
+  // semester while their other classes are still running.
+  const enrolledClassIds = {};
+  if (!final) {
+    (await Enrollment.findAll({
+      where: { student_id: { [Op.in]: studentIds } },
+      include: [{ model: Class, as: 'class', where: { semester }, attributes: ['id'], required: true }],
+      attributes: ['student_id'],
+    })).forEach((e) => { (enrolledClassIds[e.student_id] = enrolledClassIds[e.student_id] || new Set()).add(e.class.id); });
+  }
+  const passedSubjectIds = passedSubjectIdsByStudent(gradesByStudent);
   const requiredByProgramYear = await getRequiredSubjectsByProgramYear(students, semOrder);
 
-  let processed = 0;
-  const resultNames = [];
+  // Where each student was before promoting — the section history entry goes there.
+  const processedBySection = new Map();
+  const countFor = (s) => {
+    const sec = { program: s.program, year_level: s.year_level, section: s.section };
+    const k = `${sec.program}|${sec.year_level}|${sec.section}`;
+    if (!processedBySection.has(k)) processedBySection.set(k, { sec, count: 0, graduated: 0 });
+    return processedBySection.get(k);
+  };
   const updatePromises = [];
-  const newlyIrregular = [];
+  const promotedNotices = []; // { id, message }
 
   for (const student of students) {
-    // Already actioned for this exact semester (evaluateStudents' own
-    // "Already Promoted" status, at line ~263) — skip outright instead of
-    // re-running the checks below and re-applying year_level/irregular
-    // updates a second time. The frontend now folds "Already Promoted" into
-    // the same "eligible" bucket as a genuinely new Promote, so without this
-    // guard a bulk "Promote All" that happens to include one would silently
-    // double-promote them (bump year_level again, re-flag Irregular, etc.).
+    // Already actioned for this exact semester — never promote twice.
     if (student.last_promoted_semester === semester) continue;
 
     const grades = gradesByStudent[student.id] || [];
-    // Every Failed subject is retake-required now, never blocking on its
-    // own — see unmetPrereqsFor/evaluateStudents above. It's handled below
-    // alongside the actual promotion, not as a reason to skip the student.
-    const retakableFailedGrades = grades.filter(g => g.status === 'Failed');
+    // Nothing graded this semester at all — not in school this term; left alone.
+    if (grades.length === 0) continue;
+    // Automatic per-class check: wait until every class the student is
+    // enrolled in this semester has its grades released.
+    if (!final) {
+      const releasedClassIds = new Set(grades.filter((g) => g.released).map((g) => g.class_id));
+      const enrolled = enrolledClassIds[student.id] || new Set();
+      if ([...enrolled].some((cid) => !releasedClassIds.has(cid))) continue;
+    }
+    // Anything not Passed (Failed, INC, Dropped) is carried as a retake.
+    const notPassedGrades = grades.filter((g) => g.status !== 'Passed');
+    const notPassedIds = new Set(notPassedGrades.map((g) => g.class?.subject_id).filter(Boolean));
 
-    // Skip students still missing a Passed grade for any curriculum-required
-    // subject this year+semester (never enrolled, or enrolled but never
-    // submitted) — not Failed, but not actually done either. Also covers a
-    // subject blocked by an unmet prerequisite/co-requisite (evaluateStudents'
-    // "Missing Prerequisites" status) — either way they can't advance on
-    // schedule, so they're auto-flagged Irregular the same as a Failed subject.
-    if (requiredByProgramYear) {
-      const retakableFailedSubjectIds = new Set(retakableFailedGrades.map((g) => g.class?.subject_id).filter(Boolean));
+    // Curriculum subjects with no grade at all this semester (e.g. never on a
+    // class list). Same exception as evaluateStudents: a continuing student's
+    // 1st Semester from before the system existed isn't checked.
+    let missingSubjects = [];
+    const skipCompletenessCheck = semOrder === '1st' && student.year_level > 1;
+    if (requiredByProgramYear && !skipCompletenessCheck) {
       const required = requiredByProgramYear[`${student.program}|${student.year_level}`] || [];
-      // A retakable Failed subject was attempted, not skipped — excluded
-      // here so it doesn't count as "missing" on top of being handled by
-      // the retake-flagging below.
-      const missing = required.some((s) => !(passedSubjectIds[student.id] || new Set()).has(s.id) && !retakableFailedSubjectIds.has(s.id));
-      if (missing) {
-        if (student.student_status !== 'Irregular') {
-          updatePromises.push(student.update({ student_status: 'Irregular' }));
-          newlyIrregular.push({ id: student.id, name: student.name });
-        }
-        continue;
-      }
+      missingSubjects = required.filter((s) => !(passedSubjectIds[student.id] || new Set()).has(s.id) && !notPassedIds.has(s.id));
     }
+    // Per-class automatic checks wait for the rest of the semester's classes;
+    // the final check (semester end / adviser) promotes anyway, as a retake.
+    if (missingSubjects.length && !final) continue;
 
-    // Skip students whose grades haven't cleared both sign-offs yet
-    // (Chairperson verification + Admin approval on every Passed grade) —
-    // same gate gradeController.releaseClassGrades enforces per class,
-    // checked here across the whole semester so nobody gets promoted on
-    // grades that were never actually verified and finalized. Not an
-    // academic problem (just administrative lag), so NOT auto-marked
-    // Irregular — re-running Promote once verification clears will pick
-    // them back up normally.
+    // Every grade the student DOES have must be verified + approved first.
     if (!isFullyVerified(grades)) continue;
+    // The automatic run also waits until the student can see every grade
+    // (released), so a promotion notice never arrives before the grades do.
+    // Nobody is promoted — automatically or by the adviser — before the Admin
+    // has released all of their grades to them.
+    if (!grades.every((g) => g.released)) continue;
 
-    // Promotable, but still owes a retake on a Failed subject — flagged
-    // Irregular alongside the promotion itself (not instead of it): they
-    // genuinely have a non-standard subject mix now, even though nothing
-    // stopped them from advancing on schedule.
-    const hasRetake = retakableFailedGrades.length > 0;
+    // Not passing a subject never holds a student back — they're promoted and
+    // marked Irregular, carrying it as a retake. (A subject that's a
+    // prerequisite still has to be passed before its follow-up subject can be
+    // taken — enforced when a class list is imported.)
+    const retakeCodesList = [...notPassedGrades.map((g) => g.class?.subject?.code), ...missingSubjects.map((s) => s.code)].filter(Boolean);
+    const hasRetake = retakeCodesList.length > 0;
     const irregularUpdate = (hasRetake && student.student_status !== 'Irregular') ? { student_status: 'Irregular' } : {};
-    if (hasRetake && student.student_status !== 'Irregular') {
-      newlyIrregular.push({ id: student.id, name: student.name });
-    }
-    const retakeNote = hasRetake ? ` [retaking ${retakableFailedGrades.map((g) => g.class?.subject?.code).join(', ')}]` : '';
+    if (hasRetake && student.student_status !== 'Irregular') result.newlyIrregular.push({ id: student.id, name: student.name });
+    const retakeCodes = retakeCodesList.join(', ');
+    const retakeNote = hasRetake ? ` [retaking ${retakeCodes}]` : '';
+    const retakeTail = hasRetake ? ` You still need to retake ${retakeCodes}.` : '';
 
     if (semOrder === '1st') {
-      // 1st semester passed → no year_level change, just cleared for 2nd sem.
-      // Nothing else about this student's record changes, so without
-      // recording last_promoted_semester here they'd otherwise keep
-      // evaluating as freshly "Eligible" forever on every future Evaluate
-      // run against this same semester.
+      countFor(student).count++;
       updatePromises.push(student.update({ ...irregularUpdate, last_promoted_semester: semester }));
-      processed++;
-      resultNames.push(`${student.name} (cleared for 2nd Semester)${retakeNote}`);
-
+      result.processed++;
+      result.resultNames.push(`${student.name} (cleared for 2nd Semester)${retakeNote}`);
+      promotedNotices.push({ id: student.id, title: 'Cleared for the 2nd Semester', message: `You completed ${semester} and are cleared for the 2nd Semester.${retakeTail}` });
     } else if (semOrder === '2nd') {
       if (student.year_level < 4) {
-        // Captured before .update() — Sequelize's .update() mutates the
-        // in-memory instance's year_level synchronously (the DB write is
-        // the only async part), so reading student.year_level again AFTER
-        // calling it below would already see the new value and double-count
-        // the +1 in the message (e.g. Year 1 -> correctly persisted as
-        // Year 2, but the text would say "Year 3").
+        // Captured before .update() mutates the instance.
         const nextYear = student.year_level + 1;
-        // Queue all year_level updates to run in parallel
+        countFor(student).count++;
         updatePromises.push(student.update({ ...irregularUpdate, year_level: nextYear, last_promoted_semester: semester }));
-        processed++;
-        resultNames.push(`${student.name} → Year ${nextYear}${retakeNote}`);
+        result.processed++;
+        result.resultNames.push(`${student.name} → Year ${nextYear}${retakeNote}`);
+        promotedNotices.push({ id: student.id, title: 'You have been promoted', message: `You completed ${semester} and are now in Year ${nextYear}${student.section ? ` — Section ${student.section}` : ''}.${retakeTail}` });
       } else {
-        // Year 4 graduating
-        // Optionally: updatePromises.push(student.update({ student_status: 'Graduated' }));
-        updatePromises.push(student.update({ ...irregularUpdate, last_promoted_semester: semester }));
-        processed++;
-        resultNames.push(`${student.name} (Graduating)${retakeNote}`);
+        // Year 4, final semester → graduated (archived, never deleted). Still
+        // owing a retake means not done yet — stays active.
+        const graduate = !hasRetake;
+        updatePromises.push(student.update({
+          ...irregularUpdate,
+          last_promoted_semester: semester,
+          ...(graduate ? { graduated_at: new Date(), graduated_semester: semester } : {}),
+        }));
+        if (graduate) result.graduatedCount++;
+        const tally = countFor(student);
+        tally.count++;
+        if (graduate) tally.graduated++;
+        result.processed++;
+        result.resultNames.push(`${student.name} (${graduate ? 'Graduated — archived' : 'Graduating, pending retake'})${retakeNote}`);
+        promotedNotices.push({
+          id: student.id,
+          title: graduate ? 'Congratulations, graduate!' : 'Final semester completed',
+          message: graduate
+            ? `You passed all your subjects in ${semester}. Congratulations on completing your program!`
+            : `You completed ${semester}, but still need to retake ${retakeCodes} before graduating.`,
+        });
       }
     }
   }
 
-  // Run all DB updates at the same time instead of one by one
   await Promise.all(updatePromises);
+  result.skipped = students.length - result.processed;
 
-  const skipped = students.length - processed;
-  const actionLabel = semOrder === '1st'
-    ? `cleared ${processed} students for 2nd semester (${semester})`
-    : `promoted ${processed} students to next year level (${semester})`;
+  if (result.processed > 0) {
+    const who = actor ? actor.name : 'The system';
+    const actionLabel = semOrder === '1st'
+      ? `${auto ? 'automatically ' : ''}cleared ${result.processed} students for 2nd semester (${semester})`
+      : `${auto ? 'automatically ' : ''}promoted ${result.processed} students to next year level (${semester})`;
+    if (actor) await logActivity(actor.id, actionLabel, 'User', null);
 
-  await logActivity(req.user.id, actionLabel, 'User', null);
+    // Section history — stays with the section for whoever advises it next.
+    const historyUser = actor || { id: null, name: 'System (automatic)' };
+    for (const { sec, count, graduated } of processedBySection.values()) {
+      const what = semOrder === '1st'
+        ? `cleared ${count} student(s) for the 2nd Semester`
+        : Number(sec.year_level) >= 4
+          ? `processed ${count} 4th-year student(s)${graduated ? ` — ${graduated} graduated` : ''}`
+          : `promoted ${count} student(s) to Year ${Number(sec.year_level) + 1} (Section ${sec.section})`;
+      await logSectionActivity(sec, historyUser, `${what} — ${semester}`);
+    }
 
-  const notifTitle = semOrder === '1st' ? 'Students Advanced to 2nd Semester' : 'Students Promoted';
-  const notifMsg = semOrder === '1st'
-    ? `${processed} student(s) have been cleared for 2nd semester enrollment (${semester}).`
-    : `${processed} student(s) have been promoted to the next year level (${semester}).`;
+    await notifyAdmins(app, {
+      title: semOrder === '1st' ? 'Students Advanced to 2nd Semester' : 'Students Promoted',
+      message: semOrder === '1st'
+        ? `${who} cleared ${result.processed} student(s) for 2nd semester enrollment (${semester}).`
+        : `${who} promoted ${result.processed} student(s) to the next year level (${semester}).`,
+      type: 'promotion',
+      link: '/admin/users',
+    });
 
-  await notifyAdmins(req.app, { title: notifTitle, message: notifMsg, type: 'promotion', link: '/admin/promotions' });
+    // Each promoted student hears about it.
+    await Promise.all(promotedNotices.map((n) => createNotification(app, { userId: n.id, title: n.title, message: n.message, type: 'promotion', link: '/student' })));
+  }
 
-  if (newlyIrregular.length > 0) {
-    await logActivity(req.user.id, `auto-marked ${newlyIrregular.length} student(s) Irregular (failed/incomplete subjects, ${semester})`, 'User', null);
-    await Promise.all(newlyIrregular.map((s) => createNotification(req.app, {
+  if (result.newlyIrregular.length > 0) {
+    if (actor) await logActivity(actor.id, `auto-marked ${result.newlyIrregular.length} student(s) Irregular (failed/incomplete subjects, ${semester})`, 'User', null);
+    await Promise.all(result.newlyIrregular.map((s) => createNotification(app, {
       userId: s.id,
       title: 'Academic Status Update',
       message: 'Your academic status has been updated to Irregular due to a failed or incomplete subject. Please see your adviser for re-enrollment guidance.',
@@ -577,122 +618,117 @@ const promoteStudents = asyncHandler(async (req, res) => {
       link: '/student/grades',
     })));
   }
+  return result;
+};
 
-  const baseMessage = semOrder === '1st'
-    ? `Successfully cleared ${processed} student(s) for 2nd semester.`
-    : `Successfully promoted ${processed} student(s) to the next year level.`;
+// Students still in school who have submitted grades in `semester`.
+const studentsGradedIn = async (semester, extraWhere = {}) => {
+  const rows = await Grade.findAll({
+    where: { submitted: true },
+    attributes: ['student_id'],
+    include: [{ model: Class, as: 'class', where: { semester, ...extraWhere }, attributes: [] }],
+    raw: true,
+  });
+  const ids = [...new Set(rows.map((r) => r.student_id))];
+  if (!ids.length) return [];
+  return User.findAll({ where: { id: { [Op.in]: ids }, role: 'Student', status: 'Active', graduated_at: null } });
+};
 
-  const irregularNote = newlyIrregular.length > 0
-    ? ` ${newlyIrregular.length} student(s) with failed/incomplete subjects were automatically marked Irregular.`
+// A class's grades were just released to its students. For a 1st-Semester class, its
+// students are checked right away (cleared for the 2nd Semester once ALL their
+// subjects are done). 2nd-Semester promotion (year level / graduation) waits
+// for the semester to end — see autoPromoteSemester. Never throws.
+// Off: only the section's ADVISER promotes students (My Advisory → Promotion,
+// POST /promote below). Set to true to also promote automatically when grades
+// are released and when the semester ends.
+const AUTO_PROMOTION = false;
+
+const autoPromoteForClass = async (app, classId) => {
+  if (!AUTO_PROMOTION) return null;
+  try {
+    const cls = await Class.findByPk(classId, { attributes: ['id', 'semester'] });
+    if (!cls) return null;
+    const order = getSemesterOrder(cls.semester);
+    if (order === '2nd') {
+      // Year-level promotion normally waits for the semester to end — but a
+      // class released AFTER its semester already ended is checked now.
+      const sem = await Semester.findOne({ where: { name: cls.semester }, attributes: ['is_current', 'status'] });
+      if (!sem || (sem.is_current && sem.status !== 'Completed')) return null;
+    } else if (order !== '1st') {
+      return null;
+    }
+    const students = await studentsGradedIn(cls.semester, { id: cls.id });
+    // A late 2nd-Semester release is the semester's final word for these students.
+    return await runPromotion({ app, students, semester: cls.semester, auto: true, final: order === '2nd' });
+  } catch (err) {
+    console.error('[auto-promotion] class check failed:', err.message);
+    return null;
+  }
+};
+
+// A semester just ended (Admin set the next one as current): everyone graded
+// in it is checked — cleared (1st Sem) or promoted / graduated (2nd Sem).
+// Never throws.
+const autoPromoteSemester = async (app, semesterName) => {
+  if (!AUTO_PROMOTION) return null;
+  try {
+    const students = await studentsGradedIn(semesterName);
+    const result = await runPromotion({ app, students, semester: semesterName, auto: true, final: true });
+    console.log(`[auto-promotion] ${semesterName}: ${result.processed} promoted, ${result.skipped} not yet eligible.`);
+    return result;
+  } catch (err) {
+    console.error('[auto-promotion] semester check failed:', err.message);
+    return null;
+  }
+};
+
+// ================= POST /api/promotions/promote =================
+// The adviser's manual fallback — same engine, their own section only.
+const promoteStudents = asyncHandler(async (req, res) => {
+  const { student_ids, semester } = req.body;
+
+  if (!student_ids || student_ids.length === 0) {
+    return res.status(400).json({ message: 'No students selected.' });
+  }
+  if (!getSemesterOrder(semester)) {
+    return res.status(400).json({
+      message: `Cannot determine semester order from: "${semester}". Make sure semester name includes "1st" or "2nd".`,
+    });
+  }
+
+  const students = await User.findAll({ where: { id: { [Op.in]: student_ids }, role: 'Student', graduated_at: null } });
+  const mine = await advisoriesOf(req.user.id);
+  if (students.some((s) => !mine.some((a) => sameSection(a, s)))) {
+    return res.status(403).json({ message: 'You can only promote students in your own advisory section.' });
+  }
+
+  const r = await runPromotion({ app: req.app, students, semester, actor: req.user });
+
+  const baseMessage = r.semOrder === '1st'
+    ? `Successfully cleared ${r.processed} student(s) for 2nd semester.`
+    : `Successfully promoted ${r.processed} student(s) to the next year level.`;
+  const graduatedNote = r.graduatedCount > 0
+    ? ` ${r.graduatedCount} 4th-year student(s) graduated and were moved to the Graduated archive (accounts and records kept).`
+    : '';
+  const irregularNote = r.newlyIrregular.length > 0
+    ? ` ${r.newlyIrregular.length} student(s) with failed/incomplete subjects were automatically marked Irregular.`
     : '';
 
   res.json({
-    // Anyone selected but not processed either had a Failed/incomplete/
-    // not-yet-verified grade, or was already promoted for this exact
-    // semester earlier — re-run Evaluate to see exactly which and why.
-    message: (skipped > 0 ? `${baseMessage} ${skipped} student(s) were skipped (already promoted, failed, incomplete, or not yet verified).` : baseMessage) + irregularNote,
-    promoted: processed,
-    skipped,
-    newly_irregular: newlyIrregular.length,
-    semester_order: semOrder,
-    names: resultNames,
-  });
-});
-
-// ================= POST /api/promotions/mark-irregular =================
-const markIrregular = asyncHandler(async (req, res) => {
-  const { student_id } = req.body;
-
-  const student = await User.findByPk(student_id);
-  if (!student || student.role !== 'Student') {
-    return res.status(404).json({ message: 'Student not found.' });
-  }
-
-  if (req.user.role === 'Chairperson' && !(req.user.programs || []).includes(student.program)) {
-    return res.status(403).json({ message: 'You may only mark students in your own program.' });
-  }
-
-  await student.update({ student_status: 'Irregular' });
-
-  await logActivity(req.user.id, `marked ${student.name} as Irregular`, 'User', student_id);
-
-  await createNotification(req.app, {
-    userId: student_id,
-    title: 'Academic Status Update',
-    message: 'Your academic status has been updated. Please see your adviser for re-enrollment guidance.',
-    type: 'promotion',
-    link: '/student/grades',
-  });
-
-  res.json({
-    message: `${student.name} has been marked as Irregular.`,
-    student: student.toSafeJSON(),
-  });
-});
-
-// ================= GET /api/promotions/history =================
-const getPromotionHistory = asyncHandler(async (req, res) => {
-  const { ActivityLog } = require('../models');
-
-  // Same 24h retention every other promotion/regularization entry gets
-  // (see utils/activityLogger.js's promotionActivityRecentWhere) — without
-  // this, an entry that ages out of the Admin Dashboard's own Recent
-  // Activity would keep sitting here indefinitely, the one place still
-  // showing something that's supposed to be archived everywhere else.
-  const logs = await ActivityLog.findAll({
-    where: promotionActivityRecentWhere(),
-    include: [{ model: User, as: 'user', attributes: ['id', 'name', 'role'] }],
-    order: [['created_at', 'DESC']],
-    limit: 50,
-  });
-
-  res.json({ history: logs });
-});
-
-// ================= GET /api/promotions/overview =================
-// A dashboard-sized status summary — the current semester's promotion
-// summary counts (Eligible, Failed, Incomplete, etc.) without requiring
-// anyone to have actually clicked "Evaluate" in Promotion Management first,
-// and without the full per-student payload that page needs (3,000+ students'
-// worth) — just the numbers. Reuses evaluateStudents' own logic wholesale by
-// calling it internally and capturing its response instead of re-deriving
-// the same computation a second, slightly-different way.
-const getPromotionOverview = asyncHandler(async (req, res) => {
-  const currentSemester = await Semester.findOne({ where: { is_current: true } });
-  if (!currentSemester) {
-    return res.json({ semester: null, summary: null });
-  }
-
-  // asyncHandler's wrapper doesn't return/await its inner promise (it's
-  // fire-and-forget, relying on Express's own req/res lifecycle) — so
-  // capturing the result has to happen via this res.json() call resolving a
-  // promise of our own, not by awaiting evaluateStudents(...) directly
-  // (that would just resolve immediately with undefined, before the inner
-  // logic has actually run).
-  const captured = await new Promise((resolve, reject) => {
-    const capturingRes = {
-      status() { return this; },
-      json(payload) { resolve(payload); return this; },
-    };
-    evaluateStudents(
-      { query: { semester: currentSemester.name }, user: req.user },
-      capturingRes,
-      reject
-    );
-  });
-
-  res.json({
-    semester: currentSemester.name,
-    academic_year: currentSemester.academic_year,
-    semester_order: captured?.semester_order,
-    summary: captured?.summary,
+    message: (r.skipped > 0 ? `${baseMessage} ${r.skipped} student(s) were skipped (already promoted, failed, incomplete, or not yet verified).` : baseMessage) + graduatedNote + irregularNote,
+    graduated: r.graduatedCount,
+    promoted: r.processed,
+    skipped: r.skipped,
+    newly_irregular: r.newlyIrregular.length,
+    semester_order: r.semOrder,
+    names: r.resultNames,
   });
 });
 
 module.exports = {
   evaluateStudents,
   promoteStudents,
-  markIrregular,
-  getPromotionHistory,
-  getPromotionOverview,
+  runPromotion,
+  autoPromoteForClass,
+  autoPromoteSemester,
 };

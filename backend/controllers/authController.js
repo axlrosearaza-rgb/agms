@@ -1,6 +1,7 @@
 const crypto = require('crypto');
-const bcrypt = require('bcryptjs');
-const { Op } = require('sequelize');
+const bcrypt = require('../utils/bcrypt');
+const { Op, fn, col } = require('sequelize');
+const { sequelize } = require('../config/database');
 const { User, PendingRegistration } = require('../models');
 const { generateToken } = require('../middleware/auth');
 const { logActivity } = require('../utils/activityLogger');
@@ -33,6 +34,60 @@ const EMAIL_FORMAT_HINT = 'Please enter a valid Gmail or SSU email address (e.g.
 // complete someone else's registration.
 const hashCode = (code) => crypto.createHash('sha256').update(code).digest('hex');
 const generateVerificationCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+
+// Registration duplicate check, shared by register(), verifyEmail() and the
+// sign-up form's live check (checkRegistration). A student already on record
+// — same email, same Student ID Number, or the exact same full name ("First
+// M. Last", case-insensitive) — can't register a second account. Rejected
+// accounts don't count: register() deletes those and lets the student retry.
+// Returns { field, message } for the first conflict found, or null.
+const findRegistrationConflict = async ({ email, student_no, name }) => {
+  const or = [];
+  if (email) or.push({ email: email.trim().toLowerCase() });
+  if (student_no) or.push({ student_no: student_no.trim() });
+  if (name) or.push({ role: 'Student', [Op.and]: [sequelize.where(fn('lower', col('name')), name.trim().replace(/\s+/g, ' ').toLowerCase())] });
+  if (or.length === 0) return null;
+
+  const existing = await User.findAll({
+    where: { status: { [Op.ne]: 'Rejected' }, [Op.or]: or },
+    attributes: ['email', 'student_no', 'name', 'role'],
+  });
+  if (email && existing.some((u) => u.email === email.trim().toLowerCase())) {
+    return { field: 'email', message: 'An account with this email address already exists.' };
+  }
+  if (student_no && existing.some((u) => u.student_no === student_no.trim())) {
+    return { field: 'student_no', message: 'An account with this Student ID Number already exists.' };
+  }
+  if (name && existing.some((u) => u.role === 'Student')) {
+    return { field: 'name', message: 'A student with this exact name is already registered. If this is you, sign in instead or contact the administrator.' };
+  }
+  return null;
+};
+
+// Builds the stored "First M. Last" name the same way register() does, so the
+// live check and the real submission compare identical strings.
+const buildCanonicalName = (first_name, middle_initial, last_name) => {
+  const first = String(first_name || '').trim();
+  const last = String(last_name || '').trim();
+  const raw = String(middle_initial || '').trim();
+  const letter = !raw || /^n\/?a$/i.test(raw) || raw.toLowerCase() === 'none' ? '' : raw.replace(/\./g, '').trim().slice(0, 1).toUpperCase();
+  if (!first || !last) return '';
+  return letter ? `${first} ${letter}. ${last}` : `${first} ${last}`;
+};
+
+// POST /api/auth/check-registration — Body: any of { email, student_no,
+// first_name, middle_initial, last_name }. The sign-up form calls this as the
+// student types, to show "already registered" and disable the Sign Up button
+// before they ever submit. register() still re-checks on its own.
+const checkRegistration = asyncHandler(async (req, res) => {
+  const { email, student_no, first_name, middle_initial, last_name } = req.body || {};
+  const conflict = await findRegistrationConflict({
+    email: typeof email === 'string' ? email : '',
+    student_no: typeof student_no === 'string' ? student_no : '',
+    name: buildCanonicalName(first_name, middle_initial, last_name),
+  });
+  res.json({ available: !conflict, ...(conflict || {}) });
+});
 
 // POST /api/auth/login — Admin/Chairperson/Faculty log in with `username`;
 // Students log in with `student_no`. One shared field on the login form, matched
@@ -218,6 +273,12 @@ const register = asyncHandler(async (req, res) => {
     }
   }
 
+  // Same student re-registering under a different email/ID number.
+  const nameConflict = await findRegistrationConflict({ name: canonicalName });
+  if (nameConflict) {
+    return res.status(409).json({ message: nameConflict.message, field: nameConflict.field });
+  }
+
   // Housekeeping: sweep out expired attempts so they never pile up or collide
   // with someone re-using the same email/student number later.
   await PendingRegistration.destroy({ where: { verification_expires: { [Op.lt]: new Date() } } });
@@ -314,6 +375,13 @@ const verifyEmail = asyncHandler(async (req, res) => {
   if (conflict) {
     await pending.destroy();
     return res.status(409).json({ message: 'An account with this email or Student ID Number was already created. Please try signing in, or contact the administrator.' });
+  }
+  // Two unverified sign-ups for the same person — whichever confirms second
+  // is the duplicate.
+  const nameConflict = await findRegistrationConflict({ name: pending.name });
+  if (nameConflict) {
+    await pending.destroy();
+    return res.status(409).json({ message: nameConflict.message });
   }
 
   // hooks: false — the password is already bcrypt-hashed (see register()), so
@@ -478,8 +546,9 @@ const changeUsername = asyncHandler(async (req, res) => {
 // never lock someone out of the one that still works.
 const requestEmailChange = asyncHandler(async (req, res) => {
   const { newEmail, currentPassword } = req.body;
-  if (!newEmail || !isValidRegistrationEmail(newEmail)) {
-    return res.status(400).json({ message: EMAIL_FORMAT_HINT });
+  const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+  if (!newEmail || !emailRegex.test(String(newEmail).trim())) {
+    return res.status(400).json({ message: 'Please enter a valid email address (e.g. juandelacruz@gmail.com).' });
   }
   if (!currentPassword) {
     return res.status(400).json({ message: 'Enter your current password to confirm this change.' });
@@ -497,6 +566,45 @@ const requestEmailChange = asyncHandler(async (req, res) => {
   const existing = await User.findOne({ where: { email: value } });
   if (existing && existing.id !== user.id) {
     return res.status(409).json({ message: 'That email address is already in use on another account.' });
+  }
+
+  // If user has NO email on file yet (e.g. created by Admin without email),
+  // set their email directly upon password confirmation!
+  if (!user.email) {
+    user.email = value;
+    user.email_verified = true;
+    user.pending_email = null;
+    user.email_verification_code = null;
+    user.email_verification_expires = null;
+    await user.save();
+
+    await logActivity(user.id, 'added their email address', 'User', user.id);
+    await createNotification(req.app, {
+      userId: user.id,
+      title: 'Email Address Added',
+      message: `Your account email address has been set to "${value}". You can now use it for account recovery.`,
+      type: 'security',
+      link: settingsPathFor(user.role),
+    });
+
+    return res.json({
+      message: 'Email address added to your account successfully.',
+      user: user.toSafeJSON(),
+      directUpdated: true,
+    });
+  }
+
+  // Offline mode: no code can be e-mailed — the new address is saved straight
+  // away, marked not verified (same response shape as the direct update above).
+  if (require('../utils/offline').isOffline()) {
+    user.email = value;
+    user.email_verified = false;
+    user.pending_email = null;
+    user.email_verification_code = null;
+    user.email_verification_expires = null;
+    await user.save();
+    await logActivity(user.id, 'changed their email address (offline mode — not verified)', 'User', user.id);
+    return res.json({ message: 'Email address saved. It will be verified once the system is online.', user: user.toSafeJSON(), directUpdated: true });
   }
 
   const verificationCode = generateVerificationCode();
@@ -589,6 +697,7 @@ const changePassword = asyncHandler(async (req, res) => {
   }
 
   user.password = newPassword;
+  user.password_changed_at = new Date();
   await user.save();
 
   await logActivity(user.id, 'changed password', 'User', user.id);
@@ -602,6 +711,30 @@ const changePassword = asyncHandler(async (req, res) => {
   res.json({ message: 'Password changed successfully.' });
 });
 
+// POST /api/auth/first-password — Body: { newPassword, confirmPassword }.
+// Staff (Faculty / Chairperson / Admin) replace the password their account
+// was created with, the first time they sign in — the same step students do
+// in their setup wizard. Only while password_changed_at is still unset.
+const setFirstPassword = asyncHandler(async (req, res) => {
+  const user = await User.findByPk(req.user.id);
+  if (!user || user.role === 'Student') return res.status(403).json({ message: 'This step is for staff accounts.' });
+  if (user.password_changed_at) return res.status(400).json({ message: 'You have already set your own password.' });
+
+  const { newPassword, confirmPassword } = req.body;
+  const weak = require('../utils/passwordRules').weakPasswordMessage(newPassword || '');
+  if (weak) return res.status(400).json({ message: weak });
+  if (newPassword !== confirmPassword) return res.status(400).json({ message: 'Passwords do not match.' });
+  if (await user.comparePassword(newPassword)) {
+    return res.status(400).json({ message: 'Choose a new password — not the one you were given.' });
+  }
+
+  user.password = newPassword;
+  user.password_changed_at = new Date();
+  await user.save();
+  await logActivity(user.id, 'set their own password (first login)', 'User', user.id);
+  res.json({ message: 'Your new password is saved.', user: user.toSafeJSON() });
+});
+
 // POST /api/auth/forgot-password — Body: { email }. Always responds with the same
 // generic message whether or not the email is registered, so this endpoint can't
 // be used to probe which email addresses have an account (account enumeration).
@@ -611,6 +744,10 @@ const forgotPassword = asyncHandler(async (req, res) => {
 
   if (!email) {
     return res.status(400).json({ message: 'Email address is required.' });
+  }
+  // Offline mode: a reset link can't be e-mailed.
+  if (require('../utils/offline').isOffline()) {
+    return res.status(503).json({ message: 'The system is running offline, so a password reset link can\'t be e-mailed right now. Resetting a password by e-mail will work again once the system is back online.' });
   }
 
   const user = await User.findOne({ where: { email: email.trim().toLowerCase() } });
@@ -664,6 +801,7 @@ const resetPassword = asyncHandler(async (req, res) => {
   }
 
   user.password = password;
+  user.password_changed_at = new Date();
   user.reset_password_token = null;
   user.reset_password_expires = null;
   await user.save();
@@ -672,4 +810,26 @@ const resetPassword = asyncHandler(async (req, res) => {
   res.json({ message: 'Your password has been reset. You may now sign in with your new password.' });
 });
 
-module.exports = { login, register, verifyEmail, resendVerificationCode, getMe, changeUsername, requestEmailChange, confirmEmailChange, verifyPassword, changePassword, acceptPrivacyPolicy, forgotPassword, resetPassword };
+// PUT /api/auth/preferences  { idle_lock_minutes }
+// The signed-in staff member's own screen-lock setting (Settings page):
+// how many minutes of inactivity before the screen locks, or 0 for never.
+const IDLE_LOCK_CHOICES = [0, 5, 10, 15, 30, 60];
+const updatePreferences = asyncHandler(async (req, res) => {
+  const user = await User.findByPk(req.user.id);
+  if (!user) return res.status(404).json({ message: 'User not found.' });
+  if (!['Admin', 'Chairperson', 'Faculty'].includes(user.role)) {
+    return res.status(403).json({ message: 'The screen-lock setting is only for staff accounts.' });
+  }
+  if (req.body.idle_lock_minutes !== undefined) {
+    const minutes = parseInt(req.body.idle_lock_minutes, 10);
+    if (!IDLE_LOCK_CHOICES.includes(minutes)) {
+      return res.status(400).json({ message: 'Choose Off, 5, 10, 15, 30 or 60 minutes.' });
+    }
+    user.idle_lock_minutes = minutes;
+  }
+  await user.save();
+  await logActivity(user.id, `set screen lock to ${user.idle_lock_minutes === 0 ? 'off' : `${user.idle_lock_minutes} minutes`}`, 'User', user.id);
+  res.json({ message: 'Settings saved.', user: user.toSafeJSON() });
+});
+
+module.exports = { updatePreferences, login, register, checkRegistration, verifyEmail, resendVerificationCode, getMe, changeUsername, requestEmailChange, confirmEmailChange, verifyPassword, setFirstPassword, changePassword, acceptPrivacyPolicy, forgotPassword, resetPassword };

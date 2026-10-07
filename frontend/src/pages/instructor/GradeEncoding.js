@@ -1,8 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { useDraftState } from '../../hooks/useDraftState';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import { Icons, Badge, LoadingSpinner, Modal, ConfirmDialog, programHeaderClass, programCascadeGradient, ProgramDot, ProgramBadge, formatPersonName, comparePeopleNames } from '../../components/common';
+import { Icons, Badge, LoadingSpinner, Modal, ConfirmDialog, ProgramDot, ProgramBadge, formatPersonName, comparePeopleNames, useEscapeToClose } from '../../components/common';
 import StudentGradeRecordModal from '../../components/common/StudentGradeRecordModal';
+import PhotoScoreScannerModal from '../../components/common/PhotoScoreScannerModal';
+import ExcelImportModal from '../../components/common/ExcelImportModal';
+import { parseAndValidateClassRecordExcel } from '../../utils/classRecordExcelImport';
 import { gradeService } from '../../services';
 import API from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
@@ -12,7 +15,13 @@ import {
   itemRate,
   componentAverage,
   periodComposite,
-  periodGWA,
+  finalGradeAverage,
+  gwaFromComposite,
+  formatComposite,
+  halfComposite,
+  overallComposite,
+  formatGrade,
+  fmtTrimmed,
   remarksFor,
   remarksStyle,
   RATE_FORMULAS,
@@ -26,6 +35,8 @@ import {
   exportClassRecordToExcel,
   dropSequence,
   dropCellStyle,
+  remarksText,
+  isLapsedInc,
 } from '../../utils/classRecordExcel';
 import { exportGradingSheetDocx } from '../../utils/gradingSheetDocx';
 
@@ -36,6 +47,23 @@ import { exportGradingSheetDocx } from '../../utils/gradingSheetDocx';
 const withinMax = (value, max) => {
   if (value === '') return true;
   if (!/^\d*\.?\d*$/.test(value)) return false;
+  const n = parseFloat(value);
+  return isNaN(n) || n <= max;
+};
+
+// Restricts typed input for a direct-rate item to the [min, max] rate range
+// (typically 50 to 95 for SSU's default 50_45 formula). Rejects initial digits
+// below the tens digit of the minimum (e.g. 0-4 for a min of 50) and rejects
+// numbers exceeding max (e.g. 96). Single digits (5-9) are allowed while
+// typing so the user can complete a 2-digit number (50-95); onBlur clamps any
+// unfinished sub-min entry.
+const withinRate = (value, min = 50, max = 95) => {
+  if (value === '') return true;
+  if (!/^\d*\.?\d*$/.test(value)) return false;
+  if (value.startsWith('.')) return false;
+  const minFirstDigit = Math.floor(min / 10);
+  const firstDigit = parseInt(value[0], 10);
+  if (isNaN(firstDigit) || firstDigit < minFirstDigit) return false;
   const n = parseFloat(value);
   return isNaN(n) || n <= max;
 };
@@ -58,16 +86,14 @@ const OVERALL_COLOR = '#00B0F0';     // "Overall Grade" (combined composite, bot
 // Still fully editable: every SCORE cell here is a live input, exactly like
 // before, just laid out to match the official document this data eventually
 // becomes rather than a simplified stand-in for it.
-function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, updateScore, locked, onViewStudent, onMarkINC, onResolveINC, onMarkDRP, onUndoDRP, formula = RATE_FORMULAS['50_45'] }) {
+function PeriodTable({ fit = false, comps, otherComps = [], studentGrades, componentScores, updateScore, locked, classSent = false, onViewStudent, canViewRecord = () => false, onMarkINC, onResolveINC, onMarkDRP, onUndoDRP, formula = RATE_FORMULAS['50_45'] }) {
   const compNames = comps.map((c) => c.name);
   // comps is already filtered to one period by the caller, so every
   // component in it shares the same period.
   const isFinals = comps[0]?.period === 'Finals';
   // A direct-rate item (item.is_rate_direct) has no raw score at all — just
-  // the one Rate column, not the usual Score+Rate pair — so every column
-  // count/width/colSpan that used to assume a flat "2 per item" has to sum
-  // this instead.
-  const itemColSpan = (item) => (item.is_rate_direct ? 1 : 2);
+  // the one Rate column. When show_rate is false, the Rate column is hidden.
+  const itemColSpan = (item) => (item.is_rate_direct ? (item.show_rate !== false ? 1 : 0) : (item.show_rate !== false ? 2 : 1));
   // Fully user-controlled via the Setup modal's own "Show Ave" checkbox —
   // no automatic override tied to item count (a component that becomes a
   // single Rate-only item defaults to false there at that moment, but can
@@ -89,8 +115,12 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
   const colWidths = [40, 90, 150]; // #, Student No., Student Name
   comps.forEach((c) => {
     (c.items || []).forEach((item) => {
-      if (item.is_rate_direct) colWidths.push(46); // just Rate, narrow — no Score column
-      else colWidths.push(60, 50); // Score, Rate
+      if (item.is_rate_direct) {
+        if (item.show_rate !== false) colWidths.push(56); // just Rate, comfortable width — no Score column
+      } else {
+        colWidths.push(60); // Score
+        if (item.show_rate !== false) colWidths.push(50); // Rate
+      }
     });
     if (showAveCol(c)) colWidths.push(56); // Ave
     colWidths.push(50); // weight%
@@ -112,7 +142,7 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
   // instead of actually fitting. An explicit height is what this cell
   // (and the 4 rows it spans) actually sizes off of.
   const RotatedTailTh = ({ background, color = '#fff', children }) => (
-    <th rowSpan={4} className="text-center px-1 py-2.5 text-[10px] font-semibold align-bottom border-b border-l border-gray-200" style={{ background, color, width: 30, height: 190, padding: '4px 2px' }}>
+    <th rowSpan={4} className="text-center px-1 py-1.5 text-[10px] font-semibold align-bottom border-b border-l border-gray-200" style={{ background, color, width: 36, height: 115, padding: '4px 2px' }}>
       <div className="flex items-center justify-center h-full">
         <span style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>{children}</span>
       </div>
@@ -122,13 +152,25 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
   // horizontally, same as # already did — each one's sticky offset is just
   // the running total of everything pinned before it, so this can't drift
   // out of sync with colWidths above the way a hardcoded pixel value would.
-  const studentNoLeft = colWidths[0];
-  const studentNameLeft = colWidths[0] + colWidths[1];
+  // Normal view: real column widths, scrolling sideways when wider than the
+  // page. Full screen (`fit`): every column keeps its proportion of the total
+  // as a percentage, so the whole table fits the window with no scrollbar.
+  const totalWidth = colWidths.reduce((a, b) => a + b, 0);
+  const pct = (w) => (fit ? `${((w / totalWidth) * 100).toFixed(3)}%` : w);
+  const studentNoLeft = pct(colWidths[0]);
+  const studentNameLeft = pct(colWidths[0] + colWidths[1]);
   return (
-    <div className="overflow-x-auto max-h-[70vh] overflow-y-auto">
-      <table className="table-fixed" style={{ width: colWidths.reduce((a, b) => a + b, 0) }}>
+    <div className={`${fit ? 'overflow-x-hidden max-h-[calc(100vh-110px)]' : 'overflow-x-auto max-h-[70vh]'} overflow-y-auto`}>
+      {/* border-separate + spacing 0 (not the default collapsed borders): with
+          collapsed borders the 1px line between two rows belongs to neither
+          cell, so the frozen #/Student No./Name cells' white background stops
+          short of it and the colored score cells scrolling underneath show
+          through as a colored hairline along the row edge. Separate borders
+          put each row's bottom line INSIDE its own cells (see the row's
+          `[&>td]:border-b` below), so the frozen cells stay solid white. */}
+      <table className="table-fixed border-separate border-spacing-0" style={{ width: fit ? '100%' : totalWidth }}>
         <colgroup>
-          {colWidths.map((w, i) => <col key={i} style={{ width: w }} />)}
+          {colWidths.map((w, i) => <col key={i} style={{ width: pct(w) }} />)}
         </colgroup>
         <thead>
           <tr className="bg-gray-50">
@@ -141,10 +183,10 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
                 being hidden behind their own opaque background, i.e.
                 exactly the "floating" overlap this fixes. */}
             <th rowSpan={4} className="text-center px-2 py-2.5 text-xs font-semibold uppercase text-gray-600 sticky left-0 z-10 bg-gray-50 w-10 align-bottom border-b border-gray-200">#</th>
-            <th rowSpan={4} className="text-left px-3 py-2.5 text-xs font-semibold uppercase text-gray-600 sticky z-10 bg-gray-50 min-w-[90px] align-bottom border-b border-gray-200" style={{ left: studentNoLeft }}>Student No.</th>
-            <th rowSpan={4} className="text-left px-4 py-2.5 text-xs font-semibold uppercase text-gray-600 sticky z-10 bg-gray-50 min-w-[150px] align-bottom border-b border-gray-200" style={{ left: studentNameLeft }}>Student Name</th>
+            <th rowSpan={4} className="text-left px-3 py-2.5 text-xs font-semibold uppercase text-gray-600 sticky z-10 bg-gray-50 align-bottom border-b border-gray-200" style={{ left: studentNoLeft }}>Student No.</th>
+            <th rowSpan={4} className="text-left px-4 py-2.5 text-xs font-semibold uppercase text-gray-600 sticky z-10 bg-gray-50 align-bottom border-b border-gray-200" style={{ left: studentNameLeft }}>Student Name</th>
             {comps.map((c, ci) => (
-              <th key={c.id} colSpan={compColSpan(c)} className="text-center px-3 py-2 text-xs font-semibold border-b border-l border-gray-200" style={{ background: GROUP_COLORS[componentColorIndex(c.name, ci, compNames)].header }}>
+              <th key={c.id} colSpan={compColSpan(c)} className="text-center px-1.5 py-1 text-xs font-semibold border-b border-l border-gray-200" style={{ background: GROUP_COLORS[componentColorIndex(c.name, ci, compNames)].header }}>
                 {c.name}
               </th>
             ))}
@@ -165,34 +207,35 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
                 <RotatedTailTh background={OVERALL_COLOR}>Overall Grade</RotatedTailTh>
               </>
             )}
-            <th rowSpan={4} className="text-center px-3 py-2.5 text-xs font-semibold text-white min-w-[70px] align-bottom border-b border-l border-gray-200" style={{ background: GWA_HEADER_COLOR }}>GWA</th>
+            <th rowSpan={4} className="text-center px-3 py-2.5 text-xs font-semibold text-white align-bottom border-b border-l border-gray-200" style={{ background: GWA_HEADER_COLOR }}>{isFinals ? 'Final Grade' : 'Midterm Grade'}</th>
             {/* Auto-computed straight from this period's own GWA the moment
                 it's fully encoded (Passed/Failed), or from the student's
                 INC/DRP status — Faculty and a teaching Chairperson both land
                 on this same Class Record tab, so neither has to wait for
                 submission/verification just to see where a student stands. */}
-            <th rowSpan={4} className="text-center px-2 py-2.5 text-xs font-semibold uppercase text-gray-600 min-w-[90px] align-bottom border-b border-l border-gray-200 bg-gray-50">Remarks</th>
+            <th rowSpan={4} className="text-center px-2 py-2.5 text-xs font-semibold uppercase text-gray-600 align-bottom border-b border-l border-gray-200 bg-gray-50">Remarks</th>
             {/* Drop and Mark/Resolve INC both live here, on the Class Record
                 itself — not the Grade Sheet, which is the auto-computed
                 read-only summary further down (see its own comment there). */}
-            <th rowSpan={4} className="text-center px-2 py-2.5 text-xs font-semibold uppercase text-gray-600 min-w-[130px] align-bottom border-b border-l border-gray-200 bg-gray-50">Actions</th>
+            <th rowSpan={4} className="text-center px-2 py-2.5 text-xs font-semibold uppercase text-gray-600 align-bottom border-b border-l border-gray-200 bg-gray-50">Actions</th>
           </tr>
           <tr className="bg-gray-50">
             {comps.flatMap((c, ci) => {
               const color = GROUP_COLORS[componentColorIndex(c.name, ci, compNames)].header;
               return [
                 ...(c.items || []).flatMap(item => {
+                  const span = itemColSpan(item);
+                  if (span === 0) return [];
                   if (item.is_rate_direct) {
-                    // Rows 3-4 are otherwise entirely blank for a rate-only
-                    // item (no max score, no SCORE/RATE sub-labels) — folded
-                    // into this one cell (rowSpan 3) with the name rotated
-                    // vertical instead of wasting that space, matching the
-                    // real official Class Record's own rate-only columns
-                    // ("Unit Activity", "Attendance", "Recitation", ...).
+                    const isShort = (item.name || '').length <= 5;
                     return [
-                      <th key={`${item.id}-name`} rowSpan={3} className="text-center px-1 py-2.5 text-[10px] font-medium border-l border-gray-100" style={{ background: color }}>
+                      <th key={`${item.id}-name`} rowSpan={3} className="text-center px-1 py-1.5 text-[10px] font-semibold border-l border-gray-100" style={{ background: color }}>
                         <div className="flex items-center justify-center h-full">
-                          <span style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>{item.name}</span>
+                          {isShort ? (
+                            <span style={{ whiteSpace: 'nowrap' }}>{item.name}</span>
+                          ) : (
+                            <span style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>{item.name}</span>
+                          )}
                         </div>
                       </th>,
                     ];
@@ -204,13 +247,13 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
                   // empty. Row 4 (SCORE/RATE) still sits below normally.
                   if (item.show_score === false) {
                     return [
-                      <th key={`${item.id}-name`} colSpan={itemColSpan(item)} rowSpan={2} className="text-center px-2 py-1.5 text-[10px] font-medium min-w-[100px] border-l border-gray-100" style={{ background: color }}>
+                      <th key={`${item.id}-name`} colSpan={span} rowSpan={2} className={`text-center px-2 py-1.5 text-[10px] font-medium ${span > 1 ? 'min-w-[100px]' : 'min-w-[60px]'} border-l border-gray-100`} style={{ background: color }}>
                         {item.name}
                       </th>,
                     ];
                   }
                   return [
-                    <th key={`${item.id}-name`} colSpan={itemColSpan(item)} className="text-center px-2 py-1.5 text-[10px] font-medium min-w-[100px] border-l border-gray-100" style={{ background: color }}>
+                    <th key={`${item.id}-name`} colSpan={span} className={`text-center px-2 py-1.5 text-[10px] font-medium ${span > 1 ? 'min-w-[100px]' : 'min-w-[60px]'} border-l border-gray-100`} style={{ background: color }}>
                       {item.name}
                     </th>,
                   ];
@@ -226,10 +269,8 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
               // A rate-only item's own header cell already rowSpans over
               // this row (folded into the name cell above), so it emits
               // nothing here at all — not even a blank cell. Same when Max
-              // is hidden (show_score === false) — the name cell above
-              // already grew a rowSpan to cover this row instead of
-              // leaving it as an empty gap.
-              return (c.items || []).flatMap(item => (item.is_rate_direct || item.show_score === false ? [] : [
+              // is hidden (show_score === false) or item has 0 columns.
+              return (c.items || []).flatMap(item => (item.is_rate_direct || item.show_score === false || itemColSpan(item) === 0 ? [] : [
                 <th key={`${item.id}-max`} colSpan={itemColSpan(item)} className="text-center px-2 py-1 text-xs font-bold text-navy border-l border-gray-100" style={{ background: color }}>
                   {parseFloat(item.max_score)}
                 </th>,
@@ -239,47 +280,141 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
           <tr className="bg-gray-50">
             {comps.flatMap((c, ci) => {
               const color = GROUP_COLORS[componentColorIndex(c.name, ci, compNames)].header;
-              // Same as row 3 above — a rate-only item's header is already
-              // fully covered by its rowSpan-3 name cell.
-              // `transform: rotate(...)` is paint-only — it never affects
-              // layout/box sizing, so a row holding only rotated text is
-              // otherwise sized as if that text were still horizontal (one
-              // short line, ~16px) and the rotated glyphs spill out over
-              // whatever sits above/below instead of actually fitting. An
-              // explicit height here is what the row itself sizes off of.
-              return (c.items || []).flatMap(item => (item.is_rate_direct ? [] : [
-                <th key={`${item.id}-score`} className="text-center px-1 text-[10px] font-medium min-w-[60px] border-l border-gray-100" style={{ background: color, height: 44 }}>
-                  <div className="flex items-center justify-center h-full">
-                    <span style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>SCORE</span>
-                  </div>
-                </th>,
-                <th key={`${item.id}-rate`} className="text-center px-1 text-[10px] font-medium min-w-[50px]" style={{ background: color, height: 44 }}>
-                  <div className="flex items-center justify-center h-full">
-                    <span style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>RATE</span>
-                  </div>
-                </th>,
-              ]));
+              return (c.items || []).flatMap(item => {
+                if (item.is_rate_direct || itemColSpan(item) === 0) return [];
+                const cells = [
+                  <th key={`${item.id}-score`} className="text-center px-1 text-[10px] font-medium min-w-[60px] border-l border-gray-100" style={{ background: color, height: 36 }}>
+                    <div className="flex items-center justify-center h-full">
+                      <span style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>SCORE</span>
+                    </div>
+                  </th>,
+                ];
+                if (item.show_rate !== false) {
+                  cells.push(
+                    <th key={`${item.id}-rate`} className="text-center px-1 text-[10px] font-medium min-w-[50px]" style={{ background: color, height: 36 }}>
+                      <div className="flex items-center justify-center h-full">
+                        <span style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap', display: 'inline-block', lineHeight: 1 }}>RATE</span>
+                      </div>
+                    </th>
+                  );
+                }
+                return cells;
+              });
             })}
           </tr>
         </thead>
         <tbody>
           {studentGrades.map((g, idx) => {
-            const gwa = periodGWA(comps, g.student.id, componentScores, formula);
             const composite = periodComposite(comps, g.student.id, componentScores, formula);
-            // Half is exactly the DISPLAYED Composite ÷ 2, not the raw
-            // unrounded composite — rounding first means Overall 1/2 always
-            // relates to the "Midterm/Final Term Grade" number a viewer
-            // actually sees, instead of silently drifting a few tenths off
-            // it (e.g. Composite shown as 68 but Half computed from 67.6).
-            const half = composite !== null ? Math.round(composite) * 0.5 : null;
             // Finals' own Overall Grade combines both periods' composites —
             // otherComps is the Midterm side, passed in only for the Finals
-            // table below.
+            // table below. No zero-fill yet — incHere/isINC below still
+            // need the true null-or-not signal to detect incompleteness
+            // correctly.
             const midComposite = isFinals ? periodComposite(otherComps, g.student.id, componentScores, formula) : null;
-            const midHalf = midComposite !== null ? Math.round(midComposite) * 0.5 : null;
-            const overall = (isFinals && midHalf !== null && half !== null) ? midHalf + half : null;
+            // INC is per period, marked and resolved independently: a student
+            // INC in the Midterm is NOT INC in the Finals, and vice versa.
+            // isINC is the student's overall status (either period flagged);
+            // incHere is whether THIS period is the flagged one (dimmed row,
+            // INC badge/cells, Resolve INC). A row from before the per-period
+            // flags existed (INC, neither flag set) falls back to "INC in
+            // whichever period is still missing scores".
             const isINC = g.status === 'INC';
+            const hasIncFlags = !!(g.inc_midterm || g.inc_finals);
+            // (A row with neither flag — older data — is read as INC in the
+            // earliest period still missing scores, same as the server settles it.)
+            const incHere = isINC && (hasIncFlags
+              ? (isFinals ? g.inc_finals : g.inc_midterm)
+              : (isFinals ? (composite === null && midComposite !== null) : composite === null));
+            // ONLY the period that was marked INC reads INC — the Finals table
+            // never shows INC for a student who is INC in the Midterm only, and
+            // vice versa.
+            const overallInc = incHere;
             const isDRP = g.status === 'DRP';
+            // Zero-filled preview — ONLY once incHere/isINC are known above.
+            // A still-missing item counts as a literal 0 for THIS row's own
+            // preview figures only (never saved, never fed into anything but
+            // this row's own display), so an INC student's Composite/Half/
+            // GWA show a real, if provisional, number instead of sitting
+            // blank until every last item is in. previewMidComposite is
+            // zero-filled whenever the student is INC AT ALL (not just
+            // incHere) — the Finals tab's Overall Grade needs a Midterm
+            // figure to combine with even when Midterm, not Finals, is the
+            // side still missing work.
+            const previewComposite = incHere ? periodComposite(comps, g.student.id, componentScores, formula, true) : composite;
+            const previewMidComposite = isFinals && isINC ? periodComposite(otherComps, g.student.id, componentScores, formula, true) : midComposite;
+            // This period's own GWA — the equivalent of the whole-number
+            // Term Grade shown in the composite cell below (possibly a
+            // zero-filled preview).
+            const gwa = previewComposite !== null ? gwaFromComposite(previewComposite) : null;
+            // Half of the TRUE (unrounded) Term Grade (79.26 → 39.6), so
+            // Midterm's half + Finals' half is the true Overall Grade.
+            const half = halfComposite(previewComposite);
+            // TRUE average of both periods' exact composites (Midterm's
+            // Overall 1/2 + Finals' Overall 1/2) — the Overall Grade
+            // CELL further down shows it rounded to a whole number via
+            // formatComposite, the same figure the Final Grade's equivalent
+            // is looked up from.
+            const overall = isFinals ? overallComposite(previewMidComposite, previewComposite) : null;
+            // The grade column shows Midterm Grade (this period's own GWA) on the
+            // Midterm tab, but on the Finals tab it shows the equivalent of
+            // the whole Overall Grade — not the Finals GWA on its own. Falls
+            // back to this period's own GWA only when there's no Midterm
+            // block to combine with (otherComps empty).
+            // INC not completed by its deadline → the recorded 5.0.
+            const lapsed = isLapsedInc(g);
+            // Which period the lapsed INC was in — only that period's table
+            // shows 5.0 + the reason; the other shows its own real result.
+            const lapsedHere = lapsed && ['Both', isFinals ? 'Finals' : 'Midterm'].includes(g.inc_lapsed_period || 'Finals');
+            // INC (or lapsed) in the OTHER period only: this table shows this
+            // period's own result, not one dragged down by the other period's
+            // missing scores.
+            const otherPeriodOnly = (isINC && !incHere) || (lapsed && !lapsedHere);
+            const shownGrade = lapsedHere
+              ? 5.0
+              : otherPeriodOnly
+                ? gwa
+                : (isFinals && otherComps.length > 0 ? gwaFromComposite(overall) : gwa);
+            // `courseGrade` is the combined course result — the same figure now
+            // shown in the Final Grade column on the Finals tab.
+            const courseGrade = shownGrade;
+            // Remarks is the COURSE result — falling back to this period's own
+            // grade while it can't exist yet (e.g. the Midterm is INC).
+            const remarksGrade = courseGrade ?? gwa;
+            // Why this row's score boxes can't be typed into (null = they can).
+            // Clicking a blocked box shows this as a warning — a disabled input
+            // swallows the click, so the cell itself catches it (the input is
+            // pointer-events-none while blocked). An INC student's OTHER period
+            // stays editable until the class has been sent to the Chairperson;
+            // only the INC period itself goes through Resolve INC.
+            const scoreBlockedReason = (classSent || (g.submitted && !(isINC && !classSent)))
+              ? 'Grades are already submitted — viewing mode only.'
+              : locked
+                ? 'The Class Record is locked — click "Edit Scores" first to change scores.'
+                : isDRP
+                  ? 'This student is marked Dropped — undo the drop to encode scores.'
+                  : incHere
+                    ? `This student is marked INC in the ${isFinals ? 'Finals' : 'Midterm'} — click "Resolve INC" to complete their scores.`
+                    : null;
+            const warnScoreBlocked = () => toast(scoreBlockedReason, { icon: '⚠️', duration: 5000 });
+            // This row's Remarks value (INC / Passed / Failed, or null when it
+            // has none yet). Checked off the STUDENT's overall status (isINC),
+            // not just this period's own flag (incHere) — a Midterm-only INC
+            // still leaves the student INC overall even once the Finals side
+            // is done, so the Finals tab shouldn't hand out a Passed/Failed
+            // verdict off a Final Grade that's still provisional until the
+            // Midterm resolves.
+            // INC only under the period that was marked INC; the other
+            // period gets its own Passed/Failed.
+            const remarksStatus = incHere
+              ? 'INC'
+              : lapsedHere
+                ? 'Failed'
+                // Finals table while the Midterm is INC: the Final Grade is INC,
+                // so no Passed/Failed verdict here (the reason is under Midterm).
+                : (isFinals && isINC)
+                  ? null
+                  : (remarksGrade !== null ? (remarksGrade >= 1.0 && remarksGrade <= 3.01 ? 'Passed' : 'Failed') : null);
             // Set by the item/Ave/Weighted IIFE just below (it always runs
             // before the tail GWA cell reads them, since it's the earlier
             // sibling) so the tail cell can continue the exact same
@@ -290,21 +425,30 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
                  "DROPPED" in solid red, and dimming that with opacity would
                  wash it back toward the very "looks graded" look this is
                  meant to avoid. INC keeps the dim treatment since its cells
-                 still show real, legible in-progress scores. */
-              <tr key={g.student.id} className={`border-b border-gray-50 ${isINC ? 'opacity-50' : ''}`}>
+                 still show real, legible in-progress scores. The dimming is
+                 applied to the scrolling cells only, NOT the whole row: opacity
+                 on the <tr> made the sticky #/Student No./Name cells translucent
+                 too, so the colored score cells scrolling underneath them
+                 bled through as stray orange/blue lines along the row edge. */
+              <tr key={g.student.id} className={`[&>td]:border-b [&>td]:border-b-gray-50 ${incHere ? '[&>td:not(.sticky):not(:last-child)]:opacity-50' : ''}`}>
                 <td className="px-2 py-2.5 text-xs text-gray-400 text-center sticky left-0 z-10 bg-white">{idx + 1}</td>
                 <td className="px-3 py-2.5 text-xs text-gray-500 sticky z-10 bg-white" style={{ left: studentNoLeft }}>{g.student.student_no}</td>
                 <td className="px-4 py-2.5 text-sm sticky z-10 bg-white" style={{ left: studentNameLeft }}>
-                  <button
-                    type="button"
-                    onClick={() => onViewStudent(g.student)}
-                    className="text-left bg-transparent border-none p-0 cursor-pointer font-sans hover:underline"
-                    title="View this student's full grade record (1st-4th Year + GWA)"
-                  >
+                  {/* The full grade record is the adviser's only — clickable
+                      just for students in the viewer's own advisory section. */}
+                  {canViewRecord(g.student) ? (
+                    <button
+                      type="button"
+                      onClick={() => onViewStudent(g.student)}
+                      className="text-left bg-transparent border-none p-0 cursor-pointer font-sans hover:underline"
+                      title="Your advisee — view their full grade record (1st-4th Year + GWA)"
+                    >
+                      <p className="font-medium text-navy">{formatPersonName(g.student.name)}</p>
+                    </button>
+                  ) : (
                     <p className="font-medium text-navy">{formatPersonName(g.student.name)}</p>
-                  </button>
-                  {isINC && <Badge variant="yellow" className="mt-1">INC</Badge>}
-                  {isDRP && <Badge variant="red" className="mt-1">DROP</Badge>}
+                  )}
+                  {incHere && <Badge variant="yellow" className="mt-1">INC</Badge>}
                 </td>
                 {(() => {
                   // A dropped student's whole row spells "DROPPED" across
@@ -325,69 +469,103 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
                   let dropIdx = 0;
                   return comps.flatMap((c, ci) => {
                     const color = GROUP_COLORS[componentColorIndex(c.name, ci, compNames)].data;
-                    const avg = componentAverage(c, g.student.id, componentScores, formula);
-                    // Exact (unrounded) — only the displayed cell below floors it.
+                    // Zero-filled for a still-missing item ONLY when this
+                    // period is the one flagged INC (incHere) — a real
+                    // preview number instead of leaving Ave/Weighted blank
+                    // until every item is in. Never touches the SCORE input
+                    // box itself, and never saved — see periodComposite's
+                    // own comment in classRecordExcel.js.
+                    const avg = componentAverage(c, g.student.id, componentScores, formula, incHere);
+                    // Exact (unrounded) — only the displayed cell below rounds it.
                     const weighted = avg !== null ? avg * (parseFloat(c.weight) / 100) : null;
                     return [
                       ...(c.items || []).flatMap(item => {
                         const score = componentScores[g.student.id]?.[item.id];
-                        const rate = itemRate(score, item.max_score, item.is_rate_direct, formula);
-                        // A direct-rate item has just the one Rate column —
-                        // no Score column at all — so it only ever consumes
-                        // ONE cell (and one DROPPED letter), not two.
+                        const rate = itemRate(score, item.max_score, item.is_rate_direct, formula, incHere);
+                        const hasRateCol = item.show_rate !== false;
                         if (isDRP) {
                           if (item.is_rate_direct) {
+                            if (!hasRateCol) return [];
                             const rateLetter = dropSeq[dropIdx++];
                             return [
                               <td key={`${item.id}-r`} className="px-2 py-2 text-center text-sm font-bold min-w-[60px] border-l border-gray-100" style={dropCellStyle(rateLetter)}>{rateLetter}</td>,
                             ];
                           }
                           const scoreLetter = dropSeq[dropIdx++];
-                          const rateLetter = dropSeq[dropIdx++];
-                          return [
+                          const cells = [
                             <td key={`${item.id}-s`} className="px-2 py-2 text-center text-sm font-bold min-w-[60px] border-l border-gray-100" style={dropCellStyle(scoreLetter)}>{scoreLetter}</td>,
-                            <td key={`${item.id}-r`} className="px-2 py-2 text-center text-sm font-bold min-w-[50px]" style={dropCellStyle(rateLetter)}>{rateLetter}</td>,
                           ];
+                          if (hasRateCol) {
+                            const rateLetter = dropSeq[dropIdx++];
+                            cells.push(
+                              <td key={`${item.id}-r`} className="px-2 py-2 text-center text-sm font-bold min-w-[50px]" style={dropCellStyle(rateLetter)}>{rateLetter}</td>
+                            );
+                          }
+                          return cells;
                         }
                         if (item.is_rate_direct) {
+                          if (!hasRateCol) return [];
+                          const minRate = formula.base;
+                          const maxRate = formula.base + formula.range;
                           return [
-                            <td key={`${item.id}-r`} className="px-2 py-2 text-center min-w-[60px] border-l border-gray-100" style={{ background: color }}>
+                            <td key={`${item.id}-r`} className="px-2 py-2 text-center min-w-[60px] border-l border-gray-100" style={{ background: color }} onClick={scoreBlockedReason ? warnScoreBlocked : undefined}>
                               <input
                                 type="text"
                                 inputMode="decimal"
-                                className="form-input text-center text-xs py-1.5 px-1 w-full"
-                                placeholder="—"
+                                className={`form-input text-center text-xs py-1.5 px-1 w-full ${scoreBlockedReason ? 'pointer-events-none' : ''}`}
+                                placeholder={`${minRate}-${maxRate}`}
+                                title={`Rate (${minRate}-${maxRate})`}
                                 value={score ?? ''}
                                 onChange={(e) => {
                                   const v = e.target.value;
-                                  if (withinMax(v, formula.base + formula.range)) updateScore(g.student.id, item.id, v);
+                                  if (withinRate(v, minRate, maxRate)) updateScore(g.student.id, item.id, v);
                                 }}
-                                disabled={g.submitted || isINC || isDRP || locked}
+                                onBlur={(e) => {
+                                  const v = e.target.value;
+                                  if (v === '') return;
+                                  const n = parseFloat(v);
+                                  if (isNaN(n) || n < minRate) {
+                                    updateScore(g.student.id, item.id, minRate);
+                                    toast.error(`Minimum rate is ${minRate}.`);
+                                  } else if (n > maxRate) {
+                                    updateScore(g.student.id, item.id, maxRate);
+                                    toast.error(`Maximum rate is ${maxRate}.`);
+                                  }
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') e.target.blur();
+                                }}
+                                disabled={!!scoreBlockedReason}
                               />
                             </td>,
                           ];
                         }
-                        return [
-                          <td key={`${item.id}-s`} className="px-2 py-2 text-center min-w-[60px] border-l border-gray-100" style={{ background: color }}>
+                        const cells = [
+                          <td key={`${item.id}-s`} className="px-2 py-2 text-center min-w-[60px] border-l border-gray-100" style={{ background: color }} onClick={scoreBlockedReason ? warnScoreBlocked : undefined}>
                             <input
                               type="text"
                               inputMode="decimal"
-                              className="form-input text-center text-xs py-1.5 px-1 w-full"
+                              className={`form-input text-center text-xs py-1.5 px-1 w-full ${scoreBlockedReason ? 'pointer-events-none' : ''}`}
                               placeholder="0"
                               value={score ?? ''}
                               onChange={(e) => {
                                 const v = e.target.value;
                                 if (withinMax(v, parseFloat(item.max_score))) updateScore(g.student.id, item.id, v);
                               }}
-                              disabled={g.submitted || isINC || isDRP || locked}
+                              disabled={!!scoreBlockedReason}
                             />
                           </td>,
-                          <td key={`${item.id}-r`} className="px-2 py-2 text-center text-xs min-w-[50px]" style={{ background: color, color: '#FF0000' }}>{item.show_rate !== false && rate !== null ? Math.round(rate) : '—'}</td>,
                         ];
+                        if (hasRateCol) {
+                          cells.push(
+                            <td key={`${item.id}-r`} className="px-2 py-2 text-center text-xs min-w-[50px]" style={{ background: color, color: '#FF0000' }}>{rate !== null ? fmtTrimmed(rate, 0) : '—'}</td>
+                          );
+                        }
+                        return cells;
                       }),
                       ...(!showAveCol(c) ? [] : [(() => {
                         if (!isDRP) {
-                          return <td key={`${c.id}-ave`} className="px-2 py-2 text-center text-xs font-semibold min-w-[56px] border-l border-gray-200" style={{ background: color }}>{avg !== null ? Math.round(avg) : '—'}</td>;
+                          return <td key={`${c.id}-ave`} className="px-2 py-2 text-center text-xs font-semibold min-w-[56px] border-l border-gray-200" style={{ background: color }}>{avg !== null ? fmtTrimmed(avg, 0) : '—'}</td>;
                         }
                         const aveLetter = dropSeq[dropIdx++];
                         return <td key={`${c.id}-ave`} className="px-2 py-2 text-center text-sm font-bold min-w-[56px] border-l border-gray-200" style={dropCellStyle(aveLetter)}>{aveLetter}</td>;
@@ -395,7 +573,7 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
                       (() => {
                         const wBorder = !showAveCol(c) ? ' border-l border-gray-200' : '';
                         if (!isDRP) {
-                          return <td key={`${c.id}-w`} className={`px-2 py-2 text-center text-xs font-semibold min-w-[50px]${wBorder}`} style={{ background: color }}>{weighted !== null ? (Math.round(weighted * 10) / 10).toFixed(1) : '—'}</td>;
+                          return <td key={`${c.id}-w`} className={`px-2 py-2 text-center text-xs font-semibold min-w-[50px]${wBorder}`} style={{ background: color }}>{weighted !== null ? fmtTrimmed(weighted, 0) : '—'}</td>;
                         }
                         const weightedLetter = dropSeq[dropIdx++];
                         return <td key={`${c.id}-w`} className={`px-2 py-2 text-center text-sm font-bold min-w-[50px]${wBorder}`} style={dropCellStyle(weightedLetter)}>{weightedLetter}</td>;
@@ -409,19 +587,26 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
                     dropCellCount set by that IIFE, the earlier sibling).
                     Live-computed here (composite/half/overall/gwa above),
                     same as every other figure in this editable grid. */}
-                <td className="px-2 py-2.5 text-center text-xs font-semibold border-l border-gray-200" style={isDRP ? dropCellStyle(dropSeq[dropCellCount]) : { background: '#EFEFEF' }}>
-                  {isINC ? <span className="text-amber-500">INC</span> : isDRP ? dropSeq[dropCellCount] : (composite !== null ? Math.round(composite) : '—')}
+                <td className="px-2 py-2.5 text-center text-xs font-semibold border-l border-gray-200" style={{ background: isDRP ? undefined : '#EFEFEF', ...(isDRP ? dropCellStyle(dropSeq[dropCellCount]) : {}), color: incHere ? '#D97706' : undefined }}>
+                  {isDRP ? dropSeq[dropCellCount] : (previewComposite !== null ? formatComposite(previewComposite) : '—')}
                 </td>
-                <td className="px-2 py-2.5 text-center text-xs border-l border-gray-200" style={isDRP ? dropCellStyle(dropSeq[dropCellCount + 1]) : { background: '#EEF1F5' }}>
-                  {isINC ? '' : isDRP ? dropSeq[dropCellCount + 1] : (half !== null ? half.toFixed(1) : '—')}
+                <td className="px-2 py-2.5 text-center text-xs border-l border-gray-200" style={{ background: isDRP ? undefined : '#EEF1F5', ...(isDRP ? dropCellStyle(dropSeq[dropCellCount + 1]) : {}), color: incHere ? '#D97706' : undefined }}>
+                  {isDRP ? dropSeq[dropCellCount + 1] : (half !== null ? fmtTrimmed(half, 0) : '—')}
                 </td>
                 {isFinals && (
-                  <td className="px-2 py-2.5 text-center text-xs font-semibold border-l border-gray-200" style={isDRP ? dropCellStyle(dropSeq[dropCellCount + 2]) : { background: '#DCF1FB' }}>
-                    {isINC ? <span className="text-amber-500">INC</span> : isDRP ? dropSeq[dropCellCount + 2] : (overall !== null ? Math.round(overall) : '—')}
+                  <td className="px-2 py-2.5 text-center text-xs font-semibold border-l border-gray-200" style={{ background: isDRP ? undefined : '#DCF1FB', ...(isDRP ? dropCellStyle(dropSeq[dropCellCount + 2]) : {}), color: overallInc ? '#D97706' : undefined }}>
+                    {isDRP ? dropSeq[dropCellCount + 2] : (overall !== null ? formatComposite(overall) : '—')}
                   </td>
                 )}
-                <td className="px-3 py-2.5 text-center font-bold border-l border-gray-200" style={isDRP ? dropCellStyle(dropSeq[dropCellCount + (isFinals ? 3 : 2)]) : { background: GWA_DATA_COLOR }}>
-                  {isINC ? <span className="text-amber-500">INC</span> : isDRP ? dropSeq[dropCellCount + (isFinals ? 3 : 2)] : (gwa !== null ? gwa.toFixed(1) : '—')}
+                {/* Final Grade (Finals table) reads INC while the student is INC
+                    in either period; the Midterm table's grade only when the
+                    Midterm itself is the INC period. */}
+                <td className="px-3 py-2.5 text-center font-bold border-l border-gray-200" style={{ background: isDRP ? undefined : GWA_DATA_COLOR, ...(isDRP ? dropCellStyle(dropSeq[dropCellCount + (isFinals ? 3 : 2)]) : {}), color: ((isFinals && isINC) || incHere) ? '#D97706' : undefined }}>
+                  {isDRP
+                    ? dropSeq[dropCellCount + (isFinals ? 3 : 2)]
+                    : ((isFinals && isINC) || incHere)
+                      ? 'INC'
+                      : (shownGrade !== null ? formatGrade(shownGrade) : '—')}
                 </td>
                 {(() => {
                   // Automatic — derived straight from this period's own gwa
@@ -432,7 +617,6 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
                   // Record's own read-only view, the Grading Sheet, and the
                   // Excel export, so this reads exactly as boldly here as it
                   // does everywhere else Remarks shows up.
-                  const remarksStatus = isINC ? 'INC' : (gwa !== null ? (gwa >= 1.0 && gwa <= 3.0 ? 'Passed' : 'Failed') : null);
                   const rStyle = remarksStatus ? remarksStyle(remarksStatus) : null;
                   const remarksOffset = dropCellCount + (isFinals ? 4 : 3);
                   return (
@@ -440,61 +624,56 @@ function PeriodTable({ comps, otherComps = [], studentGrades, componentScores, u
                       className="px-2 py-2.5 text-center border-l border-gray-200 font-bold"
                       style={isDRP ? dropCellStyle(dropSeq[remarksOffset]) : (rStyle ? { background: rStyle.bg, color: rStyle.color } : undefined)}
                     >
-                      {isDRP ? dropSeq[remarksOffset] : remarksStatus ? remarksFor(remarksStatus) : <span className="text-gray-300 font-normal">—</span>}
+                      {isDRP ? dropSeq[remarksOffset] : remarksStatus ? ((lapsedHere || incHere) && g.inc_remarks ? <span className="text-[11px] leading-tight" title={lapsedHere ? 'INC not completed by its deadline — reason given' : 'INC — reason given'}>{remarksText(remarksStatus, g)}</span> : remarksFor(remarksStatus)) : <span className="text-gray-300 font-normal">—</span>}
                     </td>
                   );
                 })()}
                 <td className="px-2 py-2.5 text-center border-l border-gray-200 bg-gray-50/40">
-                  {/* Every button here shares one fixed width instead of
-                      each hugging its own label length — "Mark INC" and
-                      "Drop" are different lengths, so left to auto-size
-                      they'd never line up or match size. */}
-                  <div className="flex flex-col items-center gap-1">
-                    {isINC ? (
+                  {/* Resolve INC on an INC period (at full strength — this cell is
+                      excluded from the INC row's dimming) and Undo Drop on a
+                      dropped student. A row that's neither — and doesn't have a
+                      Remarks verdict yet either (still blank "—", nothing to act
+                      on once it reads Passed/Failed) — gets Mark INC/Drop instead,
+                      so there's always a way to flag it from here. */}
+                  {isDRP && (
+                    <button
+                      className="text-[11px] px-2 py-1 rounded-lg font-semibold border cursor-pointer font-sans text-gray-600 border-gray-300 bg-white hover:bg-gray-50 transition-colors whitespace-nowrap"
+                      style={{ width: 96 }}
+                      onClick={() => onUndoDRP(g)}
+                    >
+                      Undo Drop
+                    </button>
+                  )}
+                  {incHere && (
+                    <button
+                      className="text-[11px] px-2 py-1 rounded-lg font-semibold text-white border-none cursor-pointer font-sans whitespace-nowrap"
+                      style={{ background: 'linear-gradient(135deg, #b45309, #d97706)', width: 96 }}
+                      onClick={() => onResolveINC(g, comps)}
+                      title="Opens a popup to encode exactly what's incomplete in this period"
+                    >
+                      Resolve INC
+                    </button>
+                  )}
+                  {!isDRP && !incHere && !remarksStatus && (
+                    <div className="flex flex-col items-center gap-1">
                       <button
-                        className="text-[11px] px-2 py-1 rounded-lg font-semibold text-white border-none cursor-pointer font-sans whitespace-nowrap"
-                        style={{ background: 'linear-gradient(135deg, #b45309, #d97706)', width: 96 }}
-                        onClick={() => onResolveINC(g, comps)}
-                        title="Opens a popup to encode exactly what's incomplete in this period"
-                      >
-                        Resolve INC
-                      </button>
-                    ) : isDRP ? (
-                      <button
-                        className="text-[11px] px-2 py-1 rounded-lg font-semibold border cursor-pointer font-sans text-gray-600 border-gray-300 bg-white hover:bg-gray-50 transition-colors whitespace-nowrap"
+                        className="text-[11px] px-2 py-1 rounded-lg font-semibold border cursor-pointer font-sans text-amber-600 border-amber-300 bg-white hover:bg-amber-50 transition-colors whitespace-nowrap"
                         style={{ width: 96 }}
-                        onClick={() => onUndoDRP(g)}
+                        onClick={() => onMarkINC(g, isFinals ? 'Finals' : 'Midterm')}
+                        title="Flag this student as Incomplete for this period"
                       >
-                        Undo Drop
+                        Mark INC
                       </button>
-                    ) : !g.submitted && gwa === null ? (
-                      // Mark INC/Drop only offered while THIS period still has
-                      // a component genuinely unscored — once every component
-                      // is filled in (gwa computed, Remarks already shows
-                      // Passed/Failed), there's nothing left to mark incomplete
-                      // or drop out of, so neither button is there anymore
-                      // instead of sitting disabled next to a grade that's
-                      // already effectively final.
-                      <>
-                        <button
-                          className="text-[11px] px-2 py-1 rounded-lg font-semibold border cursor-pointer font-sans text-amber-700 border-amber-300 bg-amber-50 hover:bg-amber-100 transition-colors whitespace-nowrap"
-                          style={{ width: 96 }}
-                          onClick={() => onMarkINC(g)}
-                        >
-                          Mark INC
-                        </button>
-                        <button
-                          className="text-[11px] px-2 py-1 rounded-lg font-semibold border cursor-pointer font-sans text-red-700 border-red-300 bg-red-50 hover:bg-red-100 transition-colors whitespace-nowrap"
-                          style={{ width: 96 }}
-                          onClick={() => onMarkDRP(g)}
-                        >
-                          Drop
-                        </button>
-                      </>
-                    ) : (
-                      <span className="text-gray-300 text-xs">—</span>
-                    )}
-                  </div>
+                      <button
+                        className="text-[11px] px-2 py-1 rounded-lg font-semibold border cursor-pointer font-sans text-red-600 border-red-300 bg-white hover:bg-red-50 transition-colors whitespace-nowrap"
+                        style={{ width: 96 }}
+                        onClick={() => onMarkDRP(g)}
+                        title="Mark this student as Dropped for the whole class"
+                      >
+                        Drop
+                      </button>
+                    </div>
+                  )}
                 </td>
               </tr>
             );
@@ -516,13 +695,13 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
   const classId = classIdProp || classIdParam;
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const handleBack = onBack || (() => navigate(-1));
+  const goBack = onBack || (() => navigate(-1));
+  // Back asks first when there are scores not yet saved (see the leave guard below).
+  const handleBack = () => (mustSaveBeforeLeaving ? setLeaveTarget({ back: true }) : goBack());
   const { user } = useAuth();
   // Reused as-is for a teaching Chairperson under /chairperson/* — route the
   // "back" button off the account's actual role rather than hardcoding /faculty.
   const base = user?.role === 'Chairperson' ? '/chairperson' : '/faculty';
-  const periodHeaderClass = programHeaderClass(user?.program);
-  const periodCascade = programCascadeGradient(user?.program);
   const [classData, setClassData] = useState(null);
   const [releaseStatus, setReleaseStatus] = useState(null);
   const [releasing, setReleasing] = useState(false);
@@ -551,11 +730,30 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
   }, [searchParams, setActiveTab]);
   // Midterm/Finals collapsed independently in the Class Record — both start
   // closed, same as every other collapsible group in the system.
+  // Full screen, per period: 'Midterm' or 'Finals' fills the whole window
+  // (Esc or "Exit Full Screen" to go back) so it can be encoded with room to
+  // spare. Saving still works from there.
+  const [fullScreen, setFullScreen] = useState(null);
+  useEscapeToClose(() => setFullScreen(null), !!fullScreen);
   const [periodOpen, setPeriodOpen] = usePageState(`GradeEncoding.${classId}.periodOpen`, { Midterm: false, Finals: false });
   const togglePeriod = (period) => setPeriodOpen((prev) => ({ ...prev, [period]: !prev[period] }));
 
   // Component state
   const [components, setComponents] = useState([]);
+  // Hard copy for the Chairperson: the Class Record and Grade Sheet must both be
+  // exported before Submit Grades can be clicked. Remembered per class on this
+  // computer; cleared whenever scores are saved again (the old printout is stale).
+  const hardCopyKey = `GradeEncoding.hardCopy.${user?.id}.${classId}`;
+  const [hardCopy, setHardCopyState] = useState(() => {
+    try { return { record: false, sheet: false, ...JSON.parse(localStorage.getItem(hardCopyKey) || '{}') }; } catch (e) { return { record: false, sheet: false }; }
+  });
+  const setHardCopy = (next) => setHardCopyState((prev) => {
+    const value = typeof next === 'function' ? next(prev) : next;
+    try { localStorage.setItem(hardCopyKey, JSON.stringify(value)); } catch (e) { /* storage unavailable */ }
+    return value;
+  });
+  const markExported = (doc) => setHardCopy((h) => ({ ...h, [doc]: true }));
+  const hardCopyDone = hardCopy.record && hardCopy.sheet;
   // Draft-persisted (localStorage, not just in-memory) — a full Class Record's
   // worth of typed scores is real, hard-to-redo work, and there's no autosave
   // here until "Save All Scores" is actually clicked. Restored automatically
@@ -564,6 +762,22 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
   // being clobbered by the server's own (still-empty, until saved) copy, and
   // saveAllScores() for where it's cleared out again once the real save lands.
   const [componentScores, setComponentScores, clearScoresDraft] = useDraftState(`GradeEncoding.scores.${user?.id}.${classId}`, {}); // { studentId: { itemId: score } }
+
+  // ── Unsaved-scores guard ──────────────────────────────────────────────
+  // The scores as last saved on the server; anything typed that differs is
+  // unsaved. Leaving the page (sidebar/any link, Back, refresh/close) while
+  // something is unsaved asks the faculty to Save All Scores first.
+  const [savedScores, setSavedScores] = useState(null);
+  const [leaveTarget, setLeaveTarget] = useState(null); // { href } | { back: true }
+  const normalizeScores = (obj) => JSON.stringify(
+    Object.keys(obj || {}).sort().map((sid) => [sid, Object.entries(obj[sid] || {})
+      .filter(([, v]) => v !== null && v !== undefined && v !== '' && !Number.isNaN(v))
+      .map(([k, v]) => [k, Number(v)])
+      .sort(([a], [b]) => String(a).localeCompare(String(b)))])
+      .filter(([, items]) => items.length > 0)
+  );
+  const hasUnsavedScores = savedScores !== null && normalizeScores(componentScores) !== normalizeScores(savedScores);
+
   // Captured once, synchronously, at the very first render — before loadData()
   // has a chance to run — so the toast below reflects "was there a draft
   // when this page opened", not whatever componentScores has become since.
@@ -589,6 +803,69 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
   const [mirrorToFinals, setMirrorToFinals] = useState(true);
   const [savingComponents, setSavingComponents] = useState(false);
   const [savingScores, setSavingScores] = useState(false);
+  // The Class Record is ALWAYS locked when the page opens — scores can only be
+  // edited after clicking "Edit Scores" (and it locks again on Save All Scores
+  // or the next visit). This is local, on top of the server's own
+  // class_record_locked flag: a record that was never saved yet (server flag
+  const [scoresUnlocked, setScoresUnlocked] = useState(false);
+  const isSubmittedToChairperson = !classData?.awaiting_faculty_revision && (
+    !!classData?.sent_to_chairperson ||
+    !!classData?.chairperson_verified ||
+    !!classData?.all_released ||
+    (studentGrades.length > 0 && studentGrades.every((g) => g.submitted))
+  );
+  const recordLocked = isSubmittedToChairperson || !!classData?.class_record_locked || !scoresUnlocked;
+  // Closed for editing: already submitted / released, or archived (by the
+  // faculty or with its semester). Only its INC students can still be
+  // completed, through Resolve INC.
+  const classArchived = ['Completed', 'Cancelled'].includes(classData?.status);
+  const classClosed = isSubmittedToChairperson || classArchived;
+
+  // Warn before leaving while the scores are open for editing (Save All
+  // Scores not clicked yet) or anything typed differs from what's saved.
+  // When already submitted to the chairperson, the class is locked and can only
+  // be revised once the chairperson returns it, so no warning is needed.
+  const mustSaveBeforeLeaving = !isSubmittedToChairperson && (hasUnsavedScores || (!recordLocked && scoresUnlocked));
+
+  // Refresh / close the tab.
+  useEffect(() => {
+    if (!mustSaveBeforeLeaving) return undefined;
+    const onBeforeUnload = (e) => { e.preventDefault(); e.returnValue = ''; };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [mustSaveBeforeLeaving]);
+
+  // Any in-app link (sidebar, header, breadcrumbs) — caught before the router sees it.
+  useEffect(() => {
+    if (!mustSaveBeforeLeaving) return undefined;
+    const onClick = (e) => {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      const a = e.target.closest && e.target.closest('a[href]');
+      if (!a || a.target === '_blank' || a.hasAttribute('download')) return;
+      const url = new URL(a.href, window.location.href);
+      if (url.origin !== window.location.origin) return;
+      const href = url.pathname + url.search + url.hash;
+      if (url.pathname === window.location.pathname) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setLeaveTarget({ href });
+    };
+    document.addEventListener('click', onClick, true);
+    return () => document.removeEventListener('click', onClick, true);
+  }, [mustSaveBeforeLeaving]);
+
+  const leaveNow = (target) => {
+    setLeaveTarget(null);
+    // The faculty chose to leave — stop guarding.
+    setSavedScores(componentScores);
+    setScoresUnlocked(false);
+    setTimeout(() => (target?.back ? goBack() : navigate(target.href)), 0);
+  };
+
+  // Only an adviser sees a student's full grade record — i.e. students of
+  // the viewer's own advisory section(s). (The server enforces this too.)
+  const isMyAdvisee = (s) => (Array.isArray(user?.advisories) ? user.advisories : []).some((a) =>
+    a.program === s?.program && Number(a.year_level) === Number(s?.year_level) && a.section === s?.section);
 
   // A student's full curriculum record (1st-4th Year + overall GWA), pulled
   // up from clicking their name in the score grid above — not just this
@@ -609,6 +886,10 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
   // — so the instructor encodes right there instead of hunting for the
   // student's row in the full Class Record grid.
   const [resolveIncTarget, setResolveIncTarget] = useState(null); // { student, gradeId, components }
+  // The popup's own typed scores ({ itemId: rawText }) — kept apart from
+  // componentScores on purpose so typing here never changes the Class Record
+  // grid behind it; they're only written into it once Resolve is confirmed.
+  const [resolveDraft, setResolveDraft] = useState({});
   const [resolvingINC, setResolvingINC] = useState(false);
 
   // Shared confirm-warning for every mutating/action button on this page —
@@ -620,6 +901,82 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
     const cfg = confirmAction;
     setConfirmAction(null);
     if (cfg?.action) await cfg.action();
+  };
+
+  // ✅ Photo Score Scanner modal state & handler
+  const [showPhotoScanner, setShowPhotoScanner] = useState(false);
+  const handleApplyScannedScores = (scannedScores, itemIds, targetPeriod) => {
+    setComponentScores((prev) => {
+      const next = { ...prev };
+      for (const [studentId, studentData] of Object.entries(scannedScores)) {
+        if (!studentData) continue;
+        if (typeof studentData === 'object') {
+          for (const [itemId, scoreVal] of Object.entries(studentData)) {
+            if (scoreVal !== undefined && scoreVal !== null && scoreVal !== '') {
+              const parsed = parseFloat(scoreVal);
+              if (!isNaN(parsed)) {
+                next[studentId] = {
+                  ...(next[studentId] || {}),
+                  [parseInt(itemId, 10)]: parsed,
+                };
+              }
+            }
+          }
+        } else {
+          const parsed = parseFloat(studentData);
+          if (!isNaN(parsed)) {
+            const singleItemId = Array.isArray(itemIds) ? itemIds[0] : itemIds;
+            next[studentId] = {
+              ...(next[studentId] || {}),
+              [parseInt(singleItemId, 10)]: parsed,
+            };
+          }
+        }
+      }
+      return next;
+    });
+
+    setScoresUnlocked(true);
+    if (targetPeriod) {
+      setPeriodOpen((prev) => ({ ...prev, [targetPeriod]: true }));
+    }
+
+    const appliedCount = Object.values(scannedScores).reduce((acc, curr) => {
+      if (typeof curr === 'object' && curr !== null) {
+        return acc + Object.values(curr).filter(v => v !== undefined && v !== '' && v !== null).length;
+      }
+      return acc + (curr !== undefined && curr !== '' && curr !== null ? 1 : 0);
+    }, 0);
+
+    toast.success(`Inserted ${appliedCount} score${appliedCount !== 1 ? 's' : ''} into Class Record! Review and click "Save All Scores".`, { duration: 6000 });
+  };
+
+  // ✅ Excel Class Record Import & Validation state & handler
+  const [showExcelImport, setShowExcelImport] = useState(false);
+  const [excelImportResult, setExcelImportResult] = useState(null);
+  const [parsingExcel, setParsingExcel] = useState(false);
+  const excelFileInputRef = useRef(null);
+
+  const handleExcelFileSelect = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setParsingExcel(true);
+    try {
+      const result = await parseAndValidateClassRecordExcel(file, {
+        classData,
+        components,
+        studentGrades,
+      });
+      setExcelImportResult(result);
+      setShowExcelImport(true);
+    } catch (err) {
+      console.error('Excel Import Error:', err);
+      toast.error('Failed to parse Excel file: ' + (err.message || 'Invalid format'));
+    } finally {
+      setParsingExcel(false);
+      if (excelFileInputRef.current) excelFileInputRef.current.value = '';
+    }
   };
 
   useEffect(() => { loadData(); }, [classId]);
@@ -717,8 +1074,8 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
         .sort((a, b) => comparePeopleNames(a.student, b.student))
         .map((sg) => ({
           student: sg.student,
-          midterm: sg.grade?.midterm ? parseFloat(sg.grade.midterm).toFixed(1) : '',
-          finals: sg.grade?.finals ? parseFloat(sg.grade.finals).toFixed(1) : '',
+          midterm: sg.grade?.midterm ? formatGrade(sg.grade.midterm) : '',
+          finals: sg.grade?.finals ? formatGrade(sg.grade.finals) : '',
           average: sg.grade?.average ?? null,
           status: sg.grade?.status || 'Pending',
           submitted: sg.grade?.submitted || false,
@@ -726,6 +1083,11 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
           inc_remarks: sg.grade?.inc_remarks || '',
           inc_deadline: sg.grade?.inc_deadline || null,
           inc_resolved_date: sg.grade?.inc_resolved_date || null,
+          // INC is per period — which one(s) this student is incomplete in.
+          inc_lapsed_at: sg.grade?.inc_lapsed_at || null,
+          inc_lapsed_period: sg.grade?.inc_lapsed_period || null,
+          inc_midterm: !!sg.grade?.inc_midterm,
+          inc_finals: !!sg.grade?.inc_finals,
         })));
 
       try {
@@ -757,6 +1119,10 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
           const serverScores = scoreRes.data.scores || {};
           if (!hasLocalDraft && Object.keys(serverScores).length > 0) setComponentScores(serverScores);
         }
+        // What the server holds — anything typed that differs from this is
+        // unsaved. Recorded whenever it isn't known yet (not only on the very
+        // first load), so the leave warning is always armed.
+        setSavedScores((prev) => (prev === null ? (scoreRes.data.scores || {}) : prev));
       } catch (e) {
         setComponents([]);
       }
@@ -791,8 +1157,8 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
         .sort((a, b) => comparePeopleNames(a.student, b.student))
         .map((sg) => ({
           student: sg.student,
-          midterm: sg.grade?.midterm ? parseFloat(sg.grade.midterm).toFixed(1) : '',
-          finals: sg.grade?.finals ? parseFloat(sg.grade.finals).toFixed(1) : '',
+          midterm: sg.grade?.midterm ? formatGrade(sg.grade.midterm) : '',
+          finals: sg.grade?.finals ? formatGrade(sg.grade.finals) : '',
           average: sg.grade?.average ?? null,
           status: sg.grade?.status || 'Pending',
           submitted: sg.grade?.submitted || false,
@@ -800,6 +1166,11 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
           inc_remarks: sg.grade?.inc_remarks || '',
           inc_deadline: sg.grade?.inc_deadline || null,
           inc_resolved_date: sg.grade?.inc_resolved_date || null,
+          // INC is per period — which one(s) this student is incomplete in.
+          inc_lapsed_at: sg.grade?.inc_lapsed_at || null,
+          inc_lapsed_period: sg.grade?.inc_lapsed_period || null,
+          inc_midterm: !!sg.grade?.inc_midterm,
+          inc_finals: !!sg.grade?.inc_finals,
         })));
     } catch (err) {
       toast.error('Failed to refresh grades');
@@ -818,17 +1189,114 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
     const mid = parseFloat(g.midterm);
     const fin = parseFloat(g.finals);
     if (isNaN(mid) || isNaN(fin)) return null;
-    return Math.round(((mid + fin) / 2) * 100) / 100;
+    // 1 decimal, epsilon-corrected — matches classRecordExcel.js's own
+    // finalGradeAverage/formatGrade convention.
+    return Math.round(((mid + fin) / 2) * 10 + 1e-9) / 10;
   };
 
-  const isPassed = (avg) => avg !== null && avg >= 1.0 && avg <= 3.0;
+  // <=3.01, not 3.0 — matches the real official spreadsheet's own Remarks
+  // formula exactly (see classRecordExcel.js's gwaFromComposite comment for
+  // how that was verified).
+  const isPassed = (avg) => avg !== null && avg >= 1.0 && avg <= 3.01;
 
-  // ✅ "allComplete" now considers INC as a valid complete state
-  const allComplete = studentGrades.every((g) =>
-    g.status === 'INC' ||
-    g.status === 'DRP' ||
-    (g.midterm !== '' && g.finals !== '')
+  const alreadySubmitted = !classData?.awaiting_faculty_revision && (
+    (studentGrades.length > 0 && studentGrades.every((g) => g.submitted)) ||
+    !!classData?.sent_to_chairperson ||
+    !!classData?.chairperson_verified ||
+    !!classData?.all_released
   );
+
+  const midtermComps = components.filter(c => c.period === 'Midterm');
+  const finalsComps = components.filter(c => c.period === 'Finals');
+  const hasComponents = components.length > 0;
+  // Which score→Rate scale this class uses (Class.rate_formula) — the same
+  // value drives every Rate/Ave/Weighted/Composite/GWA figure in the Class
+  // Record grid below, the Resolve INC popup, and the Excel export.
+  const rateFormula = getRateFormula(classData);
+  const incCount = studentGrades.filter(g => g.status === 'INC').length;
+
+  // Grade completeness check for an individual student row.
+  // INC and DRP are recognized official submission states.
+  const isStudentComplete = (g) => {
+    if (g.status === 'INC' || g.status === 'DRP') return true;
+    if (hasComponents) {
+      if (midtermComps.length === 0 || finalsComps.length === 0) return false;
+      const midComposite = periodComposite(midtermComps, g.student.id, componentScores, rateFormula);
+      const finComposite = periodComposite(finalsComps, g.student.id, componentScores, rateFormula);
+      if (midComposite !== null && finComposite !== null) return true;
+      const midNum = parseFloat(g.midterm);
+      const finNum = parseFloat(g.finals);
+      const hasStored = g.midterm !== '' && g.midterm != null && !Number.isNaN(midNum)
+                     && g.finals !== '' && g.finals != null && !Number.isNaN(finNum);
+      const hasAnyScore = (midtermComps.some(c => (c.items || []).some(it => componentScores[g.student.id]?.[it.id] != null && componentScores[g.student.id]?.[it.id] !== '')))
+                       || (finalsComps.some(c => (c.items || []).some(it => componentScores[g.student.id]?.[it.id] != null && componentScores[g.student.id]?.[it.id] !== '')));
+      if (hasAnyScore) {
+        return midComposite !== null && finComposite !== null;
+      }
+      return hasStored;
+    }
+    const mid = parseFloat(g.midterm);
+    const fin = parseFloat(g.finals);
+    return g.midterm !== '' && g.midterm != null && !Number.isNaN(mid)
+        && g.finals !== '' && g.finals != null && !Number.isNaN(fin);
+  };
+
+  // ✅ "allComplete" considers INC/DRP as valid states, requires all students to be complete,
+  // and treats submitted/released classes as complete.
+  const allComplete = studentGrades.length > 0 && (
+    alreadySubmitted ||
+    !!classData?.all_released ||
+    studentGrades.every(isStudentComplete)
+  );
+
+  // Why Submit Grades can't be used right now (null = it can) — shown as a
+  // warning when the button is clicked anyway.
+  const submitBlockedReason = alreadySubmitted
+    ? 'Already submitted — it only becomes available again if your Chairperson returns it for revision.'
+    : !allComplete
+      ? 'Some grades are still incomplete — complete them or mark those students as INC before submitting.'
+      : null;
+  const warnUnavailable = (message) => toast(message, { icon: '⚠️', duration: 5000 });
+  // Pre-submit check shown in the Submit Grades dialog — every problem that
+  // should stop a submission (red, Submit disabled), or, when there are
+  // none, a green "ready" summary of what's about to go to the Chairperson.
+  const buildSubmitReview = () => {
+    const nameList = (list) => {
+      const names = list.map((g) => formatPersonName(g.student.name));
+      return names.length > 5 ? `${names.slice(0, 5).join(', ')} and ${names.length - 5} more` : names.join(', ');
+    };
+    const active = studentGrades.filter((g) => g.status !== 'INC' && g.status !== 'DRP');
+    const incomplete = active.filter((g) => !isStudentComplete(g));
+    const outOfRange = (v) => { const n = parseFloat(v); return Number.isNaN(n) || n < 1 || n > 5; };
+    const invalid = active.filter((g) => {
+      if (!isStudentComplete(g)) return false;
+      const midComposite = hasComponents && midtermComps.length > 0 ? periodComposite(midtermComps, g.student.id, componentScores, rateFormula) : null;
+      const finComposite = hasComponents && finalsComps.length > 0 ? periodComposite(finalsComps, g.student.id, componentScores, rateFormula) : null;
+      const midVal = midComposite !== null ? gwaFromComposite(midComposite) : (g.midterm !== '' && g.midterm != null ? parseFloat(g.midterm) : null);
+      const finVal = finComposite !== null ? gwaFromComposite(finComposite) : (g.finals !== '' && g.finals != null ? parseFloat(g.finals) : null);
+      return outOfRange(midVal) || outOfRange(finVal);
+    });
+
+    const errors = [];
+    if (studentGrades.length === 0) errors.push('No students are enrolled in this class yet.');
+    if (scoresUnlocked) errors.push('The Class Record is still being edited — click "Save All Scores" first so the grades being submitted match it.');
+    if (incomplete.length > 0) errors.push(`${incomplete.length} student${incomplete.length !== 1 ? 's have' : ' has'} incomplete grades: ${nameList(incomplete)}. Complete their scores, or mark them INC or Dropped.`);
+    if (invalid.length > 0) errors.push(`${invalid.length} student${invalid.length !== 1 ? 's have' : ' has'} a grade outside 1.0–5.0: ${nameList(invalid)}.`);
+
+    const passed = active.filter((g) => isPassed(getAverage(g))).length;
+    return {
+      errors,
+      summary: {
+        total: studentGrades.length,
+        passed,
+        failed: active.length - passed - incomplete.length - invalid.length,
+        inc: studentGrades.filter((g) => g.status === 'INC').length,
+        dropped: studentGrades.filter((g) => g.status === 'DRP').length,
+      },
+    };
+  };
+  const [submitReview, setSubmitReview] = useState(null);
+  const submittedEditReason = 'These grades were already submitted — they can only be edited again if it is returned for revision.';
 
 
   // ====== Component Setup ======
@@ -1100,16 +1568,42 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
   };
 
   const saveAllScores = async () => {
+    // Client-side pre-save validation for direct-rate items
+    const rateF = getRateFormula(classData);
+    const rateMax = rateF.base + rateF.range;
+    for (const comp of components) {
+      for (const item of (comp.items || [])) {
+        if (item.is_rate_direct) {
+          for (const [, itemScores] of Object.entries(componentScores)) {
+            const val = itemScores?.[item.id];
+            if (val !== undefined && val !== null && val !== '') {
+              const num = parseFloat(val);
+              if (isNaN(num) || num < rateF.base || num > rateMax) {
+                toast.error(`Invalid Rate (${val}) for ${item.name} — must be between ${rateF.base} and ${rateMax}.`);
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+
     setSavingScores(true);
     try {
       await API.put(`/grade-components/${classId}/scores`, { scores: componentScores });
       // The server now has this exact data — the local draft has done its
       // job and would only risk resurrecting stale values on a later visit.
       clearScoresDraft();
+      setScoresUnlocked(false);
+      // Scores changed — the exported hard copy no longer matches; export again.
+      setHardCopy({ record: false, sheet: false });
       toast.success('Scores saved and locked — click "Edit Scores" if you need to change something.');
+      setSavedScores(componentScores);
       loadData();
+      return true;
     } catch (err) {
       toast.error(err.response?.data?.message || 'Failed to save scores');
+      return false;
     } finally {
       setSavingScores(false);
     }
@@ -1120,7 +1614,13 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
   const unlockScores = async () => {
     setSavingScores(true);
     try {
-      await API.post(`/grade-components/${classId}/unlock-scores`);
+      // The server only needs unlocking if it actually holds the lock (a record
+      // that was never saved is unlocked there already — only the local lock
+      // applies then).
+      if (classData?.class_record_locked) {
+        await API.post(`/grade-components/${classId}/unlock-scores`);
+      }
+      setScoresUnlocked(true);
       toast.success('Class Record unlocked.');
       loadData();
     } catch (err) {
@@ -1160,6 +1660,7 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
 
   // ====== Submit Grades ======
   const handleSubmit = async () => {
+    if (alreadySubmitted) return;
     if (!allComplete) {
       toast.error('Please complete all grades or mark incomplete students as INC first');
       return;
@@ -1184,6 +1685,10 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
 
       await API.post('/grades/submit', { class_id: parseInt(classId) });
 
+      clearScoresDraft();
+      setScoresUnlocked(false);
+      setLeaveTarget(null);
+      setSavedScores(componentScores);
       toast.success('Grades submitted successfully!');
       loadData();
     } catch (err) {
@@ -1192,6 +1697,7 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
       setSaving(false);
     }
   };
+
 
   // ====== Release Grades to Students ======
   // Separate from "Submit Grades" above on purpose — Submit is what makes a
@@ -1205,10 +1711,6 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
     try {
       const { data } = await gradeService.releaseClass(classId);
       toast.success(data.message);
-      // Releasing is the point this document actually becomes final — export
-      // it automatically right here instead of leaving it as a separate
-      // manual step Faculty has to remember to come back and do.
-      await exportGradingSheet();
       loadData();
     } catch (err) {
       toast.error(err.response?.data?.message || 'Failed to release grades');
@@ -1218,12 +1720,34 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
   };
 
   // ====== INC Handlers ======
-  const openMarkINC = (g) => {
-    setIncTarget({ student: g.student, gradeId: g.gradeId, mode: 'mark' });
+  // `period` ('Midterm' | 'Finals') — INC is marked per period, so marking it
+  // in one never marks the other.
+  // Opened on a period that's ALREADY INC it edits that INC (reason / deadline)
+  // instead of marking a new one — same endpoint, prefilled below.
+  const openMarkINC = (g, period) => {
+    const alreadyInc = g.status === 'INC' && (period === 'Finals' ? g.inc_finals : g.inc_midterm);
+    setIncTarget({ student: g.student, gradeId: g.gradeId, mode: alreadyInc ? 'edit' : 'mark', period });
     setIncRemarks(g.inc_remarks || '');
     setIncDeadline(g.inc_deadline ? new Date(g.inc_deadline).toISOString().split('T')[0] : '');
     setShowINCModal(true);
   };
+
+  // Local calendar date (toISOString would be UTC and can read as yesterday/
+  // tomorrow late at night). The deadline must be filled in and not in the
+  // past — typing a past date into the picker bypasses its own `min`.
+  const todayISO = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  })();
+  // Why Confirm INC can't be used yet (null = it can). Both the reason AND a
+  // compliance deadline are required.
+  const incBlockedReason = !incRemarks.trim()
+    ? 'Enter the Reason / Remarks first — state what the student is missing.'
+    : !incDeadline
+      ? 'Set a Compliance Deadline first — it is required to mark a student as INC.'
+      : incDeadline < todayISO
+        ? 'The Compliance Deadline can\'t be in the past — pick today or a later date.'
+        : null;
 
   const handleSaveINC = async () => {
     if (!incTarget) return;
@@ -1233,10 +1757,13 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
       await API.post('/grades/inc', {
         class_id: parseInt(classId),
         student_id: incTarget.student.id,
+        period: incTarget.period,
         inc_remarks: incRemarks,
         inc_deadline: incDeadline || null,
       });
-      toast.success(`${incTarget.student.name} marked as INC`);
+      toast.success(incTarget.mode === 'edit'
+        ? `${incTarget.student.name}'s ${incTarget.period} INC updated`
+        : `${incTarget.student.name} marked as INC in the ${incTarget.period}`);
 
       setShowINCModal(false);
       setIncTarget(null);
@@ -1259,6 +1786,16 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
   // period instead of dumping both periods' missing items on the instructor
   // regardless of which one they were actually looking at.
   const openResolveINC = (g, periodComps) => {
+    // Same rule as any other score change: the Class Record is locked after
+    // Save All Scores, so "Edit Scores" has to be clicked first — Resolve INC
+    // doesn't get to sidestep it.
+    // …except in a class that is already closed (submitted, released or
+    // archived): there is no "Edit Scores" there anymore, and a student
+    // marked INC is the one thing the faculty can still complete.
+    if (recordLocked && !classClosed) {
+      warnUnavailable('The Class Record is locked — click "Edit Scores" first, then resolve this INC.');
+      return;
+    }
     const incomplete = periodComps
       .map((c) => ({
         ...c,
@@ -1268,20 +1805,47 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
         }),
       }))
       .filter((c) => c.items.length > 0);
-    setResolveIncTarget({ student: g.student, gradeId: g.gradeId, components: incomplete });
+    setResolveDraft({});
+    // The period this Resolve INC was clicked from — only that period's INC
+    // is resolved; the other one (if flagged) is left alone.
+    setResolveIncTarget({ student: g.student, gradeId: g.gradeId, period: periodComps[0]?.period, components: incomplete });
+  };
+
+  const closeResolveINC = () => {
+    setResolveIncTarget(null);
+    setResolveDraft({});
   };
 
   const handleResolveINCSave = async () => {
     if (!resolveIncTarget) return;
-    const { student, gradeId, components: flagged } = resolveIncTarget;
+    const { student, gradeId, period, components: flagged } = resolveIncTarget;
     const allItems = flagged.flatMap((c) => c.items || []);
     const missing = allItems.some((item) => {
-      const v = componentScores[student.id]?.[item.id];
-      return v === undefined || v === null || v === '';
+      const v = resolveDraft[item.id];
+      return v === undefined || v === null || v === '' || Number.isNaN(parseFloat(v));
     });
     if (missing) {
       toast.error('Enter a score for every item before resolving.');
       return;
+    }
+
+    const rateF = getRateFormula(classData);
+    const rateMax = rateF.base + rateF.range;
+    for (const item of allItems) {
+      const v = resolveDraft[item.id];
+      const num = parseFloat(v);
+      if (item.is_rate_direct) {
+        if (isNaN(num) || num < rateF.base || num > rateMax) {
+          toast.error(`Invalid Rate (${v}) for ${item.name} — must be between ${rateF.base} and ${rateMax}.`);
+          return;
+        }
+      } else {
+        const max = parseFloat(item.max_score);
+        if (isNaN(num) || num < 0 || num > max) {
+          toast.error(`Invalid score (${v}) for ${item.name} — must be between 0 and ${max}.`);
+          return;
+        }
+      }
     }
 
     setResolvingINC(true);
@@ -1291,17 +1855,29 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
       // normal auto-average/status logic — it only ever runs off a non-INC
       // status. Order matters: saving scores while still INC would leave
       // the new midterm/finals sitting there uncomputed into an average.
-      await API.post('/grades/inc/undo', { grade_id: gradeId });
+      // (Only this period's INC is undone — if the other period is still
+      // flagged the student stays INC there and the server says so.)
+      await API.post('/grades/inc/undo', { grade_id: gradeId, period });
       // Scoped to ONLY this student, and lock:false — this is a targeted
       // single-student fix, not "Save All Scores": it must never write
       // (or lock the grid on top of) whatever every OTHER student's row
       // currently has typed but not yet saved.
+      // The popup's scores are merged into the student's saved ones only
+      // now, in the request itself — nothing in the Class Record grid changed
+      // while they were being typed.
+      const mergedScores = { ...(componentScores[student.id] || {}) };
+      Object.entries(resolveDraft).forEach(([itemId, v]) => { mergedScores[itemId] = parseFloat(v); });
       await API.put(`/grade-components/${classId}/scores`, {
-        scores: { [student.id]: componentScores[student.id] || {} },
+        scores: { [student.id]: mergedScores },
         lock: false,
       });
-      toast.success(`${student.name}'s INC resolved.`);
-      setResolveIncTarget(null);
+      // Saved — now (and only now) reflect them in the grid.
+      Object.entries(resolveDraft).forEach(([itemId, v]) => updateScore(student.id, itemId, v));
+      setSavedScores((prev) => ({ ...(prev || {}), [student.id]: mergedScores }));
+      toast.success(classClosed
+        ? `${student.name}'s ${period || ''} INC resolved. Once nothing is left incomplete, the final grade is released to the student automatically.`.replace('  ', ' ')
+        : `${student.name}'s ${period || ''} INC resolved.`.replace('  ', ' '), { duration: classClosed ? 6000 : 4000 });
+      closeResolveINC();
       // refreshGradesOnly, not loadData — same reasoning as Mark/Undo
       // INC/DRP below: a full reload would overwrite componentScores for
       // EVERY student from the server's last-saved copy, silently
@@ -1361,22 +1937,43 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
   // truncating the roster. Generation itself lives in utils/gradingSheetDocx.js
   // — shared with My Classes' own inline Export buttons, so both places
   // produce the exact same file. ======
-  const exportGradingSheet = () => exportGradingSheetDocx({ classData, studentGrades });
+  // The exported Grading Sheet prints the SAME numbers the Grade Sheet tab shows —
+  // Midterm Grade and Final = the Average — so with a Class Record they're read
+  // live off it (same functions the tab and the Class Record use), not from
+  // whatever was last saved to the grade row.
+  const exportGradingSheet = () => {
+    if (!allComplete) {
+      toast.error('Cannot export Grading Sheet — grades are not yet complete.');
+      return;
+    }
+    const midComps = components.filter((c) => c.period === 'Midterm');
+    const finComps = components.filter((c) => c.period === 'Finals');
+    const rateF = getRateFormula(classData);
+    const rows = studentGrades.map((g) => {
+      if (midComps.length === 0 || finComps.length === 0) return g;
+      // True exact composite, same as the on-screen Grade Sheet tab
+      // (midLive/finLive) — the calculation always works off the real
+      // scores; only the printed digits (formatGrade below) are rounded.
+      const midComposite = periodComposite(midComps, g.student.id, componentScores, rateF);
+      const finComposite = periodComposite(finComps, g.student.id, componentScores, rateF);
+      const m = midComposite !== null ? gwaFromComposite(midComposite) : null;
+      const f = finComposite !== null ? gwaFromComposite(finComposite) : null;
+      return { ...g, midterm: m !== null ? formatGrade(m) : g.midterm, finals: f !== null ? formatGrade(f) : g.finals };
+    });
+    return exportGradingSheetDocx({ classData, studentGrades: rows });
+  };
 
   // ====== Excel Export — entry point (shared with pages/common/ClassRecordView.js
   // via utils/classRecordExcel.js, so both places export the exact same file) ======
-  const exportToExcel = () => exportClassRecordToExcel({ classData, components, studentGrades, componentScores });
+  const exportToExcel = () => {
+    if (!components || components.length === 0) {
+      toast.error('Setup components first before exporting the Excel file.');
+      return;
+    }
+    return exportClassRecordToExcel({ classData, components, studentGrades, componentScores });
+  };
 
   if (loading) return <LoadingSpinner />;
-
-  const midtermComps = components.filter(c => c.period === 'Midterm');
-  const finalsComps = components.filter(c => c.period === 'Finals');
-  const hasComponents = components.length > 0;
-  // Which score→Rate scale this class uses (Class.rate_formula) — the same
-  // value drives every Rate/Ave/Weighted/Composite/GWA figure in the Class
-  // Record grid below, the Resolve INC popup, and the Excel export.
-  const rateFormula = getRateFormula(classData);
-  const incCount = studentGrades.filter(g => g.status === 'INC').length;
 
   return (
     <>
@@ -1395,7 +1992,10 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
             one it actually belongs to instead of assuming. */}
         {classData?.subject?.program && <ProgramBadge program={classData.subject.program} short />}
         <span className="text-[13px] text-gray-400">{classData?.subject?.units} Units</span>
-        <span className="ml-auto text-[13px] text-gray-500">{studentGrades.length} Students</span>
+        <span className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-800 shadow-xs">
+          <Icons.Users className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+          {studentGrades.length} Students
+        </span>
         {/* ✅ Show INC count badge if any */}
         {incCount > 0 && (
           <Badge variant="yellow">{incCount} INC</Badge>
@@ -1441,48 +2041,44 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
               iframe-embedded preview Chairperson/Admin already see on their
               own Grade Approval pages. */}
           <button
-            className="btn btn-outline btn-sm whitespace-nowrap"
+            className="btn btn-outline btn-sm whitespace-nowrap flex items-center gap-1.5 font-semibold text-navy dark:text-white"
             onClick={() => setPreview(activeTab === 'grades' ? 'sheet' : 'record')}
-            title={`Preview the ${activeTab === 'grades' ? 'Grading Sheet' : 'Class Record'}`}
+            title={`Preview the official ${activeTab === 'grades' ? 'Grading Sheet' : 'Class Record'}`}
           >
-            <Icons.Eye className="w-4 h-4" /> Preview
+            <Icons.Eye className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+            <span>Preview {activeTab === 'grades' ? 'Grade Sheet' : 'Class Record'}</span>
           </button>
-          {/* Both exports only APPEAR once grades are actually released to
-              students (releaseStatus.already_released) — not just shown-but-
-              disabled beforehand. Releasing already auto-generates and
-              downloads the Grading Sheet once (see handleReleaseGrades), so
-              these are for re-downloading afterward, never a still-
-              changeable pre-release draft. */}
-          {releaseStatus?.already_released && activeTab === 'grades' && (
+          {/* Export — available any time, submitted or not. The ✓ shows it
+              was exported (both are needed before Submit Grades). */}
+          {activeTab === 'grades' ? (
             <button
               className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold rounded-lg cursor-pointer border-none font-sans transition-all text-white"
               style={{ background: 'linear-gradient(135deg, #1a7a4c, #28b464)' }}
               onClick={() => requestConfirm({
                 title: 'Export Grading Sheet',
-                message: 'Download the official SSU Grading Sheet for this class as a .docx file?',
+                message: 'Download the official Grading Sheet for this class as a Word (.docx) file?',
                 confirmText: 'Export',
                 variant: 'green',
-                action: exportGradingSheet,
+                action: async () => { await exportGradingSheet(); markExported('sheet'); },
               })}
-              title="Export the Grading Sheet"
+              title={hardCopy.sheet ? 'Exported — print it for your Chairperson' : 'Export the Grading Sheet'}
             >
-              <Icons.FileText className="w-4 h-4" /> Export Grading Sheet
+              {hardCopy.sheet ? <Icons.Check className="w-4 h-4" /> : <Icons.Download className="w-4 h-4" />} Export Grade Sheet
             </button>
-          )}
-          {releaseStatus?.already_released && activeTab !== 'grades' && (
+          ) : hasComponents && (
             <button
               className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold rounded-lg cursor-pointer border-none font-sans transition-all text-white"
               style={{ background: 'linear-gradient(135deg, #1a7a4c, #28b464)' }}
               onClick={() => requestConfirm({
-                title: 'Export Excel',
-                message: 'Download this class\'s Class Record as an Excel (.xlsx) file?',
+                title: 'Export Class Record',
+                message: 'Download the official Class Record for this class as an Excel (.xlsx) file?',
                 confirmText: 'Export',
                 variant: 'green',
-                action: exportToExcel,
+                action: async () => { await exportToExcel(); markExported('record'); },
               })}
-              title="Export the Class Record"
+              title={hardCopy.record ? 'Exported — print it for your Chairperson' : 'Export the Class Record'}
             >
-              <Icons.FileText className="w-4 h-4" /> Export Excel
+              {hardCopy.record ? <Icons.Check className="w-4 h-4" /> : <Icons.Download className="w-4 h-4" />} Export Class Record
             </button>
           )}
           {/* No more manual "Send to Chairperson" click — Submit Grades now
@@ -1509,7 +2105,7 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
             <h3 className="text-base font-semibold text-navy">Grade Sheet</h3>
             <p className="text-xs text-gray-400 mt-0.5">
               {hasComponents
-                ? 'Auto-computed from the Class Record — Midterm and Finals here always match it exactly, not editable on this tab.'
+                ? 'Auto-computed from the Class Record — Midterm Grade and Final Term Grade (= (Midterm + Finals) ÷ 2) always match it exactly. Not editable on this tab.'
                 : 'SSU GWA Scale: 1.0 (Excellent) — 3.0 (Passing) — 5.0 (Failed)'}
             </p>
           </div>
@@ -1520,9 +2116,13 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
                   <th className="text-center px-3 py-3 text-xs font-semibold uppercase rounded-tl-lg w-10">#</th>
                   <th className="text-left px-4 py-3 text-xs font-semibold uppercase">Student No.</th>
                   <th className="text-left px-4 py-3 text-xs font-semibold uppercase">Student Name</th>
-                  <th className="text-center px-4 py-3 text-xs font-semibold uppercase">Midterm</th>
-                  <th className="text-center px-4 py-3 text-xs font-semibold uppercase">Finals</th>
-                  <th className="text-center px-4 py-3 text-xs font-semibold uppercase">Average</th>
+                  <th className="text-center px-4 py-3 text-xs font-semibold uppercase">{hasComponents ? 'Midterm Grade' : 'Midterm'}</th>
+                  {/* No separate Average column — Final Term Grade IS the (Midterm +
+                      Finals) ÷ 2 figure once a Class Record drives this tab, exactly
+                      matching the exported Grading Sheet's own single "Final Grade"
+                      column (GradingSheet.js / gradingSheetDocx.js print grade.average
+                      under that same header, never a second column next to it). */}
+                  <th className="text-center px-4 py-3 text-xs font-semibold uppercase">{hasComponents ? 'Final Term Grade' : 'Finals'}</th>
                   <th className="text-center px-4 py-3 text-xs font-semibold uppercase">Remarks</th>
                   <th className="text-center px-4 py-3 text-xs font-semibold uppercase rounded-tr-lg">Status</th>
                 </tr>
@@ -1530,6 +2130,12 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
               <tbody>
                 {studentGrades.map((g, idx) => {
                   const isINC = g.status === 'INC';
+                  // Per period, same as the Class Record: only a flagged
+                  // period reads INC (rows from before the flags existed fall
+                  // back to "INC where no grade is stored").
+                  const hasIncFlags = !!(g.inc_midterm || g.inc_finals);
+                  const incMidterm = isINC && (hasIncFlags ? g.inc_midterm : !g.midterm);
+                  const incFinals = isINC && (hasIncFlags ? g.inc_finals : (!!g.midterm && !g.finals));
                   // Mark INC/Resolve INC/Drop/Undo Drop all live on the Class
                   // Record tab now (see PeriodTable) — this Grade Sheet stays
                   // read-only, same as it's always been for everything else
@@ -1537,6 +2143,49 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
                   const isDRP = g.status === 'DRP';
                   const avg = (isINC || isDRP) ? null : getAverage(g);
                   const passed = isPassed(avg);
+                  // With a Class Record: everything here is read straight off it,
+                  // live (same functions the Class Record grid uses), falling back
+                  // to the stored grade only where its scores aren't loaded.
+                  // Final Grade = (Midterm + Finals) ÷ 2 — the Class Record's
+                  // Final Grade — and for a student INC only in the Midterm it
+                  // falls back to the Finals grade, exactly like the Class Record.
+                  const midComposite = hasComponents && midtermComps.length > 0 ? periodComposite(midtermComps, g.student.id, componentScores, rateFormula) : null;
+                  const finComposite = hasComponents && finalsComps.length > 0 ? periodComposite(finalsComps, g.student.id, componentScores, rateFormula) : null;
+                  // Each period's own GWA — the true, exact composite always
+                  // drives the calculation; only what's displayed is rounded.
+                  const midLive = midComposite !== null ? gwaFromComposite(midComposite) : null;
+                  const finLive = finComposite !== null ? gwaFromComposite(finComposite) : null;
+                  const midShown = midLive ?? (g.midterm ? parseFloat(g.midterm) : null);
+                  const finShown = finLive ?? (g.finals ? parseFloat(g.finals) : null);
+                  // Final Term Grade = the equivalent of the whole-number
+                  // Overall Grade (TRUE average of both exact composites)
+                  // — same formula the Class Record's own Final Grade column
+                  // uses (overallComposite) — NOT an average of the two
+                  // already-clamped period GWAs
+                  // (finalGradeAverage). Averaging midLive/finLive after each
+                  // was separately clamped to the 1.0–5.0 floor/ceiling can
+                  // read higher than combining the raw composites first (e.g.
+                  // a Midterm composite of 96 clamps its own GWA up to 1.0
+                  // before ever being averaged, dragging the average above
+                  // what converting the true combined composite gives),
+                  // which is exactly what made this tab disagree with the
+                  // Class Record by a tenth. Only falls back to the simple
+                  // GWA average when there's no live composite to combine
+                  // (no Class Record components loaded).
+                  // INC not completed by its deadline → the recorded 5.0.
+                  const lapsedRow = isLapsedInc(g);
+                  const finalGradeShown = lapsedRow
+                    ? 5.0
+                    : midtermComps.length === 0
+                      ? finShown
+                      : hasComponents
+                        ? gwaFromComposite(overallComposite(midComposite, finComposite))
+                        : finalGradeAverage(midShown, finShown);
+                  const finalPassed = finalGradeShown !== null && finalGradeShown >= 1.0 && finalGradeShown <= 3.01;
+                  // Remarks: the course result (the average), or the Final Term Grade
+                  // itself while the average can't exist yet (e.g. Midterm INC) — same as the Class Record.
+                  const remarksShown = finalGradeShown ?? finShown;
+                  const remarksPassed = remarksShown !== null && remarksShown >= 1.0 && remarksShown <= 3.01;
 
                   return (
                     <tr
@@ -1547,20 +2196,21 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
                       <td className="px-4 py-3.5 font-medium text-sm">{g.student.student_no}</td>
                       <td className="px-4 py-3.5 text-sm">
                         <div>
-                          {g.student.name}
-                          {/* ✅ Show INC remarks and deadline inline */}
-                          {isINC && g.inc_remarks && (
-                            <p className="text-[11px] text-amber-600 mt-0.5">{g.inc_remarks}</p>
-                          )}
+                          {formatPersonName(g.student.name)}
+                          {/* The INC reason is in the Remarks column; the deadline stays here. */}
                           {isINC && g.inc_deadline && (
                             <p className="text-[11px] text-gray-400">
-                              Deadline: {new Date(g.inc_deadline).toLocaleDateString()}
+                              Comply by {new Date(g.inc_deadline).toLocaleDateString()} — otherwise 5.0
                             </p>
                           )}
                         </div>
                       </td>
                       <td className="px-4 py-3.5 text-center">
-                        {isINC ? (
+                        {/* INC is per period, same as the Class Record: only the
+                            period that's actually missing reads INC — a stored
+                            Midterm (only ever saved once its scores are all in)
+                            still shows here. */}
+                        {incMidterm ? (
                           <span className="text-amber-400 font-semibold text-sm">INC</span>
                         ) : isDRP ? (
                           <span className="text-red-500 font-semibold text-sm">DROP</span>
@@ -1571,63 +2221,81 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
                           // Letting this field be typed into too meant a manual
                           // edit here could silently disagree with, and overwrite,
                           // what the Class Record actually says.
-                          <span className="text-sm font-semibold text-gray-700">{g.midterm || '—'}</span>
+                          <span className="text-sm font-semibold text-gray-700">{midShown !== null ? formatGrade(midShown) : '—'}</span>
                         ) : (
-                          <input
-                            type="text"
-                            inputMode="decimal"
-                            className="grade-input text-center w-20 mx-auto"
-                            placeholder="1.0–5.0"
-                            value={g.midterm}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              if (withinMax(v, 5.0)) updateGrade(g.student.id, 'midterm', v);
-                            }}
-                            disabled={g.submitted && !isINC}
-                          />
+                          <div onClick={g.submitted && !isINC ? () => warnUnavailable(submittedEditReason) : undefined}>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              className={`grade-input text-center w-20 mx-auto ${g.submitted && !isINC ? 'pointer-events-none' : ''}`}
+                              placeholder="1.0–5.0"
+                              value={g.midterm}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                if (withinMax(v, 5.0)) updateGrade(g.student.id, 'midterm', v);
+                              }}
+                              disabled={g.submitted && !isINC}
+                            />
+                          </div>
                         )}
                       </td>
                       <td className="px-4 py-3.5 text-center">
+                        {/* Final Grade is INC while the student is INC in either period. */}
                         {isINC ? (
                           <span className="text-amber-400 font-semibold text-sm">INC</span>
                         ) : isDRP ? (
                           <span className="text-red-500 font-semibold text-sm">DROP</span>
                         ) : hasComponents ? (
-                          <span className="text-sm font-semibold text-gray-700">{g.finals || '—'}</span>
-                        ) : (
-                          <input
-                            type="text"
-                            inputMode="decimal"
-                            className="grade-input text-center w-20 mx-auto"
-                            placeholder="1.0–5.0"
-                            value={g.finals}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              if (withinMax(v, 5.0)) updateGrade(g.student.id, 'finals', v);
-                            }}
-                            disabled={g.submitted && !isINC}
-                          />
-                        )}
-                      </td>
-                      <td className="px-4 py-3.5 text-center">
-                        {isINC ? (
-                          <span className="text-amber-500 font-bold">INC</span>
-                        ) : isDRP ? (
-                          <span className="text-red-500 font-bold">DROP</span>
-                        ) : (
-                          <span className={`text-base font-bold ${avg !== null ? (passed ? 'text-green-500' : 'text-red-500') : 'text-gray-300'}`}>
-                            {avg !== null ? avg.toFixed(1) : '—'}
+                          // Final Term Grade = (Midterm + Finals) ÷ 2, live from the Class
+                          // Record — exactly its own Final Grade column, and what the
+                          // exported Grade Sheet prints under its single "Final Grade"
+                          // header. No separate Average column anymore — this IS it.
+                          <span className={`text-sm font-bold ${finalGradeShown !== null ? (finalPassed ? 'text-green-600' : 'text-red-600') : 'text-gray-400'}`}>
+                            {finalGradeShown !== null ? formatGrade(finalGradeShown) : '—'}
                           </span>
+                        ) : (
+                          <div onClick={g.submitted && !isINC ? () => warnUnavailable(submittedEditReason) : undefined}>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              className={`grade-input text-center w-20 mx-auto ${g.submitted && !isINC ? 'pointer-events-none' : ''}`}
+                              placeholder="1.0–5.0"
+                              value={g.finals}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                if (withinMax(v, 5.0)) updateGrade(g.student.id, 'finals', v);
+                              }}
+                              disabled={g.submitted && !isINC}
+                            />
+                          </div>
                         )}
                       </td>
                       <td className="px-4 py-3.5 text-center">
-                        {isINC
-                          ? <Badge variant="yellow">INC</Badge>
-                          : isDRP
-                            ? <Badge variant="red">DROP</Badge>
-                            : avg !== null
-                              ? <Badge variant={passed ? 'green' : 'red'}>{passed ? 'Passed' : 'Failed'}</Badge>
-                              : '—'
+                        {hasComponents
+                          // Same Remarks as the Class Record's Finals tab: checked
+                          // off the student's OVERALL status (isINC), not just
+                          // incFinals — a Midterm-only INC still leaves the
+                          // student INC overall even once the Finals side is
+                          // done, so this never hands out a Passed/Failed verdict
+                          // off a Final Grade that's still provisional until the
+                          // Midterm resolves. INC gets no verdict at all (leave it
+                          // blank — the Status column already says INC).
+                          ? (isDRP
+                              ? <Badge variant="red">DROP</Badge>
+                              : isINC
+                                ? (g.inc_remarks ? <span className="text-xs font-semibold text-amber-700">{remarksText('INC', g)}</span> : '—')
+                                : lapsedRow
+                                  ? <span className="text-xs font-semibold text-red-600" title="INC not completed by its deadline">{remarksText('Failed', g)}</span>
+                                  : remarksShown !== null
+                                  ? <Badge variant={remarksPassed ? 'green' : 'red'}>{remarksPassed ? 'Passed' : 'Failed'}</Badge>
+                                  : '—')
+                          : (isINC
+                              ? (g.inc_remarks ? <span className="text-xs font-semibold text-amber-700">{remarksText('INC', g)}</span> : '—')
+                              : isDRP
+                                ? <Badge variant="red">DROP</Badge>
+                                : avg !== null
+                                  ? <Badge variant={passed ? 'green' : 'red'}>{passed ? 'Passed' : 'Failed'}</Badge>
+                                  : '—')
                         }
                       </td>
                       <td className="px-4 py-3.5 text-center">
@@ -1643,14 +2311,24 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
                     </tr>
                   );
                 })}
+                {/* Same "nothing follows" line the exported/printed Grading
+                    Sheet puts after the last student. */}
+                {studentGrades.length > 0 && (
+                  <tr className="border-t border-gray-100">
+                    <td />
+                    <td colSpan={6} className="px-4 py-2.5 text-center text-xs font-bold tracking-wide text-gray-500">*** NOTHING FOLLOWS ***</td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
           <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-between">
-            <p className={`text-[13px] flex items-center gap-1.5 ${allComplete ? 'text-green-500' : 'text-amber-500'}`}>
-              {allComplete
-                ? <><Icons.Check /> All grades are complete {incCount > 0 && `(${incCount} INC)`}</>
-                : 'Some grades are incomplete — complete or mark as INC to submit'}
+            <p className={`text-[13px] flex items-center gap-1.5 ${allComplete || alreadySubmitted ? 'text-green-500' : 'text-amber-500'}`}>
+              {alreadySubmitted
+                ? <><Icons.Check /> Grades submitted — Submit unlocks again only if it's returned for revision</>
+                : allComplete
+                  ? <><Icons.Check /> All grades are complete {incCount > 0 && `(${incCount} INC)`}</>
+                  : 'Some grades are incomplete — complete or mark as INC to submit'}
             </p>
             <div className="flex gap-2">
               {/* Nothing left to draft-save here once the Class Record is
@@ -1673,149 +2351,207 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
                   <Icons.Save /> Save Draft
                 </button>
               )}
-              <button
-                className="btn btn-gold"
-                onClick={() => requestConfirm({
-                  title: 'Submit Grades',
-                  message: 'Submit final grades for this class? This finalizes every student\'s Midterm/Finals GWA for the semester — make sure everything is correct first.',
-                  confirmText: 'Submit',
-                  variant: 'green',
-                  action: handleSubmit,
-                })}
-                disabled={!allComplete || saving}
-              >
-                <Icons.Send /> Submit Grades
-              </button>
+              {alreadySubmitted ? (
+                <span className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800 shadow-xs">
+                  <Icons.Eye className="w-4 h-4 text-blue-600 dark:text-blue-400" /> View Only — Grades Submitted
+                </span>
+              ) : (
+                <button
+                  className={`btn btn-gold ${!allComplete ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  aria-disabled={!allComplete}
+                  onClick={() => {
+                    setSubmitReview(buildSubmitReview());
+                  }}
+                  disabled={saving}
+                >
+                  <Icons.Send /> Submit Grades
+                </button>
+              )}
             </div>
           </div>
         </div>
 
-        {/* Release to Students — the actual student-facing step, gated on
-            both halves of the sign-off (Chairperson verification + Admin
-            approval). Only appears once there's something submitted at all. */}
-        {releaseStatus && releaseStatus.submitted_count > 0 && (
-          <div className="card mt-6">
-            <div className="card-header">
-              <h3 className="text-base font-semibold text-navy">Release to Students</h3>
-              <p className="text-xs text-gray-400 mt-0.5">
-                Makes this class's grades visible to students — only possible once both sign-offs below are done.
-              </p>
-            </div>
-            <div className="card-body flex items-center justify-between flex-wrap gap-4">
-              <div className="space-y-1.5">
-                <p className={`text-[13px] flex items-center gap-1.5 ${releaseStatus.chairperson_verified ? 'text-green-500' : 'text-amber-500'}`}>
-                  {releaseStatus.chairperson_verified ? <Icons.Check className="w-4 h-4" /> : <Icons.Clock className="w-4 h-4" />}
-                  {releaseStatus.chairperson_verified
-                    ? 'Verified by your Chairperson'
-                    : 'Awaiting Chairperson verification (they forward this to Admin from Grade Sheet and Class Records)'}
-                </p>
-                <p className={`text-[13px] flex items-center gap-1.5 ${releaseStatus.admin_finalized ? 'text-green-500' : 'text-amber-500'}`}>
-                  {releaseStatus.admin_finalized ? <Icons.Check className="w-4 h-4" /> : <Icons.Clock className="w-4 h-4" />}
-                  {releaseStatus.admin_finalized
-                    ? 'Finalized by Admin'
-                    : `Awaiting Admin approval (${releaseStatus.pending_admin_approval} passed grade${releaseStatus.pending_admin_approval !== 1 ? 's' : ''} pending)`}
-                </p>
-                {releaseStatus.already_released && (
-                  <p className="text-[13px] text-green-500 flex items-center gap-1.5">
-                    <Icons.Check className="w-4 h-4" /> Already released to students
-                  </p>
-                )}
-              </div>
-              <button
-                className="btn btn-gold"
-                disabled={!releaseStatus.can_release || releasing}
-                onClick={() => requestConfirm({
-                  title: 'Release Grades to Students',
-                  message: 'Release this class\'s grades to students now? They\'ll be notified and able to see their Midterm/Finals GWA immediately.',
-                  confirmText: 'Release',
-                  variant: 'green',
-                  action: handleReleaseGrades,
-                })}
-              >
-                <Icons.Send className="w-4 h-4" /> {releasing ? 'Releasing...' : 'Release to Students'}
-              </button>
-            </div>
-          </div>
-        )}
         </>
       )}
 
       {/* ====== CLASS RECORD TAB ====== */}
       {activeTab === 'components' && hasComponents && (
-        <div className="card">
-          <div className="card-header flex items-center justify-between">
-            <div>
+        <div>
+          <div className="card mb-5">
+          <div className="card-header flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="min-w-0 flex-1">
               <h3 className="text-base font-semibold text-navy">Class Record</h3>
-              <p className="text-xs text-gray-400 mt-0.5">
-                {classData?.class_record_locked
+              <p className="text-xs text-gray-400 mt-0.5 max-w-xl">
+                {alreadySubmitted
+                  ? 'Viewing Mode — Scores are submitted to Chairperson and locked from editing.'
+                  : recordLocked
                   ? 'Scores are locked — click "Edit Scores" to make changes.'
-                  : "Enter each student's raw score per item (test, quiz, lab, etc.) — Rate, component Average, and the period GWA update live as you type, matching the official SSU Class Record."}
+                  : "Enter each student's raw score per item — Rate, Average and the period GWA update live as you type."}
               </p>
             </div>
-            {classData?.class_record_locked ? (
-              <button
-                className="btn btn-outline text-sm"
-                onClick={() => requestConfirm({
-                  title: 'Edit Scores',
-                  message: 'Unlock this Class Record\'s score grid to make changes? It locks again the next time you click "Save All Scores".',
-                  confirmText: 'Unlock',
-                  variant: 'gold',
-                  action: unlockScores,
-                })}
-                disabled={savingScores}
-              >
-                <Icons.Edit className="w-4 h-4" /> {savingScores ? 'Unlocking...' : 'Edit Scores'}
-              </button>
-            ) : (
-              <button
-                className="btn btn-gold text-sm"
-                onClick={() => requestConfirm({
-                  title: 'Save All Scores',
-                  message: 'Save every entered score for this Class Record? Midterm and Finals GWA will be recomputed for all students immediately, and the score grid locks until you click "Edit Scores".',
-                  confirmText: 'Save',
-                  variant: 'green',
-                  action: saveAllScores,
-                })}
-                disabled={savingScores}
-              >
-                {savingScores ? 'Saving...' : 'Save All Scores'}
-              </button>
-            )}
+            <div className="flex flex-wrap items-center gap-2.5 lg:flex-nowrap lg:justify-end">
+              {/* Hidden file input for Excel upload */}
+              <input
+                type="file"
+                ref={excelFileInputRef}
+                accept=".xlsx, .xls"
+                className="hidden"
+                onChange={handleExcelFileSelect}
+              />
+
+              {alreadySubmitted ? (
+                <span className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-lg text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800 shadow-xs whitespace-nowrap">
+                  <Icons.Eye className="w-4 h-4 text-blue-600 dark:text-blue-400" /> View Only — Scores Submitted
+                </span>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-outline h-11 flex items-center gap-2 border-emerald-600/40 text-emerald-800 hover:bg-emerald-50 shadow-xs px-3 text-left whitespace-nowrap"
+                    onClick={exportToExcel}
+                    title="Download the Excel spreadsheet (.xlsx) template/scores"
+                  >
+                    <Icons.Download className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                    <span className="flex flex-col leading-tight">
+                      <span className="text-sm font-semibold">Export Excel</span>
+                      <span className="text-[10px] font-normal text-emerald-700/70">Download Excel file</span>
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={parsingExcel}
+                    className="btn btn-outline h-11 flex items-center gap-2 border-emerald-600/40 text-emerald-800 hover:bg-emerald-50 shadow-xs px-3 text-left whitespace-nowrap"
+                    onClick={() => excelFileInputRef.current?.click()}
+                    title="Upload the filled-in Excel file to load its scores"
+                  >
+                    <Icons.Upload className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                    <span className="flex flex-col leading-tight">
+                      <span className="text-sm font-semibold">{parsingExcel ? 'Validating...' : 'Import Excel'}</span>
+                      <span className="text-[10px] font-normal text-emerald-700/70">Upload the filled-in file</span>
+                    </span>
+                  </button>
+
+                  {recordLocked ? (
+                    <button
+                      type="button"
+                      className="btn btn-outline h-11 text-sm flex items-center gap-1.5 px-4 whitespace-nowrap"
+                      onClick={() => requestConfirm({
+                        title: 'Edit Scores',
+                        message: 'Unlock this Class Record\'s score grid to make changes? It locks again the next time you click "Save All Scores".',
+                        confirmText: 'Unlock',
+                        variant: 'gold',
+                        action: unlockScores,
+                      })}
+                      disabled={savingScores}
+                    >
+                      <Icons.Edit className="w-4 h-4" />
+                      <span>{savingScores ? 'Unlocking...' : 'Edit Scores'}</span>
+                    </button>
+                  ) : (
+                    <>
+                    {hasUnsavedScores && (
+                      <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2.5 py-1 whitespace-nowrap">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500" /> Unsaved changes
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className="btn btn-gold h-11 text-sm flex items-center gap-1.5 px-5 font-semibold shadow-xs whitespace-nowrap"
+                      onClick={() => requestConfirm({
+                        title: 'Save All Scores',
+                        message: 'Save every entered score for this Class Record? Midterm and Finals GWA will be recomputed for all students immediately, and the score grid locks until you click "Edit Scores".',
+                        confirmText: 'Save',
+                        variant: 'green',
+                        action: saveAllScores,
+                      })}
+                      disabled={savingScores}
+                    >
+                      <Icons.Save className="w-4 h-4" />
+                      <span>{savingScores ? 'Saving...' : 'Save All Scores'}</span>
+                    </button>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+          {/* Export → fill in → Import only works when the components are unchanged in between. */}
+          <div className="px-6 py-2.5 border-t border-gray-100 bg-emerald-50/40 rounded-b-xl flex items-center gap-2 text-[11px] text-emerald-800">
+            <Icons.AlertCircle className="w-3.5 h-3.5 text-emerald-600 flex-shrink-0" />
+            <span>
+              <b>Excel:</b> export and import must use the same components — don't add, remove or rename components between exporting and importing, or the import is refused.
+            </span>
+          </div>
           </div>
 
-          {midtermComps.length > 0 && (
-            <>
-              <button
-                type="button"
-                onClick={() => togglePeriod('Midterm')}
-                className="w-full flex items-center justify-between px-6 py-3 border-b border-transparent border-none cursor-pointer font-sans"
-                style={{ background: periodCascade }}
-              >
-                <h4 className={`text-sm font-semibold ${periodHeaderClass.text}`}>Midterm</h4>
-                {periodOpen.Midterm ? <Icons.ChevronUp className={periodHeaderClass.text} /> : <Icons.ChevronDown className={periodHeaderClass.text} />}
-              </button>
-              {periodOpen.Midterm && (
-                <PeriodTable comps={midtermComps} studentGrades={studentGrades} componentScores={componentScores} updateScore={updateScore} locked={classData?.class_record_locked} onViewStudent={setGradesTarget} onMarkINC={openMarkINC} onResolveINC={openResolveINC} onMarkDRP={handleMarkDRP} onUndoDRP={handleUndoDRP} formula={rateFormula} />
-              )}
-            </>
-          )}
-
-          {finalsComps.length > 0 && (
-            <>
-              <button
-                type="button"
-                onClick={() => togglePeriod('Finals')}
-                className="w-full flex items-center justify-between px-6 py-3 border-b border-t border-transparent border-none cursor-pointer font-sans"
-                style={{ background: periodCascade }}
-              >
-                <h4 className={`text-sm font-semibold ${periodHeaderClass.text}`}>Finals</h4>
-                {periodOpen.Finals ? <Icons.ChevronUp className={periodHeaderClass.text} /> : <Icons.ChevronDown className={periodHeaderClass.text} />}
-              </button>
-              {periodOpen.Finals && (
-                <PeriodTable comps={finalsComps} otherComps={midtermComps} studentGrades={studentGrades} componentScores={componentScores} updateScore={updateScore} locked={classData?.class_record_locked} onViewStudent={setGradesTarget} onMarkINC={openMarkINC} onResolveINC={openResolveINC} onMarkDRP={handleMarkDRP} onUndoDRP={handleUndoDRP} formula={rateFormula} />
-              )}
-            </>
-          )}
+          {/* Midterm / Finals, each in its own card with its own Full Screen
+              button — the opened one fills the whole window for encoding. */}
+          {[
+            { key: 'Midterm', label: 'MIDTERM', comps: midtermComps, extra: {} },
+            { key: 'Finals', label: 'FINALS', comps: finalsComps, extra: { otherComps: midtermComps } },
+          ].filter((p) => p.comps.length > 0).map((p) => {
+            const isFull = fullScreen === p.key;
+            const open = isFull || periodOpen[p.key];
+            return (
+              <div key={p.key} className={isFull ? 'fixed inset-0 z-[950] bg-gray-50 dark:bg-gray-900 overflow-auto p-3 sm:p-5' : ''}>
+                <div className={`card overflow-hidden ${isFull ? 'min-h-full' : 'mb-5'}`}>
+                  <div className={`relative w-full px-5 py-3 bg-navy text-white flex items-center justify-center ${isFull ? 'sticky top-0 z-20' : ''}`}>
+                    {isFull ? (
+                      <h4 className="text-sm font-bold tracking-wide">
+                        {p.label} — {classData?.subject?.code}{classData?.section ? ` · ${classData.year_level || ''}-${classData.section}` : ''}
+                      </h4>
+                    ) : (
+                      <button type="button" onClick={() => togglePeriod(p.key)} className="absolute inset-0 w-full bg-transparent border-none cursor-pointer" aria-label={`Show or hide ${p.label}`} />
+                    )}
+                    {!isFull && <h4 className="text-sm font-bold tracking-wide pointer-events-none">{p.label}</h4>}
+                    <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
+                      {isFull && !recordLocked && (
+                        <>
+                          {hasUnsavedScores && (
+                            <span className="hidden sm:inline-flex items-center gap-1.5 text-[11px] font-semibold text-amber-800 bg-amber-100 rounded-full px-2.5 py-1 whitespace-nowrap">
+                              <span className="w-1.5 h-1.5 rounded-full bg-amber-500" /> Unsaved changes
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            className="btn btn-gold btn-sm flex items-center gap-1.5 font-semibold"
+                            onClick={() => requestConfirm({
+                              title: 'Save All Scores',
+                              message: 'Save every entered score for this Class Record? Midterm and Finals GWA will be recomputed for all students immediately, and the score grid locks until you click "Edit Scores".',
+                              confirmText: 'Save',
+                              variant: 'green',
+                              action: saveAllScores,
+                            })}
+                            disabled={savingScores}
+                          >
+                            <Icons.Save className="w-4 h-4" /> {savingScores ? 'Saving...' : 'Save All Scores'}
+                          </button>
+                        </>
+                      )}
+                      <button
+                        type="button"
+                        className="relative z-10 flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold bg-white/15 hover:bg-white/25 text-white border-none cursor-pointer font-sans"
+                        onClick={() => setFullScreen(isFull ? null : p.key)}
+                        title={isFull ? 'Back to the normal view (Esc)' : `Encode the ${p.key} in full screen`}
+                      >
+                        {isFull ? <Icons.Minimize className="w-4 h-4" /> : <Icons.Maximize className="w-4 h-4" />}
+                        <span className="hidden sm:inline">{isFull ? 'Exit Full Screen' : 'Full Screen'}</span>
+                      </button>
+                      {!isFull && (
+                        <span className="flex pointer-events-none">
+                          {periodOpen[p.key] ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  {open && (
+                    <PeriodTable fit={isFull} comps={p.comps} {...p.extra} studentGrades={studentGrades} componentScores={componentScores} updateScore={updateScore} locked={recordLocked} classSent={!!classData?.sent_to_chairperson} onViewStudent={setGradesTarget} canViewRecord={isMyAdvisee} onMarkINC={openMarkINC} onResolveINC={openResolveINC} onMarkDRP={handleMarkDRP} onUndoDRP={handleUndoDRP} formula={rateFormula} />
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -1830,24 +2566,34 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
           // only the X button and an explicit Cancel/Save actually close it.
           closeOnBackdropClick={false}
           footer={
-            <>
-              <button className="btn btn-outline" onClick={() => setShowComponentSetup(false)}>Cancel</button>
-              <button
-                className="btn btn-gold"
-                onClick={() => requestConfirm({
-                  title: 'Save Components',
-                  message: 'Save these grade components? This updates the rubric used to compute every student\'s Class Record — removed components/items and their entered scores will be lost.',
-                  confirmText: 'Save',
-                  variant: 'green',
-                  action: saveComponentSetup,
-                })}
-                disabled={savingComponents}
-              >
-                {savingComponents ? 'Saving...' : 'Save Components'}
-              </button>
-            </>
+            alreadySubmitted ? (
+              <button className="btn btn-outline" onClick={() => setShowComponentSetup(false)}>Close</button>
+            ) : (
+              <>
+                <button className="btn btn-outline" onClick={() => setShowComponentSetup(false)}>Cancel</button>
+                <button
+                  className="btn btn-gold"
+                  onClick={() => requestConfirm({
+                    title: 'Save Components',
+                    message: 'Save these grade components? This updates the rubric used to compute every student\'s Class Record — removed components/items and their entered scores will be lost.',
+                    confirmText: 'Save',
+                    variant: 'green',
+                    action: saveComponentSetup,
+                  })}
+                  disabled={savingComponents}
+                >
+                  {savingComponents ? 'Saving...' : 'Save Components'}
+                </button>
+              </>
+            )
           }
         >
+          {alreadySubmitted && (
+            <div className="mb-4 p-3 rounded-lg bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 text-xs text-blue-700 dark:text-blue-300 flex items-center gap-2 font-medium">
+              <Icons.Eye className="w-4 h-4 text-blue-600 dark:text-blue-400 flex-shrink-0" />
+              <span>Viewing Mode — This class has already been submitted to the Chairperson. Component setup cannot be modified.</span>
+            </div>
+          )}
           {/* Which score→Rate scale this class's Class Record uses — applies
               to every item, every component, every period. Doesn't take
               effect until Save Components below actually commits it, same
@@ -2154,7 +2900,7 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
           marking a student INC in the first place. */}
       {showINCModal && incTarget && (
         <Modal
-          title="Mark Student as INC"
+          title={`Mark Student as INC — ${incTarget.period || ''}`.trim()}
           onClose={() => { setShowINCModal(false); setIncTarget(null); }}
           size="max-w-md"
           footer={
@@ -2162,22 +2908,30 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
               <button className="btn btn-outline" onClick={() => { setShowINCModal(false); setIncTarget(null); }}>
                 Cancel
               </button>
+              {/* Soft-disabled: looks unavailable but stays clickable, so
+                  clicking it always says WHY it can't be done yet. */}
               <button
-                className="btn btn-gold"
+                className={`btn btn-gold ${incBlockedReason ? 'opacity-50 cursor-not-allowed' : ''}`}
+                aria-disabled={!!incBlockedReason}
                 onClick={() => {
-                  if (!incRemarks.trim()) {
-                    toast.error('State what the student is missing before marking them INC.');
-                    return;
-                  }
-                  requestConfirm({
-                    title: 'Mark as INC',
-                    message: `Mark ${incTarget.student.name} as INC (Incomplete)? Their grade encoding will be paused until this is resolved.`,
-                    confirmText: 'Mark as INC',
-                    variant: 'red',
-                    action: handleSaveINC,
-                  });
+                  if (incBlockedReason) return warnUnavailable(incBlockedReason);
+                  requestConfirm(incTarget.mode === 'edit'
+                    ? {
+                        title: 'Mark as INC',
+                        message: `Save the changes to ${incTarget.student.name}'s ${incTarget.period} INC (reason and compliance deadline)?`,
+                        confirmText: 'Confirm INC',
+                        variant: 'gold',
+                        action: handleSaveINC,
+                      }
+                    : {
+                        title: 'Mark as INC',
+                        message: `Mark ${incTarget.student.name} as INC (Incomplete) in the ${incTarget.period}? Only the ${incTarget.period} becomes INC — the ${incTarget.period === 'Finals' ? 'Midterm' : 'Finals'} is not affected.`,
+                        confirmText: 'Mark as INC',
+                        variant: 'red',
+                        action: handleSaveINC,
+                      });
                 }}
-                disabled={savingINC || !incRemarks.trim()}
+                disabled={savingINC}
               >
                 {savingINC ? 'Saving...' : 'Confirm INC'}
               </button>
@@ -2189,7 +2943,7 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
               <span className="text-amber-700 font-bold text-sm">!</span>
             </div>
             <div>
-              <p className="text-sm font-semibold text-amber-900">{incTarget.student.name}</p>
+              <p className="text-sm font-semibold text-amber-900">{formatPersonName(incTarget.student.name)}</p>
               <p className="text-xs text-amber-600">{incTarget.student.student_no}</p>
             </div>
           </div>
@@ -2213,15 +2967,20 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
           </div>
           <div>
             <label className="block text-xs font-semibold text-gray-600 mb-1.5">
-              Compliance Deadline <span className="text-gray-400">(optional)</span>
+              Compliance Deadline <span className="text-red-500">*</span>
             </label>
             <input
               type="date"
               className="form-input w-full text-sm"
               value={incDeadline}
               onChange={(e) => setIncDeadline(e.target.value)}
-              min={new Date().toISOString().split('T')[0]}
+              min={todayISO}
+              required
             />
+            <p className="text-[11px] text-amber-700 mt-1.5 flex items-start gap-1">
+              <Icons.AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-px" />
+              If the student doesn't complete the INC by this date, their final grade automatically becomes 5.0 (Failed).
+            </p>
           </div>
         </Modal>
       )}
@@ -2235,12 +2994,12 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
           everything else on the class stays untouched. */}
       {resolveIncTarget && (
         <Modal
-          title={`Resolve INC — ${resolveIncTarget.student.name}`}
-          onClose={() => setResolveIncTarget(null)}
+          title={`Resolve INC — ${formatPersonName(resolveIncTarget.student.name)}`}
+          onClose={closeResolveINC}
           size="max-w-md"
           footer={
             <>
-              <button className="btn btn-outline" onClick={() => setResolveIncTarget(null)}>Cancel</button>
+              <button className="btn btn-outline" onClick={closeResolveINC}>Cancel</button>
               <button className="btn btn-gold" onClick={handleResolveINCSave} disabled={resolvingINC}>
                 {resolvingINC ? 'Resolving...' : 'Resolve'}
               </button>
@@ -2252,7 +3011,7 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
               <span className="text-amber-700 font-bold text-sm">!</span>
             </div>
             <div>
-              <p className="text-sm font-semibold text-amber-900">{resolveIncTarget.student.name}</p>
+              <p className="text-sm font-semibold text-amber-900">{formatPersonName(resolveIncTarget.student.name)}</p>
               <p className="text-xs text-amber-600">{resolveIncTarget.student.student_no}</p>
             </div>
           </div>
@@ -2270,7 +3029,7 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
                 </p>
                 <div className="space-y-1.5">
                   {(c.items || []).map((item) => {
-                    const score = componentScores[resolveIncTarget.student.id]?.[item.id];
+                    const score = resolveDraft[item.id];
                     return (
                       <div key={item.id} className="flex items-center gap-2.5">
                         <span className="text-[13px] text-gray-600 flex-1">{item.name}</span>
@@ -2279,10 +3038,34 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
                           inputMode="decimal"
                           className="form-input text-center text-sm py-1.5 w-20"
                           placeholder={item.is_rate_direct ? `${rateFormula.base}-${rateFormula.base + rateFormula.range}` : '0'}
+                          title={item.is_rate_direct ? `Rate (${rateFormula.base}-${rateFormula.base + rateFormula.range})` : undefined}
                           value={score ?? ''}
                           onChange={(e) => {
                             const v = e.target.value;
-                            if (withinMax(v, item.is_rate_direct ? rateFormula.base + rateFormula.range : parseFloat(item.max_score))) updateScore(resolveIncTarget.student.id, item.id, v);
+                            // Held in the popup's own draft, NOT written to the Class
+                            // Record grid until Resolve is confirmed.
+                            const ok = item.is_rate_direct
+                              ? withinRate(v, rateFormula.base, rateFormula.base + rateFormula.range)
+                              : withinMax(v, parseFloat(item.max_score));
+                            if (ok) setResolveDraft((d) => ({ ...d, [item.id]: v }));
+                          }}
+                          onBlur={(e) => {
+                            if (!item.is_rate_direct) return;
+                            const v = e.target.value;
+                            if (v === '') return;
+                            const n = parseFloat(v);
+                            const minRate = rateFormula.base;
+                            const maxRate = rateFormula.base + rateFormula.range;
+                            if (isNaN(n) || n < minRate) {
+                              setResolveDraft((d) => ({ ...d, [item.id]: String(minRate) }));
+                              toast.error(`Minimum rate is ${minRate}.`);
+                            } else if (n > maxRate) {
+                              setResolveDraft((d) => ({ ...d, [item.id]: String(maxRate) }));
+                              toast.error(`Maximum rate is ${maxRate}.`);
+                            }
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') e.target.blur();
                           }}
                         />
                         <span className="text-[11px] text-gray-400 w-14 flex-shrink-0">{item.is_rate_direct ? 'Rate' : `/ ${parseFloat(item.max_score)}`}</span>
@@ -2304,14 +3087,116 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
         <Modal
           title={preview === 'sheet' ? 'Grading Sheet Preview' : 'Class Record Preview'}
           onClose={() => setPreview(null)}
-          size="max-w-5xl"
+          size="max-w-[98vw]"
         >
           <iframe
             key={preview}
             src={`${preview === 'sheet' ? '/grading-sheet' : '/class-record'}/${classId}?preview=1`}
             title="Document preview"
-            style={{ width: '100%', height: '65vh', border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
+            style={{ width: '100%', height: 'calc(90vh - 130px)', minHeight: 360, border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
           />
+        </Modal>
+      )}
+
+      {/* SUBMIT GRADES — pre-submit check. Red list of problems (Submit
+          disabled) when anything's wrong; otherwise a green "ready" panel
+          with the counts about to be sent to the Chairperson. */}
+      {submitReview && (() => {
+        const { errors, summary } = submitReview;
+        const ready = errors.length === 0;
+        return (
+          <Modal
+            title="Submit Grades"
+            onClose={() => setSubmitReview(null)}
+            footer={
+              <>
+                <button className="btn btn-outline" onClick={() => setSubmitReview(null)}>{ready ? 'Cancel' : 'Close'}</button>
+                <button
+                  className={`btn btn-green ${ready ? '' : 'opacity-50 cursor-not-allowed'}`}
+                  disabled={!ready || saving}
+                  onClick={async () => { setSubmitReview(null); await handleSubmit(); }}
+                >
+                  <Icons.Send className="w-4 h-4" /> Submit
+                </button>
+              </>
+            }
+          >
+            {ready ? (
+              <div className="rounded-lg border border-green-200 bg-green-50 px-4 py-3">
+                <div className="flex items-start gap-3">
+                  <Icons.Check className="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-sm font-semibold text-green-800">Ready to submit — no errors found.</p>
+                    <p className="text-sm text-green-700 mt-1">
+                      All {summary.total} student{summary.total !== 1 ? 's are' : ' is'} accounted for. Submitting sends these grades to your Chairperson for verification.
+                    </p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
+                  {[
+                    { label: 'Passed', value: summary.passed, cls: 'text-green-700' },
+                    { label: 'Failed', value: summary.failed, cls: 'text-red-600' },
+                    { label: 'INC', value: summary.inc, cls: 'text-amber-600' },
+                    { label: 'Dropped', value: summary.dropped, cls: 'text-gray-600' },
+                  ].map((s) => (
+                    <div key={s.label} className="rounded-md bg-white border border-green-100 px-3 py-2 text-center">
+                      <p className={`text-lg font-bold ${s.cls}`}>{s.value}</p>
+                      <p className="text-[11px] text-gray-500 uppercase tracking-wide">{s.label}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3">
+                <div className="flex items-start gap-3">
+                  <Icons.AlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-sm font-semibold text-red-800">
+                      Can't submit yet — {errors.length} problem{errors.length !== 1 ? 's' : ''} to fix:
+                    </p>
+                    <ul className="list-disc pl-5 mt-1.5 space-y-1">
+                      {errors.map((e) => <li key={e} className="text-sm text-red-700">{e}</li>)}
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            )}
+          </Modal>
+        );
+      })()}
+
+      {/* Leaving with scores typed but not saved yet. */}
+      {leaveTarget && !isSubmittedToChairperson && (
+        <Modal
+          title="Save your scores first"
+          onClose={() => setLeaveTarget(null)}
+          footer={
+            <>
+              <button className="btn btn-outline mr-auto text-red-600" onClick={() => leaveNow(leaveTarget)} disabled={savingScores}>
+                Leave without saving
+              </button>
+              <button className="btn btn-outline" onClick={() => setLeaveTarget(null)} disabled={savingScores}>Stay</button>
+              <button
+                className="btn btn-gold"
+                disabled={savingScores}
+                onClick={async () => {
+                  const target = leaveTarget;
+                  setLeaveTarget(null);
+                  if (await saveAllScores()) leaveNow(target);
+                }}
+              >
+                <Icons.Save className="w-4 h-4" /> {savingScores ? 'Saving...' : 'Save All Scores & Leave'}
+              </button>
+            </>
+          }
+        >
+          <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+            <Icons.AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+            <p className="text-sm text-amber-800">
+              You haven't clicked <b>Save All Scores</b> yet. Save the scores in this Class Record before going to another page —
+              unsaved scores don't count toward the students' grades (they stay only as a draft on this computer).
+            </p>
+          </div>
         </Modal>
       )}
 
@@ -2321,8 +3206,23 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
           message={confirmAction.message}
           confirmText={confirmAction.confirmText}
           variant={confirmAction.variant}
+          warning={!!confirmAction.warning}
           onConfirm={runConfirmedAction}
           onCancel={() => setConfirmAction(null)}
+        />
+      )}
+
+
+      {showExcelImport && excelImportResult && (
+        <ExcelImportModal
+          isOpen={showExcelImport}
+          onClose={() => setShowExcelImport(false)}
+          importResult={excelImportResult}
+          onReupload={() => {
+            setShowExcelImport(false);
+            setTimeout(() => excelFileInputRef.current?.click(), 100);
+          }}
+          onApplyScores={handleApplyScannedScores}
         />
       )}
     </>

@@ -1,3 +1,4 @@
+const { USER_SECRET_FIELDS } = require('../utils/userFields');
 const { Endorsement, User, Grade, Class, Subject, Enrollment, Semester } = require('../models');
 const { Op } = require('sequelize');
 const { logActivity } = require('../utils/activityLogger');
@@ -31,7 +32,7 @@ const getEndorsements = asyncHandler(async (req, res) => {
   const endorsements = await Endorsement.findAll({
     where,
     include: [
-      { model: User, as: 'student', attributes: { exclude: ['password'] } },
+      { model: User, as: 'student', attributes: { exclude: USER_SECRET_FIELDS } },
       { model: User, as: 'chairperson', attributes: ['id', 'name', 'department', 'program'] },
     ],
     order: [['created_at', 'DESC']],
@@ -56,104 +57,123 @@ const getDepartmentStudents = asyncHandler(async (req, res) => {
   // Filter students by program (not department)
   const students = await User.findAll({
     where: { role: 'Student', program: { [Op.in]: chairperson.programs }, status: 'Active' },
-    attributes: { exclude: ['password'] },
+    attributes: { exclude: USER_SECRET_FIELDS },
     order: [['year_level', 'ASC'], ['name', 'ASC']],
   });
 
-  const studentData = await Promise.all(
-    students.map(async (student) => {
-      const grades = await Grade.findAll({
-        where: { student_id: student.id, submitted: true },
-        include: [{
-          model: Class,
-          as: 'class',
-          include: [{ model: Subject, as: 'subject' }],
-        }],
-      });
+  // Everything the per-student loop below needs is fetched for ALL of them at
+  // once and grouped in memory. This used to run 3+ queries per student — plus
+  // one more per graded subject to look up its prerequisites — which for a
+  // program of ~750 students was thousands of round trips on every Chairperson
+  // dashboard load. Output is unchanged.
+  const studentIds = students.map((st) => st.id);
+  const [allGrades, allEndorsements, allEnrollments] = studentIds.length === 0 ? [[], [], []] : await Promise.all([
+    Grade.findAll({
+      where: { student_id: studentIds, submitted: true },
+      include: [{ model: Class, as: 'class', include: [{ model: Subject, as: 'subject' }] }],
+    }),
+    semester
+      ? Endorsement.findAll({ where: { student_id: studentIds, chairperson_id: req.user.id, semester } })
+      : [],
+    // Current-semester class enrollment — gives Endorsements its Faculty/Subject/
+    // Section context without adding new columns to Endorsement itself.
+    semester
+      ? Enrollment.findAll({
+          where: { student_id: studentIds },
+          include: [{
+            model: Class,
+            as: 'class',
+            where: { semester },
+            include: [
+              { model: Subject, as: 'subject', attributes: ['id', 'code', 'name'] },
+              { model: User, as: 'instructor', attributes: ['id', 'name'] },
+            ],
+          }],
+        })
+      : [],
+  ]);
 
-      const gwa = grades.length > 0
-        ? (grades.reduce((sum, g) => sum + parseFloat(g.average), 0) / grades.length).toFixed(2)
-        : null;
+  const groupBy = (rows, keyFn) => {
+    const m = new Map();
+    rows.forEach((r) => {
+      const k = keyFn(r);
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(r);
+    });
+    return m;
+  };
+  const gradesByStudent = groupBy(allGrades, (g) => g.student_id);
+  const enrollmentsByStudent = groupBy(allEnrollments, (e) => e.student_id);
+  const endorsementByStudent = new Map(allEndorsements.map((e) => [e.student_id, e]));
 
-      const endorsement = semester
-        ? await Endorsement.findOne({ where: { student_id: student.id, chairperson_id: req.user.id, semester } })
-        : null;
+  // One lookup of prerequisites for every subject that appears in any grade.
+  const gradedSubjectIds = [...new Set(allGrades.map((g) => g.class?.subject?.id).filter(Boolean))];
+  const subjectsWithPrereqs = gradedSubjectIds.length === 0 ? [] : await Subject.findAll({
+    where: { id: gradedSubjectIds },
+    include: [{ model: Subject, as: 'prerequisites', through: { attributes: [] } }],
+  });
+  const prereqsBySubject = new Map(subjectsWithPrereqs.map((sub) => [sub.id, sub.prerequisites || []]));
 
-      // Current-semester class enrollment — gives Endorsements its Faculty/Subject/
-      // Section context without adding new columns to Endorsement itself.
-      const currentEnrollments = semester
-        ? await Enrollment.findAll({
-            where: { student_id: student.id },
-            include: [{
-              model: Class,
-              as: 'class',
-              where: { semester },
-              include: [
-                { model: Subject, as: 'subject', attributes: ['id', 'code', 'name'] },
-                { model: User, as: 'instructor', attributes: ['id', 'name'] },
-              ],
-            }],
-          })
-        : [];
-      const currentClasses = currentEnrollments
-        .filter((e) => e.class)
-        .map((e) => ({
-          subject_code: e.class.subject?.code,
-          subject_name: e.class.subject?.name,
-          instructor_name: e.class.instructor?.name,
-          section: e.class.section,
-        }));
+  const studentData = students.map((student) => {
+    const grades = gradesByStudent.get(student.id) || [];
 
-      const prereqIssues = [];
+    const gwa = grades.length > 0
+      ? (grades.reduce((sum, g) => sum + parseFloat(g.average), 0) / grades.length).toFixed(2)
+      : null;
+
+    const endorsement = endorsementByStudent.get(student.id) || null;
+
+    const currentClasses = (enrollmentsByStudent.get(student.id) || [])
+      .filter((e) => e.class)
+      .map((e) => ({
+        subject_code: e.class.subject?.code,
+        subject_name: e.class.subject?.name,
+        instructor_name: e.class.instructor?.name,
+        section: e.class.section,
+      }));
+
+    const prereqIssues = [];
+    const semLower = (semester || '').toLowerCase();
+    const isFirstSem = semLower.includes('1st') || semLower.includes('first');
+    if (!isFirstSem) {
       for (const grade of grades) {
         if (!grade.class || !grade.class.subject) continue;
         const subject = grade.class.subject;
-        const prereqs = await Subject.findAll({
-          include: [{
-            model: Subject,
-            as: 'prerequisites',
-            through: { attributes: [] },
-          }],
-          where: { id: subject.id },
-        });
-
-        if (prereqs[0]?.prerequisites) {
-          for (const prereq of prereqs[0].prerequisites) {
-            const prereqGrade = grades.find((g) =>
-              g.class?.subject?.id === prereq.id && g.status === 'Passed'
-            );
-            if (!prereqGrade) {
-              prereqIssues.push({
-                subject: subject.code,
-                missing_prereq: prereq.code,
-                prereq_name: prereq.name,
-              });
-            }
+        for (const prereq of (prereqsBySubject.get(subject.id) || [])) {
+          const prereqGrade = grades.find((g) =>
+            g.class?.subject?.id === prereq.id && g.status === 'Passed'
+          );
+          if (!prereqGrade) {
+            prereqIssues.push({
+              subject: subject.code,
+              missing_prereq: prereq.code,
+              prereq_name: prereq.name,
+            });
           }
         }
       }
+    }
 
-      return {
-        ...student.toJSON(),
-        gwa,
-        grades: grades.map((g) => ({
-          id: g.id,
-          subject_code: g.class?.subject?.code,
-          subject_name: g.class?.subject?.name,
-          midterm: g.midterm,
-          finals: g.finals,
-          average: g.average,
-          status: g.status,
-        })),
-        endorsement: endorsement ? endorsement.toJSON() : null,
-        current_classes: currentClasses,
-        prereq_issues: prereqIssues,
-        is_regular: prereqIssues.length === 0,
-        completed_count: grades.filter((g) => g.status === 'Passed').length,
-        failed_count: grades.filter((g) => g.status === 'Failed').length,
-      };
-    })
-  );
+    return {
+      ...student.toJSON(),
+      gwa,
+      grades: grades.map((g) => ({
+        id: g.id,
+        subject_code: g.class?.subject?.code,
+        subject_name: g.class?.subject?.name,
+        midterm: g.midterm,
+        finals: g.finals,
+        average: g.average,
+        status: g.status,
+      })),
+      endorsement: endorsement ? endorsement.toJSON() : null,
+      current_classes: currentClasses,
+      prereq_issues: prereqIssues,
+      is_regular: prereqIssues.length === 0,
+      completed_count: grades.filter((g) => g.status === 'Passed').length,
+      failed_count: grades.filter((g) => g.status === 'Failed').length,
+    };
+  });
 
   res.json({
     department: chairperson.department || 'College of Arts and Sciences',

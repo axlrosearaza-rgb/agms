@@ -1,3 +1,5 @@
+const { emitGradesUpdated } = require('../utils/realtime');
+const { USER_SECRET_FIELDS } = require('../utils/userFields');
 const { Grade, Class, Subject, User, Enrollment, Semester } = require('../models');
 const { Op } = require('sequelize');
 const { logActivity } = require('../utils/activityLogger');
@@ -169,7 +171,7 @@ const sendGradingSheet = asyncHandler(async (req, res) => {
   const cls = await Class.findByPk(classId, {
     include: [
       { model: Subject, as: 'subject' },
-      { model: User, as: 'instructor', attributes: { exclude: ['password'] } },
+      { model: User, as: 'instructor', attributes: { exclude: USER_SECRET_FIELDS } },
     ],
   });
   if (!cls) return res.status(404).json({ message: 'Class not found.' });
@@ -191,7 +193,7 @@ const sendGradingSheet = asyncHandler(async (req, res) => {
   }
 
   const io = req.app.get('io');
-  if (io) io.emit('gradesUpdated', { class_id: cls.id, message: 'Grading sheet sent to Chairperson' });
+  if (io) emitGradesUpdated(io, { class_id: cls.id, message: 'Grading sheet sent to Chairperson' }, 'pipeline');
 
   res.json({ message: `Grading sheet sent to ${result.recipientCount} recipient(s) (${result.submittedCount}/${result.enrolledCount} students submitted).` });
 });
@@ -206,7 +208,7 @@ const forwardGradingSheetToAdmin = asyncHandler(async (req, res) => {
   const cls = await Class.findByPk(classId, {
     include: [
       { model: Subject, as: 'subject' },
-      { model: User, as: 'instructor', attributes: { exclude: ['password'] } },
+      { model: User, as: 'instructor', attributes: { exclude: USER_SECRET_FIELDS } },
     ],
   });
   if (!cls) return res.status(404).json({ message: 'Class not found.' });
@@ -245,7 +247,7 @@ const forwardGradingSheetToAdmin = asyncHandler(async (req, res) => {
   await logActivity(req.user.id, `forwarded grading sheet for ${cls.subject?.code} to ${admins.length} admin(s) for approval`, 'Class', cls.id);
 
   const io = req.app.get('io');
-  if (io) io.emit('gradesUpdated', { class_id: cls.id, message: 'Grading sheet forwarded to Admin' });
+  if (io) emitGradesUpdated(io, { class_id: cls.id, message: 'Grading sheet forwarded to Admin' }, 'pipeline');
 
   res.json({ message: `Grading sheet forwarded to ${admins.length} admin(s) for approval.` });
 });
@@ -270,7 +272,7 @@ const verifyDocument = asyncHandler(async (req, res) => {
   const cls = await Class.findByPk(classId, {
     include: [
       { model: Subject, as: 'subject' },
-      { model: User, as: 'instructor', attributes: { exclude: ['password'] } },
+      { model: User, as: 'instructor', attributes: { exclude: USER_SECRET_FIELDS } },
     ],
   });
   if (!cls) return res.status(404).json({ message: 'Class not found.' });
@@ -330,12 +332,12 @@ const verifyDocument = asyncHandler(async (req, res) => {
       });
     }
     await logActivity(req.user.id, `verified the ${doc.label.toLowerCase()} and forwarded ${cls.subject?.code} to ${admins.length} admin(s) for approval`, 'Class', cls.id);
-    if (io) io.emit('gradesUpdated', { class_id: cls.id, message: 'Forwarded to Admin' });
+    if (io) emitGradesUpdated(io, { class_id: cls.id, message: 'Forwarded to Admin' }, 'pipeline');
     return res.json({ message: `${doc.label} verified — both documents are now verified, forwarded to ${admins.length} admin(s) for approval.`, fullyVerified: true });
   }
 
   await logActivity(req.user.id, `verified the ${doc.label.toLowerCase()} for ${cls.subject?.code}`, 'Class', cls.id);
-  if (io) io.emit('gradesUpdated', { class_id: cls.id, message: `${doc.label} verified` });
+  if (io) emitGradesUpdated(io, { class_id: cls.id, message: `${doc.label} verified` }, 'pipeline');
   res.json({ message: `${doc.label} verified. Verify the other document too to forward this class to Admin.`, fullyVerified: false });
 });
 
@@ -358,7 +360,7 @@ const returnToChairperson = asyncHandler(async (req, res) => {
   const cls = await Class.findByPk(classId, {
     include: [
       { model: Subject, as: 'subject' },
-      { model: User, as: 'instructor', attributes: { exclude: ['password'] } },
+      { model: User, as: 'instructor', attributes: { exclude: USER_SECRET_FIELDS } },
     ],
   });
   if (!cls) return res.status(404).json({ message: 'Class not found.' });
@@ -379,6 +381,16 @@ const returnToChairperson = asyncHandler(async (req, res) => {
   cls.admin_return_reason = message.trim();
   cls.admin_returned_at = new Date();
   await cls.save();
+
+  // The per-grade approvals Admin already gave no longer stand either — same
+  // reset returnToFaculty does — otherwise the class still counts as
+  // "finalized by Admin" (0 pending) once the Chairperson re-verifies it,
+  // without Admin ever re-approving the revised documents. Already-released
+  // grades are left alone (students have already seen them).
+  await Grade.update(
+    { admin_approved: false, admin_approved_date: null },
+    { where: { class_id: cls.id, released: false } }
+  );
 
   const chairpersons = await User.findAll({
     where: {
@@ -407,7 +419,7 @@ const returnToChairperson = asyncHandler(async (req, res) => {
   await logActivity(req.user.id, `sent back the class record & grade sheet for ${cls.subject?.code} for revision: "${message.trim()}"`, 'Class', cls.id);
 
   const io = req.app.get('io');
-  if (io) io.emit('gradesUpdated', { class_id: cls.id, message: 'Sent back by Admin' });
+  if (io) emitGradesUpdated(io, { class_id: cls.id, message: 'Sent back by Admin' }, 'pipeline');
 
   res.json({ message: `Sent back to ${chairpersons.length} chairperson(s) for revision.` });
 });
@@ -431,7 +443,7 @@ const returnToFaculty = asyncHandler(async (req, res) => {
   const cls = await Class.findByPk(classId, {
     include: [
       { model: Subject, as: 'subject' },
-      { model: User, as: 'instructor', attributes: { exclude: ['password'] } },
+      { model: User, as: 'instructor', attributes: { exclude: USER_SECRET_FIELDS } },
     ],
   });
   if (!cls) return res.status(404).json({ message: 'Class not found.' });
@@ -501,9 +513,9 @@ const returnToFaculty = asyncHandler(async (req, res) => {
   await logActivity(req.user.id, `sent back the class record & grade sheet for ${cls.subject?.code} to Faculty for revision: "${message.trim()}"`, 'Class', cls.id);
 
   const io = req.app.get('io');
-  if (io) io.emit('gradesUpdated', { class_id: cls.id, message: 'Sent back to Faculty' });
+  if (io) emitGradesUpdated(io, { class_id: cls.id, message: 'Sent back to Faculty' }, 'pipeline');
 
-  res.json({ message: `Sent back to ${cls.instructor?.name || 'the instructor'} for revision.` });
+  res.json({ message: `Sent back to ${cls.instructor?.name || 'the faculty'} for revision.` });
 });
 
 // POST /api/reports/send-approved-grade-sheet/:classId — Admin's final step once
@@ -516,7 +528,7 @@ const sendApprovedGradeSheet = asyncHandler(async (req, res) => {
   const cls = await Class.findByPk(classId, {
     include: [
       { model: Subject, as: 'subject' },
-      { model: User, as: 'instructor', attributes: { exclude: ['password'] } },
+      { model: User, as: 'instructor', attributes: { exclude: USER_SECRET_FIELDS } },
     ],
   });
   if (!cls) return res.status(404).json({ message: 'Class not found.' });

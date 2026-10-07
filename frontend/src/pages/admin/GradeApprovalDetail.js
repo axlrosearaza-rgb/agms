@@ -107,13 +107,16 @@ export default function GradeApprovalDetail() {
         <Badge variant="blue">{cls.subject?.code}</Badge>
         {cls.subject?.program && <ProgramBadge program={cls.subject.program} short />}
         {cls.section && <Badge variant="purple">Sec {cls.section}</Badge>}
-        <span className="ml-auto text-[13px] text-gray-500">{rows.length} Students</span>
+        <span className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-800 shadow-xs">
+          <Icons.Users className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+          {rows.length} Students
+        </span>
       </div>
       <h2 className="text-xl font-bold mb-1">{cls.subject?.name}</h2>
       <p className="text-[13px] text-gray-500 mb-4 flex items-center gap-1.5 flex-wrap">
         {/* cls.semester already bakes the academic year in ("First Semester
             2026-2027") — appending cls.academic_year again duplicated it. */}
-        <span>{cls.instructor?.name} · {cls.semester}</span>
+        <span>{formatPersonName(cls.instructor?.name)} · {cls.semester}</span>
         {cls.instructor && <FacultyProgramTags user={cls.instructor} />}
       </p>
 
@@ -141,7 +144,7 @@ export default function GradeApprovalDetail() {
                     prefillText: `Hi ${cls.instructor.name}, I noticed a possible issue with the grades for ${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''}. Could you take a look?`,
                   },
                 })}
-                title="Flag a grading problem to this class's instructor"
+                title="Flag a grading problem to this class's faculty"
               >
                 <Icons.Send className="w-4 h-4" /> Forward to Messages
               </button>
@@ -170,7 +173,7 @@ export default function GradeApprovalDetail() {
                   ? 'Waiting on Chairperson verification first'
                   : pendingApproval > 0
                     ? 'Approve all Passed students first'
-                    : 'Notify the instructor and Chairperson that this Class Record and Grade Sheet are fully approved'
+                    : 'Notify the faculty and Chairperson that this Class Record and Grade Sheet are fully approved'
               }
             >
               <Icons.Send className="w-4 h-4" /> {sending ? 'Sending...' : 'Send Approved Grade Sheet'}
@@ -246,7 +249,7 @@ export default function GradeApprovalDetail() {
       {confirmingSend && (
         <ConfirmDialog
           title="Send Approved Grade Sheet?"
-          message={`Notify the instructor and Chairperson that the Class Record and Grade Sheet for ${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''} are fully approved and finalized?`}
+          message={`Notify the faculty and Chairperson that the Class Record and Grade Sheet for ${cls.subject?.code}${cls.section ? ` - Section ${cls.section}` : ''} are fully approved and finalized?`}
           confirmText={sending ? 'Sending...' : 'Send'}
           variant="green"
           confirmDisabled={sending}

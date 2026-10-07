@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const { User } = require('../models');
+const { getAuthUser } = require('../utils/userCache');
 
 // Verify JWT token
 const authenticate = async (req, res, next) => {
@@ -12,12 +12,14 @@ const authenticate = async (req, res, next) => {
     const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    const user = await User.findByPk(decoded.id);
+    // Cached for a few seconds (see utils/userCache.js) — this ran a users-table
+    // query on every single request.
+    const user = await getAuthUser(decoded.id);
     if (!user || user.status !== 'Active') {
       return res.status(401).json({ message: 'Invalid token or account deactivated.' });
     }
 
-    req.user = user.toSafeJSON();
+    req.user = user;
     next();
   } catch (error) {
     if (error.name === 'TokenExpiredError') {

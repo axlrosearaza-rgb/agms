@@ -11,8 +11,10 @@ const { asyncHandler } = require('../middleware/errorHandler');
 
 // GET /api/subjects
 const getSubjects = asyncHandler(async (req, res) => {
-  const { department, semester, search, all, program } = req.query;
-  const where = {};
+  const { department, semester, search, all, program, archived } = req.query;
+  // Archived subjects are left out unless asked for: ?archived=only lists
+  // just them (the Subjects page's Archived section).
+  const where = archived === 'only' ? { archived_at: { [Op.ne]: null } } : { archived_at: null };
   if (department) where.department = department;
   if (semester) where.semester = semester;
   // Explicit filter — used by e.g. the Student dashboard's regularization
@@ -51,15 +53,24 @@ const getSubjects = asyncHandler(async (req, res) => {
 });
 
 // POST /api/subjects
+// "2023", or a range like "2023-2024".
+const CURRICULUM_YEAR_RE = /^\d{4}(-\d{4})?$/;
+const cleanCurriculumYear = (v) => (v === undefined ? undefined : (String(v || '').trim() || null));
+
 const createSubject = asyncHandler(async (req, res) => {
   const { code, name, department, program, year_level, semester, description, prerequisite_ids, co_requisite_ids, lecture_hours, lecture_units, lab_hours, lab_units, total_hours, units, prerequisite_note, grading_scheme } = req.body;
+  const curriculum_year = cleanCurriculumYear(req.body.curriculum_year);
+  if (curriculum_year && !CURRICULUM_YEAR_RE.test(curriculum_year)) {
+    return res.status(400).json({ message: 'Curriculum year should look like 2023 (or 2023-2024).' });
+  }
 
   if ((req.user.role === 'Faculty' || req.user.role === 'Chairperson') && !(req.user.programs || []).includes(program)) {
     return res.status(403).json({ message: 'You may only create subjects for a program you teach in.' });
   }
 
+  const subject_type = req.body.subject_type === 'Minor' ? 'Minor' : 'Major';
   const subject = await Subject.create({
-    code, name, department, program, year_level, semester, description,
+    code, name, department, program, year_level, semester, description, curriculum_year, subject_type,
     lecture_hours, lecture_units, lab_hours, lab_units, total_hours, units, prerequisite_note, grading_scheme,
   });
 
@@ -85,7 +96,15 @@ const updateSubject = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'You may only edit subjects for a program you teach in.' });
   }
 
-  const fields = ['code', 'name', 'department', 'program', 'year_level', 'semester', 'description', 'lecture_hours', 'lecture_units', 'lab_hours', 'lab_units', 'total_hours', 'units', 'prerequisite_note', 'grading_scheme'];
+  if (req.body.curriculum_year !== undefined) {
+    const cy = cleanCurriculumYear(req.body.curriculum_year);
+    if (cy && !CURRICULUM_YEAR_RE.test(cy)) {
+      return res.status(400).json({ message: 'Curriculum year should look like 2023 (or 2023-2024).' });
+    }
+    req.body.curriculum_year = cy;
+  }
+  if (req.body.subject_type !== undefined) req.body.subject_type = req.body.subject_type === 'Minor' ? 'Minor' : 'Major';
+  const fields = ['code', 'name', 'department', 'program', 'year_level', 'semester', 'description', 'curriculum_year', 'subject_type', 'lecture_hours', 'lecture_units', 'lab_hours', 'lab_units', 'total_hours', 'units', 'prerequisite_note', 'grading_scheme'];
   fields.forEach((f) => { if (req.body[f] !== undefined) subject[f] = req.body[f]; });
 
   if ((req.user.role === 'Faculty' || req.user.role === 'Chairperson') && !(req.user.programs || []).includes(subject.program)) {
@@ -109,26 +128,30 @@ const updateSubject = asyncHandler(async (req, res) => {
   res.json({ message: 'Subject updated.', subject });
 });
 
-// DELETE /api/subjects/:id
-const deleteSubject = asyncHandler(async (req, res) => {
+// PUT /api/subjects/:id/archive  { archived: boolean }
+// Subjects are never deleted. An archived subject leaves the Subjects list
+// and the Create Class picker; classes, grades and prospectuses that already
+// use it keep it. Restoring ({ archived: false }) brings it back.
+const archiveSubject = asyncHandler(async (req, res) => {
   const subject = await Subject.findByPk(req.params.id);
   if (!subject) return res.status(404).json({ message: 'Subject not found.' });
 
   if ((req.user.role === 'Faculty' || req.user.role === 'Chairperson') && !(req.user.programs || []).includes(subject.program)) {
-    return res.status(403).json({ message: 'You may only delete subjects for a program you teach in.' });
+    return res.status(403).json({ message: 'You may only archive subjects for a program you teach in.' });
   }
 
-  const classCount = await Class.count({ where: { subject_id: subject.id } });
-  if (classCount > 0) {
-    return res.status(400).json({ message: `Cannot delete — ${classCount} class(es) already use this subject. Remove those classes first.` });
+  const archived = req.body.archived !== false;
+  if (archived) {
+    const running = await Class.count({ where: { subject_id: subject.id, status: 'Active' } });
+    if (running > 0) {
+      return res.status(400).json({ message: `${subject.code} is still used by ${running} active class(es) — archive it once those classes are done.` });
+    }
   }
+  subject.archived_at = archived ? new Date() : null;
+  await subject.save();
 
-  await Prerequisite.destroy({ where: { [Op.or]: [{ subject_id: subject.id }, { prerequisite_subject_id: subject.id }] } });
-  await CoRequisite.destroy({ where: { [Op.or]: [{ subject_id: subject.id }, { co_requisite_subject_id: subject.id }] } });
-  await subject.destroy();
-
-  await logActivity(req.user.id, `deleted subject ${subject.code}`, 'Subject', subject.id);
-  res.json({ message: 'Subject deleted.' });
+  await logActivity(req.user.id, `${archived ? 'archived' : 'restored'} subject ${subject.code}`, 'Subject', subject.id);
+  res.json({ message: archived ? `${subject.code} archived.` : `${subject.code} restored.`, subject });
 });
 
-module.exports = { getSubjects, createSubject, updateSubject, deleteSubject };
+module.exports = { getSubjects, createSubject, updateSubject, archiveSubject };

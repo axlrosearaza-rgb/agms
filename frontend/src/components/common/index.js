@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import API from '../../services/api';
 import { agoLabel } from '../../hooks/usePresence';
+import { yearAbbrOf, onSemestersUpdated } from '../../utils/semesterLabels';
 
 // ============ ICONS (SVG components) ============
 export const Icons = {
@@ -20,6 +21,7 @@ export const Icons = {
   Eye: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>,
   EyeOff: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/></svg>,
   Lock: (p) => <svg {...p} width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>,
+  Ban: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>,
   Search: (p) => <svg {...p} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>,
   Plus: (p) => <svg {...p} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>,
   Check: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="20 6 9 17 4 12"/></svg>,
@@ -29,6 +31,8 @@ export const Icons = {
   LogOut: (p) => <svg {...p} width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>,
   Menu: (p) => <svg {...p} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>,
   Save: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>,
+  Maximize: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>,
+  Minimize: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>,
   User: (p) => <svg {...p} width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>,
   Shield: (p) => <svg {...p} width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>,
   Award: (p) => <svg {...p} width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="8" r="7"/><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/></svg>,
@@ -48,7 +52,16 @@ export const Icons = {
   Moon: (p) => <svg {...p} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>,
   Archive: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><line x1="10" y1="13" x2="14" y2="13"/></svg>,
   RotateCcw: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>,
+  RotateCw: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>,
   Forward: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/></svg>,
+  Camera: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>,
+  Upload: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>,
+  Download: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
+  Clipboard: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>,
+  Play: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>,
+  ZoomIn: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>,
+  ZoomOut: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>,
+  Sparkles: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>,
 };
 
 // ============ ROLE DISPLAY LABEL ============
@@ -59,23 +72,81 @@ export const roleLabel = (role) => role;
 
 // ============ PERSON NAME SHARED FORMATTER ============
 // Single system-wide convention for every human-facing name label:
-// "Last name, First name Middle name(s)" — exactly the way the stored
-// name was entered, with the surname alphabetically leading the sort and
-// the middle token left intact as `G.` instead of being reduced to one
-// guessed letter or removed altogether.
+// "Surname, First Name Middle Initial" (e.g. "Araza, Axl Rose G.",
+// "Pacolor, Sweet Mercy F.", "Tenedero, Emma Q.") — surname leads (both for
+// sorting and standard Philippine academic roster presentation), followed by
+// the full given name(s), then the middle initial.
 export function formatPersonName(name = '') {
-  const parts = String(name || '').trim().replace(/\s+/g, ' ').split(' ').filter(Boolean);
-  if (parts.length === 0) return '';
+  let str = String(name || '').trim().replace(/\s+/g, ' ');
+  if (!str) return '';
 
-  const first = parts[0];
-  const last = parts[parts.length - 1];
-  const middle = parts.slice(1, -1);
+  const SUFFIXES = new Set(['jr', 'jr.', 'sr', 'sr.', 'ii', 'iii', 'iv', 'v']);
+  const SURNAME_PREFIXES = new Set(['de', 'del', 'dela', 'de la', 'delos', 'de los', 'de las', 'san', 'santa', 'santo', 'van', 'von', 'al', 'see']);
 
-  if (middle.length === 0) {
-    return `${last}, ${first}`;
+  // If already contains a comma: 'Surname, First Name Middle Initial' or legacy 'Surname, MI First'
+  if (str.includes(',')) {
+    const commaIdx = str.indexOf(',');
+    const surname = str.slice(0, commaIdx).trim();
+    const after = str.slice(commaIdx + 1).trim();
+    if (!after) return surname;
+    const afterTokens = after.split(' ').filter(Boolean);
+    // If it starts with middle initial (e.g. 'G. Axl Rose' or 'G Axl Rose')
+    if (afterTokens.length > 1 && /^[A-Za-z]\.?$/.test(afterTokens[0])) {
+      const mi = afterTokens[0].endsWith('.') ? afterTokens[0] : afterTokens[0] + '.';
+      const first = afterTokens.slice(1).join(' ');
+      return `${surname}, ${first} ${mi}`;
+    }
+    return `${surname}, ${after}`;
   }
 
-  return `${last}, ${first} ${middle.join(' ')}`;
+  let tokens = str.split(' ').filter(Boolean);
+  if (tokens.length === 1) return tokens[0];
+
+  // Suffix handling (e.g. "Jr.", "Sr.", "III") attached to surname
+  let suffix = '';
+  if (tokens.length > 2 && SUFFIXES.has(tokens[tokens.length - 1].toLowerCase())) {
+    suffix = ' ' + tokens.pop();
+  }
+
+  // Compound surname prefixes (e.g. "Del Rosario", "Delos Reyes", "Dela Cruz", "De Guia", "See Bok")
+  let surnameTokens = [];
+  if (tokens.length >= 3 && tokens[tokens.length - 2].toLowerCase() === 'la' && tokens[tokens.length - 3].toLowerCase() === 'de') {
+    surnameTokens = tokens.splice(tokens.length - 3, 3);
+  } else if (tokens.length >= 3 && tokens[tokens.length - 2].toLowerCase() === 'los' && tokens[tokens.length - 3].toLowerCase() === 'de') {
+    surnameTokens = tokens.splice(tokens.length - 3, 3);
+  } else if (tokens.length >= 2 && SURNAME_PREFIXES.has(tokens[tokens.length - 2].toLowerCase())) {
+    surnameTokens = tokens.splice(tokens.length - 2, 2);
+  } else {
+    surnameTokens = [tokens.pop()];
+  }
+  const surname = surnameTokens.join(' ') + suffix;
+
+  // Remaining tokens are Given/First Name(s) and Middle Initial.
+  // Middle initial is identified as a single letter (e.g. "G." or "G"),
+  // distinguishing it from abbreviations like "Ma." (Maria) or compound given names.
+  let mi = '';
+  let firstTokens = [];
+
+  let miIndex = -1;
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    if (/^[A-Za-z]\.?$/.test(tokens[i])) {
+      miIndex = i;
+      break;
+    }
+  }
+
+  if (miIndex !== -1) {
+    mi = tokens[miIndex];
+    if (!mi.endsWith('.')) mi += '.';
+    firstTokens = tokens.filter((_, idx) => idx !== miIndex);
+  } else {
+    firstTokens = tokens;
+  }
+
+  const firstName = firstTokens.join(' ');
+  if (!firstName) return surname;
+  if (!mi) return `${surname}, ${firstName}`;
+  return `${surname}, ${firstName} ${mi}`;
 }
 
 // Same "Last, First Middle" order as formatPersonName, but the surname
@@ -88,6 +159,20 @@ export function formatPersonNameCapsSurname(name = '') {
   const commaIdx = formatted.indexOf(',');
   if (commaIdx === -1) return formatted.toUpperCase();
   return formatted.slice(0, commaIdx).toUpperCase() + formatted.slice(commaIdx);
+}
+
+// "First Name Middle Initial Surname" (e.g. "Axl Rose G. Araza") — the
+// signature-style order used for the faculty name on the exported/printed
+// Class Record and Grade Sheet. Built from formatPersonName's own parse, so
+// compound surnames ("Dela Cruz") and suffixes ("Jr.") are handled the same
+// way.
+export function formatPersonNameFirstLast(name = '') {
+  const formatted = formatPersonName(name);
+  const commaIdx = formatted.indexOf(',');
+  if (commaIdx === -1) return formatted;
+  const surname = formatted.slice(0, commaIdx).trim();
+  const given = formatted.slice(commaIdx + 1).trim();
+  return given ? `${given} ${surname}` : surname;
 }
 
 export function comparePeopleNames(a, b) {
@@ -189,12 +274,9 @@ export const programBSLabel = (value) => {
 
 export function ProgramBadge({ program, short = false, bs = false, size = 'sm', className = '' }) {
   if (!program) return <span className="text-gray-400">—</span>;
-  const sizeClass = size === 'lg' ? 'text-base px-4 py-1.5 font-bold' : '';
+  const sizeClass = size === 'lg' ? 'text-base font-semibold text-gray-800 dark:text-gray-100' : 'text-[13px] font-medium text-gray-700 dark:text-gray-300';
   const label = bs ? programBSLabel(program) : (short ? programShortLabel(program) : program);
-  // BSIT/BSIS/BSPsych/BSS need to read as a program identity at a glance, not
-  // blend in with the rest of a row's text — bold (not just the badge's own
-  // default font-semibold) everywhere this renders, not just the `lg` size.
-  return <Badge variant={programColorVariant(program)} className={`font-bold ${sizeClass} ${className}`}>{label}</Badge>;
+  return <span className={`${sizeClass} ${className}`}>{label}</span>;
 }
 
 // A part-time faculty account is tagged with every program (so every
@@ -206,7 +288,8 @@ export function ProgramBadge({ program, short = false, bs = false, size = 'sm', 
 export function FacultyProgramTags({ user, short = true }) {
   if (!user) return null;
   if (user.employment_type === 'Part Time') {
-    return <Badge variant="yellow">Part Timer</Badge>;
+    // Plain text, same look as the program labels the other faculty show.
+    return <span className="text-[13px] font-medium text-gray-700 dark:text-gray-300">Part Timer</span>;
   }
   const programs = user.programs?.length ? user.programs : (user.program ? [user.program] : []);
   if (programs.length === 0) return null;
@@ -246,7 +329,7 @@ export function ProgramDot({ program, className = '' }) {
 // Shared here so both display consistently wherever a student shows up —
 // Admin, Chairperson, Faculty, and the student's own account alike.
 export const STUDENT_TYPES = ['New', 'Shifter', 'Transferee', 'Old', 'Quitter'];
-const STUDENT_TYPE_LABELS = { New: 'New Student', Old: 'Old Student' };
+const STUDENT_TYPE_LABELS = { New: 'New Student', Old: 'Old Student', Quitter: 'Returnee' };
 export const studentTypeLabel = (t) => STUDENT_TYPE_LABELS[t] || t;
 const STUDENT_TYPE_BADGE_VARIANT = { New: 'blue', Shifter: 'purple', Transferee: 'yellow', Old: 'gray', Quitter: 'red' };
 export function StudentTypeBadge({ status, className = '' }) {
@@ -353,15 +436,19 @@ export function studentCurrentYearSectionLabel(user) {
 export function CurrentSemesterTag({ className = '' }) {
   const [semester, setSemester] = useState(null);
   useEffect(() => {
-    API.get('/semesters/public/current')
+    const fetchCurrent = () => API.get('/semesters/public/current')
       .then(({ data }) => setSemester(data.semester))
       .catch(() => {});
+    fetchCurrent();
+    // Live — a new current semester, or its A.Y./S.Y. label changing,
+    // shows up here without a reload.
+    return onSemestersUpdated(fetchCurrent);
   }, []);
   if (!semester) return null;
   return (
     <span className={`inline-flex items-center gap-1.5 text-xs font-medium text-gray-500 bg-gray-100 px-3 py-1.5 rounded-full ${className}`}>
       <Icons.Clock className="w-3 h-3" />
-      {semester.term || semester.name} · A.Y. {semester.academic_year}
+      {semester.term || semester.name} · {yearAbbrOf(semester)} {semester.academic_year}
     </span>
   );
 }
@@ -402,10 +489,33 @@ const modalStack = [];
 function handleModalEscape(e) {
   if (e.key !== 'Escape' || modalStack.length === 0) return;
   const top = modalStack[modalStack.length - 1].current;
-  // A modal that opted out of backdrop-click dismissal (an in-progress form
-  // that must never be discarded by a stray click) is just as easy to
-  // dismiss by a stray Esc — it ignores it too, and blocks the ones below.
-  if (top.dismissible) top.close();
+  // Esc does exactly what the X button does — it closes the topmost pop-up,
+  // including ones that ignore a click on the backdrop.
+  top.close();
+}
+
+// The X button closes EVERYTHING that's open — the pop-up it's on and any
+// pop-up underneath it — so one click always gets back to the page.
+// (Esc and Cancel still close just the top one.)
+export function closeAllModals() {
+  [...modalStack].reverse().forEach((h) => { try { h.current.close(); } catch (e) { /* already gone */ } });
+}
+
+// For pop-ups that aren't built on <Modal> (they draw their own overlay):
+// Esc closes them like their X button, in the same topmost-first order.
+export function useEscapeToClose(onClose, enabled = true) {
+  const handle = useRef({ close: onClose, dismissible: true });
+  handle.current.close = onClose;
+  useEffect(() => {
+    if (!enabled) return undefined;
+    if (modalStack.length === 0) document.addEventListener('keydown', handleModalEscape);
+    modalStack.push(handle);
+    return () => {
+      const i = modalStack.indexOf(handle);
+      if (i !== -1) modalStack.splice(i, 1);
+      if (modalStack.length === 0) document.removeEventListener('keydown', handleModalEscape);
+    };
+  }, [enabled]);
 }
 
 export function Modal({ title, onClose, children, footer, size = 'max-w-lg', closeOnBackdropClick = true }) {
@@ -425,12 +535,29 @@ export function Modal({ title, onClose, children, footer, size = 'max-w-lg', clo
     };
   }, []);
 
+  const handleClose = (e) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    if (typeof onClose === 'function') {
+      onClose();
+    }
+  };
+
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[1000] p-5 animate-fadeIn" onClick={closeOnBackdropClick ? onClose : undefined}>
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[1000] p-5 animate-fadeIn" onClick={closeOnBackdropClick ? handleClose : undefined}>
       <div className={`bg-white rounded-xl w-full ${size} max-h-[90vh] overflow-y-auto shadow-2xl animate-slideUp`} onClick={(e) => e.stopPropagation()}>
         <div className="px-6 py-5 border-b border-gray-100 flex items-center justify-between">
           <h3 className="text-lg font-semibold">{title}</h3>
-          <button className="btn-icon" onClick={onClose}><Icons.X /></button>
+          <button
+            type="button"
+            className="btn-icon"
+            onClick={handleClose}
+            title="Close"
+          >
+            <Icons.X />
+          </button>
         </div>
         <div className="px-6 py-5">{children}</div>
         {footer && <div className="px-6 py-4 border-t border-gray-100 flex justify-end gap-2">{footer}</div>}
@@ -446,12 +573,33 @@ export function SearchBar({ value, onChange, placeholder = 'Search...' }) {
       <Icons.Search className="text-gray-400 flex-shrink-0" />
       <input
         type="text"
-        className="border-none outline-none py-2.5 text-sm font-sans flex-1 bg-transparent"
+        className="border-none outline-none py-2.5 text-sm font-sans flex-1 bg-transparent min-w-0"
         placeholder={placeholder}
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Escape' && value) onChange(''); }}
       />
+      <ClearSearchButton value={value} onClear={() => onChange('')} inline />
     </div>
+  );
+}
+
+// The "x" that resets a search box — only shown while there's text in it.
+// Absolutely positioned inside a `relative` wrapper by default (give the
+// input some right padding, e.g. pr-8); `inline` for a flex row instead.
+export function ClearSearchButton({ value, onClear, inline = false, className = '' }) {
+  if (!value) return null;
+  return (
+    <button
+      type="button"
+      aria-label="Clear search"
+      title="Clear search"
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onClear}
+      className={`${inline ? 'flex-shrink-0' : 'absolute right-2 top-1/2 -translate-y-1/2'} w-6 h-6 rounded-full flex items-center justify-center text-gray-400 hover:text-gray-700 hover:bg-gray-100 border-none bg-transparent cursor-pointer p-0 ${className}`}
+    >
+      <Icons.X className="w-3.5 h-3.5" />
+    </button>
   );
 }
 
@@ -492,7 +640,10 @@ export function EmptyState({ icon, title, description }) {
 }
 
 // ============ CONFIRM DIALOG ============
-export function ConfirmDialog({ title, message, onConfirm, onCancel, confirmText = 'Confirm', variant = 'red', confirmDisabled = false }) {
+// `warning` — for actions that can't be casually taken back (submitting grades,
+// releasing them to students): shows a warning sign beside the message so it
+// reads as "double-check this" instead of a routine yes/no.
+export function ConfirmDialog({ title, message, onConfirm, onCancel, confirmText = 'Confirm', variant = 'red', confirmDisabled = false, warning = false }) {
   return (
     <Modal title={title} onClose={onCancel} footer={
       <>
@@ -500,7 +651,41 @@ export function ConfirmDialog({ title, message, onConfirm, onCancel, confirmText
         <button className={`btn btn-${variant}`} onClick={onConfirm} disabled={confirmDisabled}>{confirmText}</button>
       </>
     }>
-      <p className="text-sm text-gray-600">{message}</p>
+      {warning ? (
+        <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+          <Icons.AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+          <p className="text-sm text-amber-800">{message}</p>
+        </div>
+      ) : (
+        <p className="text-sm text-gray-600">{message}</p>
+      )}
     </Modal>
   );
+}
+
+// ============ GROUPING HELPERS ============
+export function groupByProgramYearSection(list) {
+  const byProgram = {};
+  (list || []).forEach((c) => {
+    const program = c.subject?.program || 'No Program';
+    const year = c.year_level ?? '—';
+    const section = c.section || 'No Section';
+    if (!byProgram[program]) byProgram[program] = {};
+    if (!byProgram[program][year]) byProgram[program][year] = {};
+    if (!byProgram[program][year][section]) byProgram[program][year][section] = [];
+    byProgram[program][year][section].push(c);
+  });
+  return byProgram;
+}
+
+export function groupByYearSection(list) {
+  const byYear = {};
+  (list || []).forEach((c) => {
+    const year = c.year_level ?? '—';
+    const section = c.section || 'No Section';
+    if (!byYear[year]) byYear[year] = {};
+    if (!byYear[year][section]) byYear[year][section] = [];
+    byYear[year][section].push(c);
+  });
+  return byYear;
 }
