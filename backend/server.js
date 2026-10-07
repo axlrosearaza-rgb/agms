@@ -64,11 +64,21 @@ const isLanOrigin = (origin) =>
   process.env.NODE_ENV !== 'production'
   && /^https?:\/\/(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(origin);
 
+// On Vercel the frontend and this backend share one domain (/vercel.json
+// routes /api/* here), so the page's own origin is the deployment itself.
+// Vercel provides those hostnames; they are trusted without listing each
+// one in CLIENT_URL. (A custom domain still goes in CLIENT_URL.)
+const vercelOrigins = ['VERCEL_URL', 'VERCEL_BRANCH_URL', 'VERCEL_PROJECT_PRODUCTION_URL']
+  .map((name) => process.env[name])
+  .filter(Boolean)
+  .map((host) => `https://${host}`);
+
 const isAllowedOrigin = (origin) => {
   if (!origin) return true;
   if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return true;
   if (isLanOrigin(origin)) return true;
   if (allowedOriginsFromEnv.includes(origin)) return true;
+  if (vercelOrigins.includes(origin)) return true;
   return false;
 };
 
@@ -217,6 +227,16 @@ const startServer = async () => {
     }
 
     await ensureIndexes();
+
+    // On Vercel this file runs as a function: Vercel serves the exported
+    // `app` itself, per request, with no long-lived process. So there is no
+    // port to listen on, and nothing below can run there — the Socket.IO
+    // server (live updates) and the timers (auto-archive, INC deadlines,
+    // semester end, warnings) all need a server that stays up.
+    if (process.env.VERCEL) {
+      console.log('✅ AGMS backend ready (Vercel function — no Socket.IO, no background timers).');
+      return;
+    }
 
     // A bigger accept queue than Node's default (511): when thousands of people
     // open the app in the same minute (start of class), new connections arrive

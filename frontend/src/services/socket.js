@@ -1,17 +1,10 @@
 import { io } from 'socket.io-client';
 import { getToken } from './authStorage';
 import api from './api';
-
-// Same API_BASE_URL logic api.js uses, minus the trailing /api — that env
-// var (or the dynamic same-host fallback — see api.js's own comment) points
-// at the REST base (".../api"), but Socket.io connects to the bare server
-// origin. Hardcoding localhost:5000 here (the old behavior) meant every
-// deployed build silently tried to open a socket back to the visitor's own
-// machine instead of the real backend, breaking realtime features (chat,
-// presence) in production while the REST API worked fine.
-const API_BASE_URL =
-  process.env.REACT_APP_API_URL || `http://${window.location.hostname}:5000/api`;
-const SOCKET_URL = API_BASE_URL.replace(/\/api\/?$/, '');
+// The bare server origin (not ".../api") — worked out once in apiBase.js,
+// together with the REST base, so a deployed build never opens a socket back
+// to the visitor's own machine.
+import { SOCKET_URL } from './apiBase';
 
 const socket = io(SOCKET_URL, {
   autoConnect: false,
