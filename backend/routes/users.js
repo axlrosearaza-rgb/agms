@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const { getAdviserSummary, getUsers, getUserById, createUser, checkStudentNos, updateUser, archiveUser, restoreUser, getUsersByDepartment, setAdvisory, importAdvisories, getMyAdvisory, importAdvisoryList, updateAdvisee, setRegularizationSubjects, getPresence } = require('../controllers/userController');
+const { getAdviserSummary, getUsers, getUserById, createUser, checkStudentNos, updateUser, archiveUser, restoreUser, getUsersByDepartment, setAdvisory, importAdvisories, getAdviserArchive, getMyAdvisory, importAdvisoryList, updateAdvisee, setRegularizationSubjects, getPresence } = require('../controllers/userController');
 const { authenticate, authorize } = require('../middleware/auth');
 
 router.use(authenticate);
@@ -25,6 +25,9 @@ router.get('/:id', authorize('Admin', 'Chairperson', 'Faculty'), getUserById);
 router.post('/check-student-nos', authorize('Admin', 'Faculty', 'Chairperson'), checkStudentNos);
 // Whole adviser list from a Room Assignment-style document (Admin).
 router.post('/advisories/import', authorize('Admin'), importAdvisories);
+// "Remove All Advisory" — every section taken off every adviser (Admin).
+// Past advisers and the advisees they had (there is no "remove all": a new list is uploaded instead).
+router.get('/advisers/archive', authorize('Admin'), getAdviserArchive);
 router.post('/', authorize('Admin', 'Chairperson'), createUser);
 router.put('/:id', authorize('Admin', 'Chairperson', 'Faculty'), updateUser);
 // Nothing is deleted — accounts are archived (and can be restored).

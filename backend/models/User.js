@@ -141,6 +141,12 @@ const User = sequelize.define('User', {
     type: DataTypes.STRING(100),
     allowNull: true,
   },
+  // Students only: the curriculum of their program that they follow, kept as
+  // they move up the years (see utils/studentCurriculum.js).
+  curriculum_year: {
+    type: DataTypes.STRING(20),
+    allowNull: true,
+  },
   // Irregular students only: every Year+Section pair they're actually taking
   // classes under (e.g. retaking a Year 2 subject while also enrolled in Year 3
   // classes) — [{ year_level: 2, section: 'A' }, ...]. `year_level`/`section`

@@ -117,6 +117,10 @@ async function upsertImportedStudents(rawStudents, { rowOffset = 0, createdBy = 
 
   const created = [];
   if (toCreate.length > 0) {
+    // Each new student follows the curriculum of their own batch.
+    const { curriculumForNewStudent } = require('./studentCurriculum');
+    const curriculumCache = new Map();
+    for (const c of toCreate) c.data.curriculum_year = await curriculumForNewStudent(c.data.program, c.data.year_level, curriculumCache);
     const passwordHash = await bcrypt.hash(DEFAULT_STUDENT_PASSWORD, await bcrypt.genSalt(10));
     const withPassword = (d) => ({ ...d, password: passwordHash });
     for (let i = 0; i < toCreate.length; i += IMPORT_BATCH) {

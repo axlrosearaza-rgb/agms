@@ -12,6 +12,7 @@
   import { notificationService, classService, chatService, authService, accountSetupService } from '../../services';
   import socket, { onGradesUpdated } from '../../services/socket';
   import API from '../../services/api';
+  import toast from 'react-hot-toast';
   import { playNotificationSound } from '../../utils/notificationSound';
   import { getLastActivity, markActivity, isLockedState, setLockedState } from '../../services/authStorage';
 
@@ -186,7 +187,14 @@
     // scattered across whatever page happens to be open.
     const [isOnline, setIsOnline] = useState(navigator.onLine);
     useEffect(() => {
-      const goOnline = () => setIsOnline(true);
+      // Back online: every open page reloads its data by itself, so nothing
+      // shown is left over from before the connection dropped.
+      const goOnline = () => {
+        setIsOnline(true);
+        API.clearCache();
+        window.dispatchEvent(new Event('agms:data-changed'));
+        toast.success('Back online — the page has been refreshed.');
+      };
       const goOffline = () => setIsOnline(false);
       window.addEventListener('online', goOnline);
       window.addEventListener('offline', goOffline);
@@ -946,7 +954,7 @@
           {!isOnline && (
             <div className="bg-amber-50 text-amber-800 text-[12.5px] px-4 lg:px-7 py-2 flex items-center gap-2 border-b border-amber-100 sticky top-14 z-[80]">
               <Icons.AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-              You're offline — showing the last loaded data. Some actions won't work until your connection is back.
+              No internet connection — you are seeing the last loaded data, and saving is paused until the connection is back. Nothing you have entered is lost.
             </div>
           )}
 

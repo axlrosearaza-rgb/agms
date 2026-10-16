@@ -35,16 +35,22 @@ const getAdminDashboard = asyncHandler(async (req, res) => {
   // zero those three buckets out entirely regardless of real approval
   // status.)
   // Only the three columns actually read below, as plain rows: this scans every
-  // approved grade in the system (tens of thousands), and building a full
-  // Sequelize model instance per row was most of this endpoint's runtime.
+  const currentSemester = await Semester.findOne({ where: { is_current: true } });
+  const semName = semester || currentSemester?.name;
+  const adminClassWhere = { admin_class_record_approved: true, admin_grade_sheet_approved: true };
+  if (semName) adminClassWhere.semester = semName;
+
+  // Released grades only — Student Grade Status, the pass rate and the
+  // average GWA appear once the Admin releases a class's grades to its
+  // students, not before.
   const allGrades = await Grade.findAll({
-    where: { submitted: true },
+    where: { released: true },
     attributes: ['student_id', 'status', 'average'],
     include: [{
       model: Class,
       as: 'class',
       attributes: [],
-      where: { admin_class_record_approved: true, admin_grade_sheet_approved: true },
+      where: adminClassWhere,
     }],
     raw: true,
   });
@@ -205,8 +211,9 @@ const getAdminDashboard = asyncHandler(async (req, res) => {
   // entries "age out" of this feed (not deleted; still reachable via GET
   // /api/dashboard/activities?archived=true, see getActivities below) so the
   // feed doesn't grow without bound the longer the system has been running.
+  const semesterCutoff = currentSemester ? (currentSemester.created_at || (currentSemester.start_date ? new Date(currentSemester.start_date) : null)) : null;
   const recentActivities = await ActivityLog.findAll({
-    where: activityRetentionWhere(true),
+    where: activityRetentionWhere(true, semesterCutoff),
     include: [{ model: User, as: 'user', attributes: ['id', 'name', 'avatar', 'role'] }],
     order: [['created_at', 'DESC']],
     limit: 100,
@@ -219,9 +226,6 @@ const getAdminDashboard = asyncHandler(async (req, res) => {
     group: ['department'],
     raw: true,
   });
-
-  // Current semester
-  const currentSemester = await Semester.findOne({ where: { is_current: true } });
 
   // Per-program breakdown: enrolled students, faculty, active classes, pass rate, avg GWA
   const programBreakdown = await Promise.all(PROGRAMS.map(async (program) => {
@@ -248,7 +252,7 @@ const getAdminDashboard = asyncHandler(async (req, res) => {
     // program's pass rate/GWA yet.
     const programGrades = classIds.length > 0
       ? await Grade.findAll({
-        where: { class_id: classIds, submitted: true },
+        where: { class_id: classIds, released: true }, // released to the students only
         include: [{
           model: Class,
           as: 'class',
@@ -306,11 +310,20 @@ const getAdminAnalytics = asyncHandler(async (req, res) => {
     raw: true,
   });
 
+  const currentSemester = await Semester.findOne({ where: { is_current: true } });
+  const semName = currentSemester?.name;
+
   // Submitted grades by status (donut)
   const statusCounts = await Grade.findAll({
     where: { submitted: true },
-    attributes: ['status', [sequelize.fn('COUNT', sequelize.col('id')), 'count']],
-    group: ['status'],
+    include: [{
+      model: Class,
+      as: 'class',
+      where: semName ? { semester: semName } : { status: 'Active' },
+      attributes: [],
+    }],
+    attributes: ['status', [sequelize.fn('COUNT', sequelize.col('Grade.id')), 'count']],
+    group: ['Grade.status'],
     raw: true,
   });
 
@@ -324,6 +337,7 @@ const getAdminAnalytics = asyncHandler(async (req, res) => {
 
   // Classes by status (donut)
   const classStatusCounts = await Class.findAll({
+    where: semName ? { semester: semName } : {},
     attributes: ['status', [sequelize.fn('COUNT', sequelize.col('id')), 'count']],
     group: ['status'],
     raw: true,
@@ -456,10 +470,14 @@ const getActivities = asyncHandler(async (req, res) => {
   const { page = 1, limit = 20, archived, action, search } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
+  const currentSemester = await Semester.findOne({ where: { is_current: true } });
+  const semesterCutoff = currentSemester ? (currentSemester.created_at || (currentSemester.start_date ? new Date(currentSemester.start_date) : null)) : null;
+
   const isChairperson = req.user.role === 'Chairperson';
-  const where = archived === 'true'
-    ? (isChairperson ? chairpersonActivityRetentionWhere(false) : activityRetentionWhere(false))
-    : (isChairperson ? chairpersonActivityRetentionWhere(true) : {});
+  const isArchived = archived === 'true';
+  const where = isArchived
+    ? (isChairperson ? chairpersonActivityRetentionWhere(false, semesterCutoff) : activityRetentionWhere(false, semesterCutoff))
+    : (isChairperson ? chairpersonActivityRetentionWhere(true, semesterCutoff) : activityRetentionWhere(true, semesterCutoff));
   if (action) where.action = { [Op.iLike]: `%${action}%` };
 
   if (req.user.role === 'Chairperson') {
@@ -535,7 +553,13 @@ const getActivities = asyncHandler(async (req, res) => {
 // list (default 20).
 const getLoginHistory = asyncHandler(async (req, res) => {
   const { limit = 20 } = req.query;
+  const currentSemester = await Semester.findOne({ where: { is_current: true } });
+  const semesterCutoff = currentSemester ? (currentSemester.created_at || (currentSemester.start_date ? new Date(currentSemester.start_date) : null)) : null;
+
   const where = { action: { [Op.iLike]: '%logged in%' } };
+  if (semesterCutoff) {
+    where.created_at = { [Op.gte]: semesterCutoff };
+  }
 
   if (req.user.role === 'Chairperson') {
     const myPrograms = req.user.programs || [];

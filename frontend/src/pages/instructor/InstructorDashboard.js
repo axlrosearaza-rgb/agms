@@ -29,7 +29,10 @@ export default function InstructorDashboard() {
   // silently did nothing. Passing the already-known displayed boolean (each
   // call site already computed it as `xOpen`) sidesteps that mismatch
   // entirely instead of trying to keep two separate defaults in sync.
-  const toggleGroup = (key, next) => setOpenGroups((prev) => ({ ...prev, [key]: next }));
+  const toggleGroup = (key, next) => setOpenGroups((prev) => ({
+    ...prev,
+    [key]: next !== undefined ? next : !prev[key]
+  }));
   // "Encode Grades" opens right here on the Dashboard instead of navigating
   // to /faculty/encode/:classId — My Classes (InstructorClasses.js) keeps
   // that routed page for its own "Encode Grades" action, fully separate from

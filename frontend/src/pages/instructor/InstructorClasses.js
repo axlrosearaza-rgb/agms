@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useNavigate } from 'react-router-dom';
-import { Icons, Badge, SearchBar, StatCard, LoadingSpinner, Modal, ProgramBadge, ConfirmDialog, ProgramDot, programCascadeGradient, programShortLabel, comparePeopleNames, formatPersonName, ClearSearchButton } from '../../components/common';
+import { Icons, Badge, SearchBar, StatCard, LoadingSpinner, Modal, ProgramBadge, ConfirmDialog, ProgramDot, programCascadeGradient, programShortLabel, comparePeopleNames, formatPersonName, ClearSearchButton, groupBySemester } from '../../components/common';
 import { classService, subjectService, semesterService, gradeService } from '../../services';
 import toast from 'react-hot-toast';
 import { usePageState } from '../../hooks/usePageState';
@@ -202,7 +202,10 @@ export default function InstructorClasses({ embedded = false }) {
   // defaulting to — meaning the very first click on any freshly-loaded
   // group silently did nothing. Passing the already-known displayed boolean
   // (each call site already computed it as `xOpen`) sidesteps that mismatch.
-  const toggleGroup = (key, next) => setOpenGroups((prev) => ({ ...prev, [key]: next }));
+  const toggleGroup = (key, next) => setOpenGroups((prev) => ({
+    ...prev,
+    [key]: next !== undefined ? next : !prev[key]
+  }));
 
   const [subjects, setSubjects] = useState([]);
   const [semesterOptions, setSemesterOptions] = useState([]);
@@ -431,16 +434,6 @@ export default function InstructorClasses({ embedded = false }) {
     if (cfg?.action) await cfg.action();
   };
 
-  const archiveClass = async (c) => {
-    try {
-      await classService.update(c.id, { status: 'Completed' });
-      toast.success(`${c.subject?.code || 'Class'} archived`);
-      loadClasses();
-    } catch (err) {
-      toast.error(err.response?.data?.message || 'Failed to archive class');
-    }
-  };
-
   const unarchiveClass = async (c) => {
     try {
       await classService.update(c.id, { status: 'Active' });
@@ -458,12 +451,18 @@ export default function InstructorClasses({ embedded = false }) {
   // The class's schedule as day → time slots, for the same picker Create Class uses.
   const [editTimes, setEditTimes] = useState({});
   const [savingEdit, setSavingEdit] = useState(false);
-  const openEditClass = (c) => { setEditForm({ section: c.section || '', schedule: c.schedule || '' }); setEditTimes(scheduleFromString(c.schedule)); setEditClass(c); };
+  // The subject can still be changed while nothing has been built on it: no
+  // grades encoded and no Class Record components set up yet.
+  const editSubjectOpen = !!editClass && !editClass.has_scores && !(editClass.submitted_count > 0);
+  const openEditClass = (c) => { setEditForm({ subject_id: c.subject_id || c.subject?.id || '', year_level: c.year_level ? String(c.year_level) : '', section: c.section || '', schedule: c.schedule || '' }); setEditTimes(scheduleFromString(c.schedule)); setEditClass(c); };
   const saveEditClass = async () => {
     if (!editForm.section) return toast.error('Choose a section.');
+    if (!editForm.year_level) return toast.error('Choose a year level.');
     setSavingEdit(true);
     try {
-      await classService.update(editClass.id, { section: editForm.section, schedule: scheduleToString(editTimes) || null });
+      const changes = { section: editForm.section, year_level: Number(editForm.year_level), schedule: scheduleToString(editTimes) || null };
+      if (editSubjectOpen && editForm.subject_id && Number(editForm.subject_id) !== Number(editClass.subject_id || editClass.subject?.id)) changes.subject_id = Number(editForm.subject_id);
+      await classService.update(editClass.id, changes);
       toast.success('Class updated.');
       setEditClass(null);
       loadClasses();
@@ -922,8 +921,12 @@ export default function InstructorClasses({ embedded = false }) {
                           </button>
                         )}
                         {!(c.all_released || c.sent_to_chairperson || c.chairperson_verified) && (
-                          <button className="btn-icon" onClick={() => openEditClass(c)} title="Edit Class (section, schedule)">
-                            <Icons.Settings />
+                          <button
+                            className="h-8 px-2.5 inline-flex items-center gap-1 rounded-lg border border-solid border-gray-200 dark:border-gray-700 bg-transparent cursor-pointer text-xs font-semibold font-sans text-navy dark:text-blue-300 hover:bg-gray-50 dark:hover:bg-gray-800 whitespace-nowrap transition-all"
+                            onClick={() => openEditClass(c)}
+                            title="Edit this class — subject, year level, section and schedule"
+                          >
+                            <Icons.Settings className="w-3.5 h-3.5" /> Edit
                           </button>
                         )}
                         <button className="btn-icon" onClick={() => openEnrollModal(c)} title="Class List">
@@ -942,29 +945,8 @@ export default function InstructorClasses({ embedded = false }) {
                         <button className="btn-icon" onClick={() => setPreview({ cls: c, type: 'sheet' })} title="Preview Grade Sheet">
                           <Icons.FileText />
                         </button>
-                        {/* Release and Archive both dropped from this row —
-                            Release already lives on the class's own Grade
-                            Encoding page (where the actual score entry
-                            happens, right next to it), and Archive only ever
-                            makes sense once a class is actually done
-                            (Released), where it now lives instead — see the
-                            Released group below. Having both here too, on
-                            every class a Faculty/teaching Chairperson creates,
-                            duplicated an action that belongs to a later step. */}
-                        {/* Classes are never deleted — archived, with everything kept. */}
-                        <button
-                          className="btn-icon hover:!bg-amber-50 hover:!text-amber-600"
-                          title="Archive Class"
-                          onClick={() => requestConfirm({
-                            title: 'Archive Class',
-                            message: `Archive ${c.subject?.code || 'this class'}${c.section ? ` - Section ${c.section}` : ''}? It moves to the Archived tab — its students, scores and grades are all kept, and you can restore it from there any time.`,
-                            confirmText: 'Archive',
-                            variant: 'gold',
-                            action: () => archiveClass(c),
-                          })}
-                        >
-                          <Icons.Archive />
-                        </button>
+                        {/* No Archive button: a class is archived by the system when its
+                            semester ends, never by hand. */}
                       </div>
                     </td>
                   </tr>
@@ -1079,19 +1061,6 @@ export default function InstructorClasses({ embedded = false }) {
                                     >
                                       <Icons.Download className="w-3.5 h-3.5" /> {exportingDoc === `${c.id}-sheet` ? 'Exporting…' : 'Export Grade Sheet'}
                                     </button>
-                                    <button
-                                      className="btn-icon"
-                                      title="Archive Class"
-                                      onClick={() => requestConfirm({
-                                        title: 'Archive Class',
-                                        message: `Archive ${c.subject?.code || 'this class'}${c.section ? ` - Section ${c.section}` : ''}? It moves to the Archived tab and stops appearing in this Released list. You can restore it later from there.`,
-                                        confirmText: 'Archive',
-                                        variant: 'gold',
-                                        action: () => archiveClass(c),
-                                      })}
-                                    >
-                                      <Icons.Archive />
-                                    </button>
                                   </div>
                                 </td>
                               </tr>
@@ -1118,11 +1087,33 @@ export default function InstructorClasses({ embedded = false }) {
           <div className="card overflow-hidden">
             <div className="card-header">
               <h3 className="text-base font-semibold text-navy">Archived Classes ({filteredArchived.length})</h3>
-              <p className="text-xs text-gray-400 mt-0.5">Classes from semesters that have ended — read-only, kept for your records.</p>
+              <p className="text-xs text-gray-400 mt-0.5">Grouped by semester. When a semester ends, all of its classes are archived here under it — read-only, kept for your records.</p>
             </div>
+            {filteredArchived.length === 0 && (
+              <p className="text-sm text-gray-400 text-center py-8">No archived classes yet.</p>
+            )}
+            {/* SEMESTER first — each archived class sits under the semester it
+                belongs to (a semester's classes are all archived when it ends). */}
+            {groupBySemester(filteredArchived).map(({ semester, list: semesterClasses }) => {
+              const semesterKey = `archived-semester|${semester}`;
+              const semesterOpen = !!openGroups[semesterKey];
+              return (
+                <div key={semester} className="border-t border-gray-200">
+                  <button
+                    onClick={() => toggleGroup(semesterKey, !semesterOpen)}
+                    className="w-full px-5 py-3 flex items-center justify-between border-none cursor-pointer font-sans bg-navy/5 hover:bg-navy/10 transition-colors"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <Icons.Clock className="w-4 h-4 text-navy" />
+                      <span className="text-sm font-bold text-navy">{semester}</span>
+                      <span className="text-xs text-gray-500">{semesterClasses.length} class{semesterClasses.length !== 1 ? 'es' : ''}</span>
+                    </div>
+                    {semesterOpen ? <Icons.ChevronUp className="w-4 h-4 text-gray-500" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-500" />}
+                  </button>
+                  {semesterOpen && (
             <GroupedClassTree
-              items={filteredArchived}
-              idPrefix="archived"
+              items={semesterClasses}
+              idPrefix={`archived-${semester}`}
               openGroups={openGroups}
               toggleGroup={toggleGroup}
               emptyMessage="No archived classes yet."
@@ -1159,29 +1150,51 @@ export default function InstructorClasses({ embedded = false }) {
                     </div>
                   </td>
                   <td className="px-4 py-3.5">
-                    {/* Only a class YOU archived (not one whose whole
-                        semester Admin marked Completed) can be restored
-                        here — reactivating a class from a closed term
-                        doesn't make sense. */}
-                    {c.manually_archived && (
+                    <div className="flex items-center gap-1.5">
                       <button
                         className="btn-icon"
-                        title="Restore to Active"
-                        onClick={() => requestConfirm({
-                          title: 'Restore Class',
-                          message: `Restore ${c.subject?.code || 'this class'}${c.section ? ` - Section ${c.section}` : ''} to your active classes?`,
-                          confirmText: 'Restore',
-                          variant: 'green',
-                          action: () => unarchiveClass(c),
-                        })}
+                        onClick={() => {
+                          if (embedded && onOpenClass) {
+                            onOpenClass(c.id);
+                          } else {
+                            navigate(`${base}/encode/${c.id}`);
+                          }
+                        }}
+                        title={c.sent_to_chairperson || c.all_released ? 'Open Class Record' : 'Encode Grades'}
                       >
-                        <Icons.ArrowLeft />
+                        <Icons.Edit />
                       </button>
-                    )}
+                      <button className="btn-icon" onClick={() => openEnrollModal(c)} title="Class List">
+                        <Icons.Users />
+                      </button>
+                      {/* Only a class YOU archived (not one whose whole
+                          semester Admin marked Completed) can be restored
+                          here — reactivating a class from a closed term
+                          doesn't make sense. */}
+                      {c.manually_archived && (
+                        <button
+                          className="btn-icon"
+                          title="Restore to Active"
+                          onClick={() => requestConfirm({
+                            title: 'Restore Class',
+                            message: `Restore ${c.subject?.code || 'this class'}${c.section ? ` - Section ${c.section}` : ''} to your active classes?`,
+                            confirmText: 'Restore',
+                            variant: 'green',
+                            action: () => unarchiveClass(c),
+                          })}
+                        >
+                          <Icons.ArrowLeft />
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               )}
             />
+                  )}
+                </div>
+              );
+            })}
           </div>
         </>
       )}
@@ -1200,18 +1213,35 @@ export default function InstructorClasses({ embedded = false }) {
         >
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="sm:col-span-2">
-              <label className="form-label">Subject</label>
-              <div className="form-input !bg-gray-50 !text-gray-700 flex items-center gap-2 cursor-default select-none">
-                <Icons.Lock className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
-                <span className="truncate">{editClass.subject?.code} — {editClass.subject?.name}</span>
-              </div>
+              <label className="form-label">Subject {editSubjectOpen && <span className="text-red-500">*</span>}</label>
+              {editSubjectOpen ? (
+                <select
+                  className="form-select"
+                  value={editForm.subject_id}
+                  onChange={(e) => {
+                    const picked = subjects.find((s) => String(s.id) === e.target.value);
+                    // Follows the new subject's own year level, like Create Class does.
+                    setEditForm({ ...editForm, subject_id: e.target.value, year_level: picked?.year_level ? String(picked.year_level) : editForm.year_level });
+                  }}
+                >
+                  {!subjects.some((s) => String(s.id) === String(editForm.subject_id)) && editClass.subject && (
+                    <option value={editForm.subject_id}>{editClass.subject.code} — {editClass.subject.name}</option>
+                  )}
+                  {subjects.map((s) => <option key={s.id} value={s.id}>{s.code} — {s.name}</option>)}
+                </select>
+              ) : (
+                <div className="form-input !bg-gray-50 !text-gray-700 flex items-center gap-2 cursor-default select-none" title="Scores have already been recorded for this subject">
+                  <Icons.Lock className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+                  <span className="truncate">{editClass.subject?.code} — {editClass.subject?.name}</span>
+                </div>
+              )}
             </div>
             <div>
-              <label className="form-label">Year Level</label>
-              <div className="form-input !bg-gray-50 !text-gray-700 flex items-center gap-2 cursor-default select-none">
-                <Icons.Lock className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
-                <span>{editClass.year_level ? `Year ${editClass.year_level}` : '—'}</span>
-              </div>
+              <label className="form-label">Year Level <span className="text-red-500">*</span></label>
+              <select className="form-select" value={editForm.year_level} onChange={(e) => setEditForm({ ...editForm, year_level: e.target.value })}>
+                <option value="">Select Year Level</option>
+                {[1, 2, 3, 4].map((y) => <option key={y} value={y}>Year {y}</option>)}
+              </select>
             </div>
             <div>
               <label className="form-label">Section <span className="text-red-500">*</span></label>
@@ -1226,7 +1256,9 @@ export default function InstructorClasses({ embedded = false }) {
             </div>
           </div>
           <p className="text-[11px] text-gray-400 mt-3">
-            Subject, Year Level and Semester are set when the class is created. The students already on the class list stay on it.
+            {editSubjectOpen
+              ? 'The Semester is set when the class is created. The students already on the class list stay on it.'
+              : 'The subject is locked because scores have already been recorded for it. The Semester is set when the class is created. The students already on the class list stay on it.'}
           </p>
         </Modal>
       )}

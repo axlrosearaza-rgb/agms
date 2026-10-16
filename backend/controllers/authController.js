@@ -112,7 +112,10 @@ const login = asyncHandler(async (req, res) => {
     return res.status(401).json({ message: 'Invalid username/Student ID Number or password.' });
   }
 
-  if (!user.email_verified) {
+  // Students never wait on an e-mail to sign in: their account exists because
+  // their adviser created / imported it, and that is enough. They add an
+  // e-mail later (account setup, or Settings). The check stays for staff.
+  if (!user.email_verified && user.role !== 'Student') {
     return res.status(403).json({ message: 'Please verify your email before signing in. Check your inbox for the verification code sent when you registered.' });
   }
 
@@ -598,13 +601,14 @@ const requestEmailChange = asyncHandler(async (req, res) => {
   // away, marked not verified (same response shape as the direct update above).
   if (require('../utils/offline').isOffline()) {
     user.email = value;
-    user.email_verified = false;
+    // Left as it is: email_verified is also the sign-in gate (login refuses
+    // an account with it false), so it must never be switched off here.
     user.pending_email = null;
     user.email_verification_code = null;
     user.email_verification_expires = null;
     await user.save();
-    await logActivity(user.id, 'changed their email address (offline mode — not verified)', 'User', user.id);
-    return res.json({ message: 'Email address saved. It will be verified once the system is online.', user: user.toSafeJSON(), directUpdated: true });
+    await logActivity(user.id, 'changed their email address (offline mode — saved without a code)', 'User', user.id);
+    return res.json({ message: 'Email address saved.', user: user.toSafeJSON(), directUpdated: true });
   }
 
   const verificationCode = generateVerificationCode();
@@ -784,9 +788,9 @@ const resetPassword = asyncHandler(async (req, res) => {
   if (password !== confirmPassword) {
     return res.status(400).json({ message: 'Passwords do not match.' });
   }
-  if (password.length < 8) {
-    return res.status(400).json({ message: 'Password must be at least 8 characters.' });
-  }
+  // Same strong-password rules as everywhere else a password is chosen.
+  const weakReset = require('../utils/passwordRules').weakPasswordMessage(password || '');
+  if (weakReset) return res.status(400).json({ message: weakReset });
 
   const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
   const user = await User.findOne({

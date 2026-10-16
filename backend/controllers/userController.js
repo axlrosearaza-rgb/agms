@@ -229,6 +229,7 @@ const createUser = asyncHandler(async (req, res) => {
     section: role === 'Student' ? section : null,
     student_status: role === 'Student' ? (student_status || 'Regular') : null,
     student_type: role === 'Student' ? (student_type || null) : null,
+    curriculum_year: role === 'Student' ? await require('../utils/studentCurriculum').curriculumForNewStudent(program, year_level) : null,
     employee_no: isFaculty ? employee_no : null,
     academic_rank: isFaculty ? academic_rank : null,
     specialization: isFaculty ? specialization : null,
@@ -365,6 +366,11 @@ const updateUser = asyncHandler(async (req, res) => {
     user.status = 'Rejected';
   }
 
+  // Deactivated = archived. A deactivated account goes straight to User
+  // Management's Archived section; activating it again brings it back.
+  if (user.status === 'Deactivated' && !user.archived_at) user.archived_at = new Date();
+  if (user.status === 'Active' && user.archived_at) user.archived_at = null;
+
   await user.save();
   await notifyStudentDecision(user, previousStatus);
   if (previousStatus === 'Pending' && user.status === 'Active') {
@@ -433,9 +439,10 @@ const logAdviserChanges = async (adviser, before, after, actingUser) => {
   for (const a of after || []) {
     if (!beforeKeys.has(advisoryKey(a))) await logSectionActivity(a, actingUser, `assigned ${adviser.name} as adviser`);
   }
-  for (const a of before || []) {
-    if (!afterKeys.has(advisoryKey(a))) await logSectionActivity(a, actingUser, `removed ${adviser.name} as adviser`);
-  }
+  const lost = (before || []).filter((a) => !afterKeys.has(advisoryKey(a)));
+  for (const a of lost) await logSectionActivity(a, actingUser, `removed ${adviser.name} as adviser`);
+  // What this adviser had is kept on record (Manage Advisory → Past Advisers).
+  await require('../utils/adviserArchive').archivePastAdvisory(adviser, lost, actingUser);
 };
 
 // PUT /api/users/:id/advisory  { advisories: [{ program, year_level, section }, ...] }
@@ -510,11 +517,12 @@ const setAdvisory = asyncHandler(async (req, res) => {
 // POST /api/users/advisories/import  { assignments: [{ user_id, program, year_level, section }], replace_all }
 // Admin only — the whole adviser list at once (read from a Room Assignment-
 // style document on the frontend and matched to accounts there). Each listed
-// section goes to its adviser and is taken off anyone else who had it. With
-// replace_all, every existing advisory is cleared first, so the imported list
-// becomes the complete set.
+// section goes to its adviser and is taken off anyone else who had it (that
+// earlier adviser's record is archived). Sections that are not in the list
+// keep their adviser — nothing is ever cleared wholesale.
 const importAdvisories = asyncHandler(async (req, res) => {
-  const { assignments, replace_all: replaceAll } = req.body;
+  const { assignments } = req.body;
+  const replaceAll = false;
   if (!Array.isArray(assignments) || assignments.length === 0) {
     return res.status(400).json({ message: 'Nothing to import.' });
   }
@@ -581,7 +589,24 @@ const importAdvisories = asyncHandler(async (req, res) => {
   }
 
   await logActivity(req.user.id, `imported advisers for ${bySection.size} section(s)${replaceAll ? ' (replaced all advisories)' : ''}`, 'User', null);
-  res.json({ message: `Advisers set for ${bySection.size} section(s) across ${userIds.length} adviser(s).`, sections: bySection.size, advisers: userIds.length });
+  // How many sections actually changed hands or got their first adviser.
+  let changed = 0;
+  for (const { user, before } of touched.values()) {
+    const beforeKeys = new Set(before.map(advisoryKey));
+    changed += (user.advisories || []).filter((x) => !beforeKeys.has(advisoryKey(x))).length;
+  }
+  res.json({
+    message: changed
+      ? `Adviser list updated: ${changed} section(s) changed, ${bySection.size - changed} already up to date.`
+      : `No changes — all ${bySection.size} section(s) already have the adviser in this list.`,
+    sections: bySection.size, advisers: userIds.length, changed,
+  });
+});
+
+// GET /api/users/advisers/archive (Admin) — past advisers: each section an
+// adviser used to have, with the advisees in it when it ended.
+const getAdviserArchive = asyncHandler(async (req, res) => {
+  res.json({ archive: await require('../utils/adviserArchive').listPastAdvisories() });
 });
 
 // GET /api/users/my-advisory — Faculty / Chairperson: every advisory section they
@@ -721,9 +746,9 @@ const advisesSection = async (userId, program, yearLevel, section) => {
 
 // PUT /api/users/my-advisory/students/:id  { name, student_no, student_status, student_type, status }
 // The adviser corrects one of their own advisees' details (a misspelled name,
-// a wrong ID number, Regular/Irregular, student type). Only students
-// currently in one of the adviser's advisory sections; Program / Year /
-// Section aren't changed here.
+// a wrong ID number, Regular/Irregular, student type), or moves them into
+// another of the adviser's own advisory sections. Only students currently in
+// one of the adviser's advisory sections.
 const STUDENT_TYPES = ['New', 'Old', 'Shifter', 'Transferee', 'Quitter'];
 const updateAdvisee = asyncHandler(async (req, res) => {
   const student = await User.findByPk(req.params.id);
@@ -732,6 +757,7 @@ const updateAdvisee = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'You can only edit students in your own advisory section.' });
   }
 
+  const fromSection = { program: student.program, year_level: student.year_level, section: student.section };
   const changes = [];
   if (req.body.name !== undefined) {
     const name = String(req.body.name || '').trim().replace(/\s+/g, ' ');
@@ -760,6 +786,37 @@ const updateAdvisee = asyncHandler(async (req, res) => {
     student.student_type = req.body.student_type;
   }
 
+  // Take the student out of this advisory section (imported by mistake / not
+  // in this section). Nothing is deleted — the account, grades and class
+  // enrollments stay; the Admin can place them, and re-importing the class
+  // list brings them back.
+  if (req.body.remove_from_section === true) {
+    student.section = null;
+    await student.save();
+    const note = `removed ${student.name}${student.student_no ? ` (${student.student_no})` : ''} from the section`;
+    await logActivity(req.user.id, `${note} ${fromSection.program} ${fromSection.year_level}-${fromSection.section}`, 'User', student.id);
+    await logSectionActivity(fromSection, req.user, note);
+    return res.json({ message: `${student.name} was removed from the section.`, student: student.toSafeJSON() });
+  }
+
+  // Move to another of this adviser's own advisory sections (a student
+  // imported into the wrong one). Any other section stays the Admin's to set.
+  if (req.body.section !== undefined || req.body.year_level !== undefined || req.body.program !== undefined) {
+    const program = req.body.program ?? student.program;
+    const year = parseInt(req.body.year_level ?? student.year_level, 10);
+    const section = req.body.section ?? student.section;
+    const moved = program !== student.program || year !== Number(student.year_level) || section !== student.section;
+    if (moved) {
+      if (!(await advisesSection(req.user.id, program, year, section))) {
+        return res.status(403).json({ message: 'You can only move a student into one of your own advisory sections.' });
+      }
+      changes.push(`moved ${student.program} ${student.year_level}-${student.section} → ${program} ${year}-${section}`);
+      student.program = program;
+      student.year_level = year;
+      student.section = section;
+    }
+  }
+
   // Deactivate / activate the account — a deactivated student can't sign in.
   if (req.body.status !== undefined && req.body.status !== student.status) {
     if (!['Active', 'Deactivated'].includes(req.body.status) || !['Active', 'Deactivated'].includes(student.status)) {
@@ -773,6 +830,9 @@ const updateAdvisee = asyncHandler(async (req, res) => {
   await student.save();
   await logActivity(req.user.id, `edited advisee ${student.name}: ${changes.join(', ')}`, 'User', student.id);
   await logSectionActivity({ program: student.program, year_level: student.year_level, section: student.section }, req.user, `edited ${student.name} (${changes.join(', ')})`);
+  if (fromSection.program !== student.program || Number(fromSection.year_level) !== Number(student.year_level) || fromSection.section !== student.section) {
+    await logSectionActivity(fromSection, req.user, `edited ${student.name} (${changes.join(', ')})`);
+  }
   res.json({ message: `${student.name} was updated.`, student: student.toSafeJSON() });
 });
 
@@ -929,4 +989,4 @@ const checkStudentNos = asyncHandler(async (req, res) => {
 });
 
 
-module.exports = { getAdviserSummary, getUsers, getUserById, createUser, checkStudentNos, updateUser, archiveUser, restoreUser, getUsersByDepartment, setAdvisory, importAdvisories, getMyAdvisory, importAdvisoryList, updateAdvisee, setRegularizationSubjects, getPresence };
+module.exports = { getAdviserSummary, getUsers, getUserById, createUser, checkStudentNos, updateUser, archiveUser, restoreUser, getUsersByDepartment, setAdvisory, importAdvisories, getAdviserArchive, getMyAdvisory, importAdvisoryList, updateAdvisee, setRegularizationSubjects, getPresence };

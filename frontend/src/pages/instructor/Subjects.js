@@ -5,6 +5,7 @@ import { useAuth } from '../../context/AuthContext';
 import toast from 'react-hot-toast';
 import { usePageState } from '../../hooks/usePageState';
 import { latestCurriculumByProgram, curriculumYears, curriculumStatus } from '../../components/common/CurriculumBadge';
+import SubjectImportModal from '../../components/admin/SubjectImportModal';
 
 const SEMESTERS = ['1st Semester', '2nd Semester', 'Summer'];
 // Curriculum-checklist ordering — "Summer" always last, not alphabetical.
@@ -48,10 +49,16 @@ export default function Subjects() {
   const { user } = useAuth();
   const myPrograms = (user?.programs || []).filter((p) => p !== 'General Education (GE)');
   // One Subjects page for Admin, Chairperson and Faculty (same design for all
-  // three): Admin sees and manages every program; a Chairperson manages their
-  // own program(s); Faculty get the same view read-only.
+  // three): only the Admin adds, imports, edits and archives subjects.
+  // Chairperson and Faculty get the same view of their program(s), read-only.
   const isAdmin = user?.role === 'Admin';
-  const canManage = isAdmin || user?.role === 'Chairperson';
+  const canManage = isAdmin;
+  // Subjects come in through Import Subjects only, and nothing is archived by
+  // hand: the Admin edits what is there, and an earlier curriculum simply stays
+  // on record for reference. (The Add and Archive controls are kept behind
+  // these two switches rather than removed.)
+  const canAdd = false;
+  const canArchive = false;
   const programOptions = isAdmin ? ALL_PROGRAMS : myPrograms;
 
   // Namespaced by role — this page is shared by Admin, Faculty and
@@ -78,6 +85,9 @@ export default function Subjects() {
   // Subjects are never deleted — archived ones are listed at the bottom.
   const [archivedSubjects, setArchivedSubjects] = useState([]);
   const [archivedOpen, setArchivedOpen] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  // A whole curriculum about to be archived: { program, curriculum, count }.
+  const [archiveCurriculumTarget, setArchiveCurriculumTarget] = useState(null);
 
   const loadSubjects = useCallback(async () => {
     try {
@@ -237,6 +247,30 @@ export default function Subjects() {
     }
   };
 
+  // A whole curriculum (every subject of one program's curriculum year) at once.
+  const handleArchiveCurriculum = async () => {
+    const c = archiveCurriculumTarget;
+    if (!c) return;
+    try {
+      const { data } = await subjectService.archiveCurriculum(c.program, c.curriculum, true);
+      toast.success(data.message);
+      setArchiveCurriculumTarget(null);
+      loadSubjects();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to archive the curriculum');
+      setArchiveCurriculumTarget(null);
+    }
+  };
+  const handleRestoreCurriculum = async (program, curriculum) => {
+    try {
+      const { data } = await subjectService.archiveCurriculum(program, curriculum, false);
+      toast.success(data.message);
+      loadSubjects();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to restore the curriculum');
+    }
+  };
+
   // New vs Old is per program: its latest curriculum year is New.
   const latestByProgram = latestCurriculumByProgram(subjects);
   const allCurriculumYears = curriculumYears(subjects);
@@ -284,8 +318,6 @@ export default function Subjects() {
     if (b === NO_CURRICULUM) return -1;
     return (parseInt(b, 10) || 0) - (parseInt(a, 10) || 0) || String(b).localeCompare(String(a));
   });
-  // Program headers only when more than one program can be on screen.
-  const showProgramHeaders = isAdmin || programOptions.length > 1 || programKeys.length > 1;
 
   // Total Hours is its own value (not derived) — falls back to Lecture+Lab only
   // for legacy rows that predate the standalone Total field.
@@ -317,7 +349,7 @@ export default function Subjects() {
             <h4 className="text-sm font-semibold text-gray-600 italic">{sem}</h4>
             <span className="text-xs text-gray-400">({rows.length})</span>
           </button>
-          {canManage && yr && (
+          {canAdd && yr && (
             <button className="btn-icon" onClick={() => openCreate(yr, sem, ctx.program, ctx.curriculum)} title={`Add subject to Year ${yr} — ${sem}`}>
               <Icons.Plus className="w-4 h-4" />
             </button>
@@ -335,7 +367,7 @@ export default function Subjects() {
                 <th colSpan={2} className="text-center px-3 py-1.5 text-[11px] font-semibold uppercase text-gray-500 border-b border-gray-200">Total</th>
                 <th rowSpan={2} className="text-left px-3 py-2 text-[11px] font-semibold uppercase text-gray-500 align-bottom">Pre-Requisite</th>
                 <th rowSpan={2} className="text-left px-3 py-2 text-[11px] font-semibold uppercase text-gray-500 align-bottom">Co-Requisite</th>
-                <th rowSpan={2} className="text-right px-3 py-2 text-[11px] font-semibold uppercase text-gray-500 align-bottom">Actions</th>
+                {canManage && <th rowSpan={2} className="text-right px-3 py-2 text-[11px] font-semibold uppercase text-gray-500 align-bottom">Actions</th>}
               </tr>
               <tr className="bg-gray-50">
                 <th className="text-center px-2 py-1.5 text-[10px] font-semibold uppercase text-gray-400">Hrs</th>
@@ -374,14 +406,14 @@ export default function Subjects() {
                       <div className="flex flex-wrap gap-1">{s.co_requisites.map((p) => <Badge key={p.id} variant="blue">{p.code}</Badge>)}</div>
                     ) : <span className="text-gray-300 text-xs">—</span>}
                   </td>
-                  <td className="px-3 py-2.5 text-right">
-                    {canManage ? (
+                  {canManage && (
+                    <td className="px-3 py-2.5 text-right">
                       <div className="flex gap-1.5 justify-end">
                         <button className="btn-icon" onClick={() => openEdit(s)} title="Edit"><Icons.Edit /></button>
-                        <button className="btn-icon hover:!bg-amber-50 hover:!text-amber-600" onClick={() => setArchiveTarget(s)} title="Archive"><Icons.Archive /></button>
+                        {canArchive && <button className="btn-icon hover:!bg-amber-50 hover:!text-amber-600" onClick={() => setArchiveTarget(s)} title="Archive"><Icons.Archive /></button>}
                       </div>
-                    ) : <span className="text-gray-300 text-xs">—</span>}
-                  </td>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
@@ -394,7 +426,7 @@ export default function Subjects() {
                 <td className="px-2 py-2.5 text-center">{sums.labUnits}</td>
                 <td className="px-2 py-2.5 text-center">{sums.totalHrs}</td>
                 <td className="px-2 py-2.5 text-center">{sums.totalUnits}</td>
-                <td colSpan={3} />
+                <td colSpan={canManage ? 3 : 2} />
               </tr>
             </tfoot>
           </table>
@@ -412,39 +444,60 @@ export default function Subjects() {
     const isNone = cur === NO_CURRICULUM;
     const status = isNone ? null : curriculumStatus({ program: prog, curriculum_year: cur }, latestByProgram);
     const units = [...years.flatMap((yr) => Object.values(bucket.grouped[yr]).flat()), ...bucket.unassigned].reduce((n, s) => n + (s.units || 0), 0);
+    // Compact: a curriculum is one line until it is opened (a search opens
+    // every curriculum that has a match, so results are never hidden).
+    const curKey = `${ctx.key}|open`;
+    const curOpen = !!expanded[curKey] || !!search;
     return (
-      <div key={cur} className="mb-6 last:mb-0">
-        {/* Curriculum header — the curriculum year sits on top of its subjects. */}
-        <div className={`flex flex-wrap items-center justify-between gap-2 rounded-xl px-4 py-3 mb-3 border ${isNone ? 'bg-gray-50 border-dashed border-gray-300' : status === 'New' ? 'bg-green-50 border-green-200' : 'bg-amber-50 border-amber-200'}`}>
-          <div className="flex items-center gap-2.5">
-            <Icons.Book className={`w-4 h-4 ${isNone ? 'text-gray-400' : status === 'New' ? 'text-green-600' : 'text-amber-600'}`} />
-            <h3 className={`text-sm font-bold tracking-wide ${isNone ? 'text-gray-500' : 'text-navy'}`}>
-              {isNone ? 'NO CURRICULUM SET' : `${cur} CURRICULUM`}
-            </h3>
-            {status && (
-              <span className={`text-[10px] font-bold uppercase rounded-full px-2 py-0.5 ${status === 'New' ? 'bg-green-600 text-white' : 'bg-amber-500 text-white'}`}>{status}</span>
+      <div key={prog} className="mb-2.5 last:mb-0">
+        {/* One program of this curriculum — click it to show or hide its years. */}
+        <div className={`flex flex-wrap items-center justify-between gap-2 rounded-xl px-4 py-2 border bg-white border-gray-200 hover:border-gray-300 ${curOpen ? 'mb-2.5' : ''}`}>
+          <div
+            className="flex items-center gap-2.5 cursor-pointer select-none flex-1 min-w-0"
+            role="button"
+            tabIndex={0}
+            aria-expanded={curOpen}
+            title={curOpen ? 'Hide this program' : 'Show this program'}
+            onClick={() => toggle(curKey)}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(curKey); } }}
+          >
+            {curOpen ? <Icons.ChevronUp className="w-4 h-4 text-gray-400" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400" />}
+            {prog === 'No Program'
+              ? <h3 className="text-sm font-bold tracking-wide text-gray-500">NO PROGRAM</h3>
+              : <ProgramBadge program={prog} size="lg" />}
+            {status === 'Old' && (
+              <span className="text-[10px] font-bold uppercase rounded-full px-2 py-0.5 bg-amber-500 text-white" title="This program has a newer curriculum">Old</span>
             )}
           </div>
           <div className="flex items-center gap-3">
             <span className="text-xs text-gray-500">{count} subject{count !== 1 ? 's' : ''} · {units} units</span>
-            {canManage && (
+            {canAdd && (
               <button className="btn btn-outline btn-sm bg-white" onClick={() => openCreate(null, null, ctx.program, ctx.curriculum)}>
                 <Icons.Plus className="w-3.5 h-3.5" /> Add subject
+              </button>
+            )}
+            {canArchive && ctx.program && (
+              <button
+                className="btn btn-outline btn-sm bg-white"
+                onClick={() => setArchiveCurriculumTarget({ program: ctx.program, curriculum: ctx.curriculum, count })}
+                title="Archive every subject of this curriculum (nothing is deleted)"
+              >
+                <Icons.Archive className="w-3.5 h-3.5" /> Archive curriculum
               </button>
             )}
           </div>
         </div>
 
-        {years.map((yr) => {
+        {curOpen && years.map((yr) => {
           const semesters = Object.keys(bucket.grouped[yr]).sort((a, b) => (SEMESTER_ORDER[a] ?? 9) - (SEMESTER_ORDER[b] ?? 9));
           const yearKey = `${ctx.key}|year:${yr}`;
           const yearOpen = !!expanded[yearKey];
           const yearSubjectCount = semesters.reduce((n, sem) => n + bucket.grouped[yr][sem].length, 0);
           return (
-            <div key={yr} className="card overflow-hidden mb-4">
+            <div key={yr} className="card overflow-hidden mb-2">
               <button
                 onClick={() => toggle(yearKey)}
-                className="w-full px-5 py-3 bg-navy text-white flex items-center justify-center gap-2 cursor-pointer border-none font-sans"
+                className="w-full px-5 py-2 bg-navy text-white flex items-center justify-center gap-2 cursor-pointer border-none font-sans"
               >
                 <h3 className="text-sm font-bold tracking-wide">{YEAR_LABEL[yr] || `YEAR ${yr}`}</h3>
                 <span className="text-xs opacity-70">({yearSubjectCount})</span>
@@ -459,13 +512,13 @@ export default function Subjects() {
           );
         })}
 
-        {bucket.unassigned.length > 0 && (() => {
+        {curOpen && bucket.unassigned.length > 0 && (() => {
           const key = `${ctx.key}|year:unassigned`;
           return (
-            <div className="card overflow-hidden mb-4">
+            <div className="card overflow-hidden mb-2">
               <button
                 onClick={() => toggle(key)}
-                className="w-full px-5 py-3 bg-gray-400 text-white flex items-center justify-center gap-2 cursor-pointer border-none font-sans"
+                className="w-full px-5 py-2 bg-gray-400 text-white flex items-center justify-center gap-2 cursor-pointer border-none font-sans"
               >
                 <h3 className="text-sm font-bold tracking-wide">UNASSIGNED — no Year/Semester set</h3>
                 <span className="text-xs opacity-70">({bucket.unassigned.length})</span>
@@ -489,13 +542,20 @@ export default function Subjects() {
         <div>
           <h2 className="text-lg font-bold text-navy">Subjects</h2>
           <p className="text-[13px] text-gray-500">
-            {isAdmin ? 'Every program\'s curriculum' : 'Curriculum for your program(s)'}, grouped by Curriculum, Year and Semester ({filtered.length} subject{filtered.length !== 1 ? 's' : ''})
+            {isAdmin ? 'Every program\'s subjects' : 'Subjects of your program(s)'}, grouped by Curriculum, Program, Year and Semester ({filtered.length} subject{filtered.length !== 1 ? 's' : ''})
           </p>
         </div>
         {canManage && (
-          <button className="btn btn-gold" onClick={() => openCreate()}>
-            <Icons.Plus /> Add Subject
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button className="btn btn-gold" onClick={() => setShowImport(true)} title="Bring in a whole curriculum from a Word file">
+              <Icons.Upload /> Import Subjects
+            </button>
+            {canAdd && (
+              <button className="btn btn-gold" onClick={() => openCreate()}>
+                <Icons.Plus /> Add Subject
+              </button>
+            )}
+          </div>
         )}
       </div>
 
@@ -517,33 +577,37 @@ export default function Subjects() {
       {programKeys.length === 0 && (
         <div className="card p-12 text-center text-gray-400">
           <Icons.FileText className="w-8 h-8 mx-auto mb-2 opacity-30" />
-          {subjects.length === 0 ? (canManage ? 'No subjects yet — use Add Subject.' : 'No subjects yet.') : 'No subjects match these filters.'}
+          {subjects.length === 0 ? (canManage ? 'No subjects yet — use Import Subjects.' : 'No subjects yet.') : 'No subjects match these filters.'}
         </div>
       )}
 
-      {programKeys.map((prog) => {
-        const curricula = sortCurricula(Object.keys(byProgram[prog]));
-        const body = curricula.map((cur) => curriculumSection(prog, cur, byProgram[prog][cur]));
-        if (!showProgramHeaders) return <div key={prog}>{body}</div>;
-        const progKey = `prog:${prog}`;
-        const progOpen = expanded[progKey] !== false; // open by default
-        const progCount = curricula.reduce((n, cur) => {
-          const b = byProgram[prog][cur];
-          return n + b.unassigned.length + Object.values(b.grouped).reduce((m, sems) => m + Object.values(sems).reduce((k, r) => k + r.length, 0), 0);
-        }, 0);
+      {/* The CURRICULUM is the header; under it, one compact line per program. */}
+      {sortCurricula([...new Set(programKeys.flatMap((prog) => Object.keys(byProgram[prog])))]).map((cur) => {
+        const programs = programKeys.filter((prog) => byProgram[prog][cur]);
+        const isNone = cur === NO_CURRICULUM;
+        const countOf = (b) => b.unassigned.length + Object.values(b.grouped).reduce((m, sems) => m + Object.values(sems).reduce((k, r) => k + r.length, 0), 0);
+        const total = programs.reduce((n, prog) => n + countOf(byProgram[prog][cur]), 0);
+        // New = the latest curriculum of at least one of its programs.
+        const isNew = !isNone && programs.some((prog) => curriculumStatus({ program: prog, curriculum_year: cur }, latestByProgram) === 'New');
+        const curKey = `curriculum:${cur}`;
+        const open = expanded[curKey] !== false; // open by default
         return (
-          <div key={prog} className="card overflow-hidden mb-5">
+          <div key={cur} className="card overflow-hidden mb-5">
             <button
-              onClick={() => setExpanded((prev) => ({ ...prev, [progKey]: !progOpen }))}
-              className="w-full flex items-center justify-between px-5 py-3 cursor-pointer border-none bg-gray-50/60 hover:bg-gray-100 font-sans transition-colors"
+              onClick={() => setExpanded((prev) => ({ ...prev, [curKey]: !open }))}
+              className={`w-full flex items-center justify-between px-5 py-3 cursor-pointer border-none font-sans transition-colors ${isNone ? 'bg-gray-50 hover:bg-gray-100' : isNew ? 'bg-green-50 hover:bg-green-100/70' : 'bg-amber-50 hover:bg-amber-100/70'}`}
             >
               <div className="flex items-center gap-2.5">
-                {prog === 'No Program' ? <span className="text-xs font-semibold text-gray-500 uppercase">No Program</span> : <ProgramBadge program={prog} size="lg" />}
-                <span className="text-xs text-gray-400">({progCount})</span>
+                <Icons.Book className={`w-5 h-5 ${isNone ? 'text-gray-400' : isNew ? 'text-green-600' : 'text-amber-600'}`} />
+                <h3 className={`text-base font-bold tracking-wide ${isNone ? 'text-gray-500' : 'text-navy'}`}>{isNone ? 'NO CURRICULUM SET' : `${cur} CURRICULUM`}</h3>
+                {!isNone && (
+                  <span className={`text-[10px] font-bold uppercase rounded-full px-2 py-0.5 text-white ${isNew ? 'bg-green-600' : 'bg-amber-500'}`}>{isNew ? 'New' : 'Old'}</span>
+                )}
+                <span className="text-xs text-gray-500">{programs.length} program{programs.length !== 1 ? 's' : ''} · {total} subject{total !== 1 ? 's' : ''}</span>
               </div>
-              {progOpen ? <Icons.ChevronUp className="w-4 h-4 text-gray-400" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400" />}
+              {open ? <Icons.ChevronUp className="w-4 h-4 text-gray-400" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400" />}
             </button>
-            {progOpen && <div className="card-body">{body}</div>}
+            {open && <div className="card-body">{programs.map((prog) => curriculumSection(prog, cur, byProgram[prog][cur]))}</div>}
           </div>
         );
       })}
@@ -784,59 +848,104 @@ export default function Subjects() {
         </Modal>
       )}
 
-      {/* ARCHIVED SUBJECTS — never deleted; restore puts one back in the list. */}
-      {canManage && archivedSubjects.length > 0 && (
-        <div className="card mt-6 overflow-hidden">
-          <button
-            type="button"
-            onClick={() => setArchivedOpen((o) => !o)}
-            className="w-full px-5 py-3 flex items-center justify-between bg-gray-50 border-none cursor-pointer font-sans text-left"
-          >
-            <span className="flex items-center gap-2 text-sm font-bold text-gray-700">
-              <Icons.Archive className="w-4 h-4" /> Archived Subjects
-              <span className="text-[11px] font-semibold bg-gray-200 text-gray-700 rounded-full px-2 py-0.5">{archivedSubjects.length}</span>
-            </span>
-            {archivedOpen ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
-          </button>
-          {archivedOpen && (
-            <div className="overflow-x-auto">
-              <table className="w-full text-[13px]">
-                <thead className="bg-gray-50 text-[11px] uppercase text-gray-500">
-                  <tr>
-                    <th className="px-4 py-2 text-left">Code</th>
-                    <th className="px-4 py-2 text-left">Description</th>
-                    <th className="px-4 py-2 text-left">Program</th>
-                    <th className="px-4 py-2 text-center">Curriculum</th>
-                    <th className="px-4 py-2 text-center">Year · Semester</th>
-                    <th className="px-4 py-2 text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {archivedSubjects.map((s) => (
-                    <tr key={s.id} className="border-t border-gray-100 text-gray-600">
-                      <td className="px-4 py-2 font-semibold">{s.code}</td>
-                      <td className="px-4 py-2">{s.name}</td>
-                      <td className="px-4 py-2 text-[12px]">{s.program}</td>
-                      <td className="px-4 py-2 text-center">{s.curriculum_year || '—'}</td>
-                      <td className="px-4 py-2 text-center whitespace-nowrap">Year {s.year_level || '—'} · {s.semester || '—'}</td>
-                      <td className="px-4 py-2 text-right">
-                        <button className="btn btn-outline btn-sm" onClick={() => handleRestore(s)} title="Put this subject back in the list">
-                          <Icons.RotateCw className="w-3.5 h-3.5" /> Restore
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
+      {/* ARCHIVED — never deleted. Grouped by program and curriculum, so an
+          archived curriculum is seen as one set; a whole curriculum or a single
+          subject can be restored. Admin only. */}
+      {canManage && archivedSubjects.length > 0 && (() => {
+        const groups = {};
+        archivedSubjects.forEach((sub) => {
+          const key = `${sub.program || ''}|${sub.curriculum_year || ''}`;
+          groups[key] = groups[key] || { program: sub.program || '', curriculum: sub.curriculum_year || '', list: [] };
+          groups[key].list.push(sub);
+        });
+        const ordered = Object.values(groups).sort((a, b) => a.program.localeCompare(b.program) || String(b.curriculum).localeCompare(String(a.curriculum)));
+        return (
+          <div className="card mt-6 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setArchivedOpen((o) => !o)}
+              className="w-full px-5 py-3 flex items-center justify-between bg-gray-50 border-none cursor-pointer font-sans text-left"
+            >
+              <span className="flex items-center gap-2 text-sm font-bold text-gray-700">
+                <Icons.Archive className="w-4 h-4" /> Archived Curricula and Subjects
+                <span className="text-[11px] font-semibold bg-gray-200 text-gray-700 rounded-full px-2 py-0.5">{archivedSubjects.length}</span>
+              </span>
+              {archivedOpen ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
+            </button>
+            {archivedOpen && ordered.map((g) => {
+              const key = `archived:${g.program}|${g.curriculum}`;
+              const open = !!expanded[key];
+              return (
+                <div key={key} className="border-t border-gray-100">
+                  <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-2.5 bg-amber-50/60">
+                    <button type="button" onClick={() => toggle(key)} className="flex items-center gap-2 bg-transparent border-none cursor-pointer p-0 font-sans">
+                      {open ? <Icons.ChevronUp className="w-4 h-4 text-gray-400" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400" />}
+                      {g.program ? <ProgramBadge program={g.program} /> : <span className="text-xs font-semibold text-gray-500 uppercase">No Program</span>}
+                      <span className="text-sm font-bold text-navy">{g.curriculum ? `${g.curriculum} CURRICULUM` : 'NO CURRICULUM SET'}</span>
+                      <span className="text-xs text-gray-500">({g.list.length} archived)</span>
+                    </button>
+                    {canManage && g.program && (
+                      <button className="btn btn-outline btn-sm bg-white" onClick={() => handleRestoreCurriculum(g.program, g.curriculum)} title="Put every archived subject of this curriculum back in the list">
+                        <Icons.RotateCw className="w-3.5 h-3.5" /> Restore curriculum
+                      </button>
+                    )}
+                  </div>
+                  {open && (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-[13px]">
+                        <thead className="bg-gray-50 text-[11px] uppercase text-gray-500">
+                          <tr>
+                            <th className="px-4 py-2 text-left">Code</th>
+                            <th className="px-4 py-2 text-left">Description</th>
+                            <th className="px-4 py-2 text-center">Year · Semester</th>
+                            {canManage && <th className="px-4 py-2 text-right">Actions</th>}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {g.list.map((sub) => (
+                            <tr key={sub.id} className="border-t border-gray-100 text-gray-600">
+                              <td className="px-4 py-2 font-semibold whitespace-nowrap">{sub.code}</td>
+                              <td className="px-4 py-2">{sub.name}</td>
+                              <td className="px-4 py-2 text-center whitespace-nowrap">Year {sub.year_level || '—'} · {sub.semester || '—'}</td>
+                              {canManage && (
+                                <td className="px-4 py-2 text-right">
+                                  <button className="btn btn-outline btn-sm" onClick={() => handleRestore(sub)} title="Put this subject back in the list">
+                                    <Icons.RotateCw className="w-3.5 h-3.5" /> Restore
+                                  </button>
+                                </td>
+                              )}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })()}
+
+      {showImport && (
+        <SubjectImportModal onClose={() => setShowImport(false)} onImported={loadSubjects} existingYears={allCurriculumYears} />
+      )}
+
+      {archiveCurriculumTarget && (
+        <ConfirmDialog
+          title="Archive Curriculum"
+          message={`Archive the ${archiveCurriculumTarget.curriculum ? `${archiveCurriculumTarget.curriculum} Curriculum` : 'subjects with no curriculum set'} of ${archiveCurriculumTarget.program}? Its subjects leave this list and can no longer be picked for new classes, but every class, grade and prospectus that already uses them keeps them. You can restore it from Archived Curricula and Subjects at the bottom.`}
+          confirmText="Archive Curriculum"
+          variant="gold"
+          onConfirm={handleArchiveCurriculum}
+          onCancel={() => setArchiveCurriculumTarget(null)}
+        />
       )}
 
       {archiveTarget && (
         <ConfirmDialog
           title="Archive Subject"
-          message={`Archive ${archiveTarget.code} — ${archiveTarget.name}? It leaves this list and can no longer be picked for new classes, but every class, grade and prospectus that already uses it keeps it. You can restore it from Archived Subjects at the bottom.`}
+          message={`Archive ${archiveTarget.code} — ${archiveTarget.name}? It leaves this list and can no longer be picked for new classes, but every class, grade and prospectus that already uses it keeps it. You can restore it from Archived Curricula and Subjects at the bottom.`}
           confirmText="Archive"
           variant="gold"
           onConfirm={handleArchive}

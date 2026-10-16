@@ -3,7 +3,7 @@ import { Icons, Avatar, Badge, SearchBar, LoadingSpinner, EmptyState, StatCard, 
 import StudentGradeRecordModal from '../../components/common/StudentGradeRecordModal';
 import StudentWordImportModal from '../../components/admin/StudentWordImportModal';
 import PromoteSectionModal from '../../components/common/PromoteSectionModal';
-import EditAdviseeModal from '../../components/instructor/EditAdviseeModal';
+import EditSectionStudentsModal from '../../components/instructor/EditSectionStudentsModal';
 import { userService } from '../../services';
 import { usePageState } from '../../hooks/usePageState';
 import { useAutoRefresh } from '../../hooks/useAutoRefresh';
@@ -51,7 +51,7 @@ function SemesterOverview({ data, semester, label = '', archived = false }) {
   );
 
   return (
-    <div className={archived ? 'px-5 py-4 border-t border-gray-100' : 'card px-5 py-4 mb-3'}>
+    <div className={archived ? 'px-5 py-4 border-t border-gray-100' : 'px-5 py-3.5 border-b border-gray-100 bg-gray-50/40'}>
       <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-500 mb-2.5 flex flex-wrap items-center gap-2">
         {archived
           ? <><Icons.Archive className="w-3.5 h-3.5" /> {semester}{label ? ` · ${label}` : ''}</>
@@ -132,7 +132,8 @@ export default function MyAdvisory() {
   // '' = all sections, else one section's key.
   const [activeSection, setActiveSection] = useState('');
   const [gradesTarget, setGradesTarget] = useState(null);
-  const [editTarget, setEditTarget] = useState(null);
+  // The section whose imported students are open for double-checking / editing.
+  const [editSection, setEditSection] = useState(null);
   // Deactivate / activate an advisee's account (confirmed first).
   const [statusTarget, setStatusTarget] = useState(null);
   const [savingStatus, setSavingStatus] = useState(false);
@@ -195,7 +196,8 @@ export default function MyAdvisory() {
   const q = search.trim().toLowerCase();
   const matches = (s) => !q || s.name?.toLowerCase().includes(q) || s.student_no?.includes(q);
 
-  const irregularCount = students.filter((s) => s.student_status === 'Irregular').length;
+  const regularCount = students.filter((s) => !!s.account_setup_at && s.student_status === 'Regular').length;
+  const irregularCount = students.filter((s) => !!s.account_setup_at && s.student_status === 'Irregular').length;
   const noClassCount = students.filter((s) => !s.class_count).length;
 
   return (
@@ -219,7 +221,7 @@ export default function MyAdvisory() {
         </div>
       ) : (
         <>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
             <StatCard
               label={advisories.length === 1 ? 'Advisory' : 'Advisory Sections'}
               value={advisories.length === 1 ? sectionLabel(advisories[0]) : advisories.length}
@@ -227,14 +229,9 @@ export default function MyAdvisory() {
               iconBg="bg-blue-50 text-blue-600"
             />
             <StatCard label="Advisees" value={students.length} icon={<Icons.Users />} iconBg="bg-blue-50 text-blue-500" />
+            <StatCard label="Regular" value={regularCount} icon={<Icons.Check />} iconBg="bg-green-50 text-green-600" />
             <StatCard label="Irregular" value={irregularCount} sub={`${noClassCount} not in a class yet`} icon={<Icons.AlertTriangle />} iconBg="bg-red-50 text-red-500" />
           </div>
-
-          {/* This semester at a glance, per section — above the search box and
-              the lists: passed everything / has a retake / promoted. */}
-          {shownSections.map((a) => (studentsOf(a).length > 0
-            ? <SemesterOverview key={sectionKey(a)} data={overviewOf(studentsOf(a))} semester={semester} label={advisories.length > 1 ? sectionLabel(a) : ''} />
-            : null))}
 
           {/* ARCHIVED — a semester's overview is saved when it ends, and the
               one above starts over for the new semester. */}
@@ -315,6 +312,14 @@ export default function MyAdvisory() {
                     <button className="btn btn-outline btn-sm flex items-center gap-1.5" onClick={() => setImportTarget(a)}>
                       <Icons.Upload className="w-3.5 h-3.5" /> Import Class List
                     </button>
+                    <button
+                      className="btn btn-outline btn-sm flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                      onClick={() => setEditSection(a)}
+                      disabled={!all.length}
+                      title={all.length ? 'Double-check and correct the imported students' : 'Import the class list first'}
+                    >
+                      <Icons.Edit className="w-3.5 h-3.5" /> Edit Students
+                    </button>
                     <button className="btn btn-primary btn-sm flex items-center gap-1.5" onClick={() => setPromoteTarget(a)} disabled={!all.length}>
                       <Icons.Award className="w-3.5 h-3.5" /> Promotion
                     </button>
@@ -338,6 +343,11 @@ export default function MyAdvisory() {
                       </ul>
                     )}
                   </div>
+                )}
+
+                {/* Section's Semester Overview (grades, retakes, promotion status) — inside the section container, above the student table */}
+                {open && all.length > 0 && (
+                  <SemesterOverview data={overviewOf(all)} semester={semester} />
                 )}
 
                 {!open ? null : visible.length === 0 ? (
@@ -367,23 +377,24 @@ export default function MyAdvisory() {
                                 <Avatar letter={s.avatar || s.name?.[0]} className="bg-blue-500 text-white" size="w-7 h-7 text-xs" />
                                 <div className="flex items-center gap-2 flex-wrap">
                                   <p className="text-[13px] font-medium">{formatStudentName(s.name)}</p>
-                                  <RegularityBadge status={s.student_status} />
-                                  <StudentTypeBadge status={s.student_type} />
+                                  {!!s.account_setup_at && (
+                                    <>
+                                      <RegularityBadge status={s.student_status} />
+                                      <StudentTypeBadge status={s.student_type} />
+                                    </>
+                                  )}
                                 </div>
                               </div>
                             </td>
                             <td className="px-2 py-2.5 text-[13px] text-gray-500 text-center font-mono">{s.student_no || '—'}</td>
                             <td className="px-2 py-2.5 text-center">
                               {statusBadge(s)}
-                              {s.student_status === 'Irregular' && s.irregular_sections?.length > 0 && (
+                              {!!s.account_setup_at && s.student_status === 'Irregular' && s.irregular_sections?.length > 0 && (
                                 <p className="text-[11px] text-gray-400 mt-0.5">Taking: {s.irregular_sections.map((p) => `Y${p.year_level}-${p.section}`).join(', ')}</p>
                               )}
                             </td>
                             <td className="px-2 py-2.5 pr-5 whitespace-nowrap">
                               <div className="flex justify-center gap-1.5">
-                                <button className="btn-icon" onClick={() => setEditTarget(s)} title="Edit student information">
-                                  <Icons.Edit />
-                                </button>
                                 <button
                                   className={`btn-icon ${s.status === 'Deactivated' ? 'hover:!bg-green-50 hover:!text-green-600' : 'hover:!bg-red-50 hover:!text-red-500'}`}
                                   onClick={() => setStatusTarget(s)}
@@ -421,7 +432,16 @@ export default function MyAdvisory() {
           onCancel={() => setStatusTarget(null)}
         />
       )}
-      {editTarget && <EditAdviseeModal student={editTarget} onClose={() => setEditTarget(null)} onSaved={load} />}
+      {editSection && (
+        <EditSectionStudentsModal
+          section={editSection}
+          sectionLabel={`${sectionLabel(editSection)}`}
+          students={studentsOf(editSection)}
+          advisories={advisories}
+          onClose={() => setEditSection(null)}
+          onSaved={load}
+        />
+      )}
       {gradesTarget && <StudentGradeRecordModal studentId={gradesTarget.id} onClose={() => setGradesTarget(null)} />}
       {importTarget && (
         <StudentWordImportModal

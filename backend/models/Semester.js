@@ -20,7 +20,7 @@ const Semester = sequelize.define('Semester', {
   year_label: {
     type: DataTypes.STRING(20),
     allowNull: false,
-    defaultValue: 'Academic Year',
+    defaultValue: 'School Year',
     validate: { isIn: [['Academic Year', 'School Year']] },
   },
   term: {

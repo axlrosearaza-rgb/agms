@@ -20,8 +20,25 @@
 import PizZip from 'pizzip';
 import { saveAs } from 'file-saver';
 import toast from 'react-hot-toast';
-import { programShortLabel, formatPersonNameFirstLast, comparePeopleNames } from '../components/common';
+import { programShortLabel, formatPersonNameFirstLast, formatPersonNameCapsSurname, comparePeopleNames } from '../components/common';
 import { getSemesterFor, yearAbbrOf } from './semesterLabels';
+
+export function classSectionCode(c, fallbackProgram) {
+  const prog = c?.program || fallbackProgram || '';
+  const pLower = prog.toLowerCase();
+  let pCode = '';
+  if (pLower.includes('information technology')) pCode = 'IT';
+  else if (pLower.includes('information systems')) pCode = 'IS';
+  else if (pLower.includes('psychology')) pCode = 'BSPSY';
+  else if (pLower.includes('statistics')) pCode = 'BSS';
+  else if (pLower.includes('computer science')) pCode = 'CS';
+  else pCode = programShortLabel(prog).replace(/^BS\s*/i, '') || '';
+
+  const y = c?.year_level || '';
+  const s = c?.section || '';
+  if (!y && !s) return '';
+  return `${pCode ? `${pCode} ` : ''}${y}${s}`.trim();
+}
 
 const TEMPLATE_URL = '/templates/grades-monitoring-form-template.docx';
 const HEADER_SHADE = 'D9D9D9'; // light gray, matches the reference printout's own header row shading
@@ -32,66 +49,87 @@ const ORDINAL_NUM = { First: '1', Second: '2', Third: '3' };
 const ORDINAL_SUF = { First: 'st', Second: 'nd', Third: 'rd' };
 
 // Finds "College of Arts and Sciences / 1[st] Semester A.Y. 2026-2027" by
-// its actual run boundaries (not a hardcoded literal string) — the marker
-// text sits inside the SAME run as "GRADES MONITORING FORM" (joined by a
-// text-wrapping <w:br/>), so the replacement can only start after the
-// marker text itself, never at that run's own opening tag.
+// its actual run boundaries (not a hardcoded literal string).
 function findSubtitleRange(docXml) {
-  const marker = 'College of Arts and Sciences / 1';
+  const marker = 'College of ';
   const markerIdx = docXml.indexOf(marker);
   if (markerIdx === -1) return null;
   const afterMarker = markerIdx + marker.length;
   const firstTClose = docXml.indexOf('</w:t>', afterMarker) + '</w:t>'.length;
-  const firstRClose = docXml.indexOf('</w:r>', firstTClose) + '</w:r>'.length; // closes the run "GRADES MONITORING FORM<br/>College of Arts and Sciences / 1" started in
-  const secondRClose = docXml.indexOf('</w:r>', firstRClose) + '</w:r>'.length; // the superscript "st" run
-  const thirdRClose = docXml.indexOf('</w:r>', secondRClose) + '</w:r>'.length; // the " Semester A.Y. 2026-2027" run
+  const firstRClose = docXml.indexOf('</w:r>', firstTClose) + '</w:r>'.length;
+  const secondRClose = docXml.indexOf('</w:r>', firstRClose) + '</w:r>'.length;
+  const thirdRClose = docXml.indexOf('</w:r>', secondRClose) + '</w:r>'.length;
   if (firstRClose < 0 || secondRClose < 0 || thirdRClose < 0) return null;
   return { start: markerIdx, firstRClose, secondRClose, thirdRClose };
 }
 
-// Rebuilds the subtitle in place using the ORIGINAL run 2 ("st" superscript)
-// and run 3 (" Semester A.Y. ...") XML verbatim — preserves their exact
-// formatting attributes automatically — with only their actual text content
-// swapped out, rather than hand-reconstructing the run XML from scratch.
-function buildSubtitleReplacement(docXml, range, semesterName, yearAbbr = 'A.Y.') {
+// Rebuilds the subtitle to match official SSU format:
+// "College of Arts and Sciences / Second Semester S.Y. 2025 - 2026" (with "Arts and Sciences" and the term underlined).
+function buildSubtitleReplacement(docXml, range, semesterName, yearAbbr = 'S.Y.') {
   const raw = semesterName || '';
-  const ay = raw.match(/\d{4}-\d{4}/)?.[0] || '';
-  const term = raw.replace(ay, '').replace(/,?\s*$/, '').replace(/\s*(Semester|Summer)\s*$/i, '').trim();
+  const ayMatch = raw.match(/\d{4}\s*-\s*\d{4}/)?.[0] || '';
+  const ayFormatted = ayMatch ? ayMatch.replace(/\s*-\s*/, ' - ') : '';
   const isSummer = /summer/i.test(raw);
-  const num = ORDINAL_NUM[term] || '1';
-  const suf = ORDINAL_SUF[term] || 'st';
+  const isSecond = /second|2nd/i.test(raw);
+  const termWord = isSummer ? 'Summer' : isSecond ? 'Second' : 'First';
 
-  const run2Xml = docXml.slice(range.firstRClose, range.secondRClose);
-  const run3Xml = docXml.slice(range.secondRClose, range.thirdRClose);
+  const uRun = (text) => `<w:r><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:b w:val="1"/><w:bCs w:val="1"/><w:u w:val="single"/><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr><w:t xml:space="preserve">${esc(text)}</w:t></w:r>`;
+  const plainRun = (text) => `<w:r><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:b w:val="1"/><w:bCs w:val="1"/><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr><w:t xml:space="preserve">${esc(text)}</w:t></w:r>`;
 
   if (isSummer) {
-    // No ordinal suffix for Summer — drop run 2 entirely, adjust run 3's
-    // own text (still reusing its real formatting attributes).
-    const newRun3 = run3Xml.replace(/<w:t[^>]*>[^<]*<\/w:t>/, `<w:t xml:space="preserve"> Summer ${esc(yearAbbr)} ${esc(ay)}</w:t>`);
-    return `College of Arts and Sciences / Summer</w:t></w:r>${newRun3}`;
+    return `College of </w:t></w:r>${uRun('Arts and Sciences')}${plainRun(' / ')}${uRun('Summer')}${plainRun(` ${yearAbbr} ${ayFormatted}`)}`;
   }
-  const newRun2 = run2Xml.replace(/<w:t[^>]*>[^<]*<\/w:t>/, `<w:t xml:space="preserve">${esc(suf)}</w:t>`);
-  const newRun3 = run3Xml.replace(/<w:t[^>]*>[^<]*<\/w:t>/, `<w:t xml:space="preserve"> Semester ${esc(yearAbbr)} ${esc(ay)}</w:t>`);
-  return `College of Arts and Sciences / ${num}</w:t></w:r>${newRun2}${newRun3}`;
+
+  return `College of </w:t></w:r>${uRun('Arts and Sciences')}${plainRun(' / ')}${uRun(termWord)}${plainRun(` Semester ${yearAbbr} ${ayFormatted}`)}`;
 }
 
-const fmtDate = (d) => (d ? new Date(d).toLocaleDateString('en-US', { month: 'short', day: '2-digit', year: 'numeric' }) : '—');
+const fmtDate = (d) => (d ? new Date(d).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : '—');
 
-// Injects a light-gray fill AND italic into every header cell — the
-// data rows underneath stay upright (regular, not italic); it's the column
-// headers themselves (Name of Faculty, Program, ... Total) that are meant
-// to read italic here.
+// Injects a light-gray fill, compacts row height and paragraph spacing,
+// removes empty spacer paragraphs, and applies bold italic 8.5pt styling.
 function styleHeaderRows(rowsXml) {
-  let out = rowsXml.replace(/<w:tcPr(\/?)>/g, (_m, selfClosed) => (
+  let out = rowsXml;
+
+  // 1. Remove forced trHeight constraints so rows fit tightly to content
+  out = out.replace(/<w:trHeight[^>]*\/>/g, '<w:trHeight w:val="0" w:hRule="auto"/>');
+
+  // 2. Remove empty spacer paragraphs inside header cells (e.g. before "Name of Faculty")
+  out = out.replace(/<w:p\b[^>]*>(?:<w:pPr>[\s\S]*?<\/w:pPr>)?\s*(?:<w:r\b[^>]*>(?:<w:rPr>[\s\S]*?<\/w:rPr>)?\s*<\/w:r>)?\s*<\/w:p>(?=<w:p)/g, '');
+
+  // 3. Ultra-compact paragraph spacing: 0 before, 0 after, tight 180 line height
+  const compactSpacing = '<w:spacing w:before="0" w:after="0" w:line="180" w:lineRule="auto"/>';
+  out = out.replace(/<w:spacing\b[^>]*\/>/g, compactSpacing);
+
+  // 4. Shading & vertical center on every header cell tcPr
+  out = out.replace(/<w:tcPr(\/?)>/g, (_m, selfClosed) => (
     selfClosed
       ? `<w:tcPr><w:vAlign w:val="center"/><w:shd w:val="clear" w:fill="${HEADER_SHADE}"/></w:tcPr>`
       : `<w:tcPr><w:vAlign w:val="center"/><w:shd w:val="clear" w:fill="${HEADER_SHADE}"/>`
   ));
-  // Every header run already carries <w:b/><w:bCs/> (bold) from the
-  // template itself — add italic right alongside it.
-  out = out.replace(/<w:b w:val="1"\/><w:bCs w:val="1"\/>/g, '<w:b w:val="1"/><w:bCs w:val="1"/><w:i w:val="1"/><w:iCs w:val="1"/>');
+
+  // 5. Apply 8.5pt font size (17 half-pts) + bold + italic to all header runs
+  out = out.replace(/<w:rPr>([\s\S]*?)<\/w:rPr>/g, (_m, rPrInner) => {
+    const clean = rPrInner
+      .replace(/<w:sz\b[^>]*\/>/g, '')
+      .replace(/<w:szCs\b[^>]*\/>/g, '')
+      .replace(/<w:b\b[^>]*\/>/g, '')
+      .replace(/<w:bCs\b[^>]*\/>/g, '')
+      .replace(/<w:i\b[^>]*\/>/g, '')
+      .replace(/<w:iCs\b[^>]*\/>/g, '')
+      .replace(/<w:rFonts\b[^>]*\/>/g, '');
+    return `<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:b w:val="1"/><w:bCs w:val="1"/><w:i w:val="1"/><w:iCs w:val="1"/><w:sz w:val="17"/><w:szCs w:val="17"/>${clean}</w:rPr>`;
+  });
+
   return out;
 }
+
+// Precise column widths (total 15345 dxa):
+// Col 0: Name of Faculty (3000 dxa)
+// Col 1: Course Code (1000 dxa)
+// Col 2: Descriptive Title (4100 dxa)
+// Col 3: Date Submitted (2250 dxa) — wide enough so "Date Submitted to the" stays on 1 line
+// Col 4-8: Passed (950), Incomplete (1350), Failed (900), Dropped (950), Total (845)
+const NEW_GRID_COLS = [3000, 1000, 4100, 2250, 950, 1350, 900, 950, 845];
 
 // Column indices whose DATA should stay left-aligned like real body text
 // (Name of Faculty, Descriptive Title) — every other column (Course Code,
@@ -102,55 +140,56 @@ function styleHeaderRows(rowsXml) {
 const LEFT_ALIGN_COLS = new Set([0, 2]);
 
 // Splits a <w:tr>...</w:tr> block into its individual <w:tc>...</w:tc> cells
-// and drops a text run into each one's trailing paragraph (a paragraph with
-// no runs closes right after its <w:pPr>, so the run just needs inserting
-// before that paragraph's own </w:p>).
-function fillRowCells(rowXml, values) {
-  const cells = rowXml.match(/<w:tc>[\s\S]*?<\/w:tc>/g) || [];
+// and drops a text run into each one's trailing paragraph. Supports w:vMerge
+// on Column 0 (Name of Faculty) so multi-class instructors span rows in Word.
+function fillRowCells(rowXml, values, vMerge = null) {
+  const cells = rowXml.match(/<w:tc[\s\S]*?<\/w:tc>/g) || [];
   const filledCells = cells.map((cellXml, i) => {
     const text = values[i];
     let cell = cellXml;
+    const colWidth = NEW_GRID_COLS[i] || 1000;
 
-    // Vertically center every cell — otherwise a wrapped multi-line cell
-    // (Descriptive Title) sits top-anchored while its single-line
-    // neighbors in the same row don't, throwing the row's alignment off.
-    cell = cell.replace(/<w:tcPr\/>/, '<w:tcPr><w:vAlign w:val="center"/></w:tcPr>')
-      .replace(/<w:tcPr>(?!<w:vAlign)/, '<w:tcPr><w:vAlign w:val="center"/>');
-
-    if (text == null || text === '') return cell;
-
-    // Set this cell's own paragraph alignment explicitly — inserted right
-    // before <w:rPr> specifically, since CT_PPr's schema order requires
-    // <w:jc> to precede <w:rPr> (the paragraph mark's own run properties,
-    // always last); getting that order wrong is exactly the kind of thing
-    // that's syntactically fine but semantically off, like the <w:tr>
-    // stripping bug from earlier.
-    const align = LEFT_ALIGN_COLS.has(i) ? 'left' : 'center';
-    const pPrMatch = cell.match(/<w:pPr>[\s\S]*?<\/w:pPr>/);
-    if (pPrMatch) {
-      const pPrXml = pPrMatch[0];
-      const newPPr = /<w:jc\b/.test(pPrXml)
-        ? pPrXml.replace(/<w:jc w:val="[^"]*"\/>/, `<w:jc w:val="${align}"/>`)
-        : /<w:rPr/.test(pPrXml)
-          ? pPrXml.replace(/<w:rPr/, `<w:jc w:val="${align}"/><w:rPr`)
-          : pPrXml.replace('</w:pPr>', `<w:jc w:val="${align}"/></w:pPr>`);
-      cell = cell.replace(pPrXml, newPPr);
+    // Handle vertical merge and explicit cell width on Column 0 (Name of Faculty) & other columns
+    let tcPrContent = `<w:tcW w:w="${colWidth}" w:type="dxa"/><w:vAlign w:val="top"/>`;
+    if (i === 0) {
+      if (vMerge === 'restart') {
+        tcPrContent = `<w:vMerge w:val="restart"/><w:tcW w:w="${colWidth}" w:type="dxa"/><w:vAlign w:val="top"/>`;
+      } else if (vMerge === 'continue') {
+        tcPrContent = `<w:vMerge/><w:tcW w:w="${colWidth}" w:type="dxa"/><w:vAlign w:val="top"/>`;
+      }
     }
 
-    const runXml = `<w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">${esc(text)}</w:t></w:r>`;
+    if (/<w:tcPr\/>/.test(cell)) {
+      cell = cell.replace(/<w:tcPr\/>/, `<w:tcPr>${tcPrContent}</w:tcPr>`);
+    } else if (/<w:tcPr>/.test(cell)) {
+      cell = cell.replace(/<w:tcPr>[\s\S]*?<\/w:tcPr>/, `<w:tcPr>${tcPrContent}</w:tcPr>`);
+    } else {
+      cell = `<w:tc><w:tcPr>${tcPrContent}</w:tcPr>${cell.slice('<w:tc>'.length)}`;
+    }
+
+    if (text == null || text === '') {
+      if (i === 0 && vMerge === 'continue') {
+        return cell.replace(/<w:p[\s\S]*?<\/w:p>/, '<w:p><w:pPr><w:jc w:val="left"/></w:pPr></w:p>');
+      }
+      return cell;
+    }
+
+    // Set this cell's own paragraph alignment explicitly and reset any awkward line/after spacing
+    const align = LEFT_ALIGN_COLS.has(i) ? 'left' : 'center';
+    const spacingXml = '<w:spacing w:before="0" w:after="0" w:line="220" w:lineRule="auto"/>';
+    const newPPr = `<w:pPr>${spacingXml}<w:jc w:val="${align}"/></w:pPr>`;
+    if (/<w:pPr>[\s\S]*?<\/w:pPr>/.test(cell)) {
+      cell = cell.replace(/<w:pPr>[\s\S]*?<\/w:pPr>/, newPPr);
+    } else {
+      cell = cell.replace('<w:p>', `<w:p>${newPPr}`);
+    }
+
+    const runXml = `<w:r><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">${esc(text)}</w:t></w:r>`;
     const lastPClose = cell.lastIndexOf('</w:p>');
     return cell.slice(0, lastPClose) + runXml + cell.slice(lastPClose);
   });
-  // The row's own <w:tr ...>/<w:trPr>...</w:trPr> opening and </w:tr>
-  // closing tags were being dropped here before — only the <w:tc> cells got
-  // returned, leaving them as bare cells with no <w:tr> parent once
-  // inserted into the table. That's syntactically valid XML (so it passed
-  // well-formedness checks) but invalid OOXML — Word can't place a <w:tc>
-  // outside a row, so it silently dumped the "cell" content as loose
-  // paragraphs below the table instead of inside it. Preserving the row's
-  // real open/close tags here and only swapping the cells in between fixes
-  // that.
-  const firstTcIdx = rowXml.indexOf('<w:tc>');
+
+  const firstTcIdx = rowXml.indexOf('<w:tc');
   const lastTcEndIdx = rowXml.lastIndexOf('</w:tc>') + '</w:tc>'.length;
   return rowXml.slice(0, firstTcIdx) + filledCells.join('') + rowXml.slice(lastTcEndIdx);
 }
@@ -171,12 +210,17 @@ function emptyStateRowXml(columnCount, message) {
   return `<w:tr><w:tc><w:tcPr><w:gridSpan w:val="${columnCount}"/></w:tcPr><w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:i/><w:iCs/></w:rPr><w:t xml:space="preserve">${esc(message)}</w:t></w:r></w:p></w:tc></w:tr>`;
 }
 
-// A program's classes, alphabetical by faculty surname (then subject code),
+// A program's classes, alphabetical by faculty surname (then year, section, code),
 // each with `span`: how many rows that faculty member's name covers on their
 // FIRST row, 0 on the rows after it — a faculty member with several classes
 // is named once. Shared by the Reports pages and this export.
 export function withFacultySpans(rows = []) {
-  const sorted = [...rows].sort((a, b) => comparePeopleNames(a.instructor_name || '', b.instructor_name || '') || String(a.subject_code).localeCompare(String(b.subject_code)));
+  const sorted = [...rows].sort((a, b) =>
+    comparePeopleNames(a.instructor_name || '', b.instructor_name || '') ||
+    (a.year_level || 0) - (b.year_level || 0) ||
+    String(a.section || '').localeCompare(String(b.section || '')) ||
+    String(a.subject_code || '').localeCompare(String(b.subject_code || ''))
+  );
   const who = (c) => c.instructor_id ?? c.instructor_name ?? '';
   return sorted.map((c, i) => {
     if (i > 0 && who(sorted[i - 1]) === who(c)) return { c, span: 0 };
@@ -186,23 +230,53 @@ export function withFacultySpans(rows = []) {
   });
 }
 
-function buildProgramTableXml(tblOpenXml, headerRowsXml, blankRowTemplate, columnCount, rows) {
+// The rule line under the letterhead — the same line the Grade Sheet's header
+// has (1.5pt, the full width of the page), added to this form's header. It
+// hangs from the header's last paragraph, just below everything in it.
+const HEADER_RULE_XML = (pageWidthEmu) => '<w:r><w:drawing>'
+  + '<wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="251670000" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">'
+  + '<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:align>center</wp:align></wp:positionH>'
+  + '<wp:positionV relativeFrom="paragraph"><wp:posOffset>440000</wp:posOffset></wp:positionV>'
+  + `<wp:extent cx="${pageWidthEmu}" cy="0"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>`
+  + '<wp:docPr id="990001" name="Header Rule"/><wp:cNvGraphicFramePr/>'
+  + '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
+  + '<wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:cNvCnPr/><wps:spPr>'
+  + `<a:xfrm><a:off x="0" y="0"/><a:ext cx="${pageWidthEmu}" cy="0"/></a:xfrm><a:prstGeom prst="line"><a:avLst/></a:prstGeom><a:noFill/>`
+  + '<a:ln w="19050" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:srgbClr val="000000"/></a:solidFill><a:prstDash val="solid"/></a:ln>'
+  + '</wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>';
+
+function addHeaderRule(zip, docXml) {
+  const file = zip.file('word/header1.xml');
+  if (!file) return;
+  const xml = file.asText();
+  if (xml.includes('name="Header Rule"')) return;
+  const end = xml.lastIndexOf('</w:p>');
+  if (end < 0) return;
+  // Page width in twentieths of a point → EMU (635 per twip).
+  const pageW = Number((docXml.match(/<w:pgSz[^>]*w:w="(\d+)"/) || [])[1] || 18720) * 635;
+  zip.file('word/header1.xml', xml.slice(0, end) + HEADER_RULE_XML(pageW) + xml.slice(end));
+}
+
+function buildProgramTableXml(tblOpenXml, headerRowsXml, blankRowTemplate, columnCount, rows, program) {
   const dataRowsXml = (rows && rows.length > 0)
     // Alphabetical by surname (same order as the Reports page), printed
-    // First M. Surname, and only on each faculty member's first row.
+    // SURNAME, First M., vertically merged for faculty with multiple classes.
     ? withFacultySpans(rows).map(({ c: r, span }) => {
       const total = (r.passed || 0) + (r.inc || 0) + (r.failed || 0) + (r.dropped || 0);
+      const secCode = classSectionCode(r, program);
+      const descriptiveTitle = `${r.subject_name || '—'}${secCode ? ` ${secCode}` : ''}`;
+      const vMerge = span > 1 ? 'restart' : span === 0 ? 'continue' : null;
       return fillRowCells(blankRowTemplate, [
-        span === 0 ? '' : r.instructor_name ? formatPersonNameFirstLast(r.instructor_name) : '—',
+        span === 0 ? '' : r.instructor_name ? formatPersonNameCapsSurname(r.instructor_name) : '—',
         r.subject_code || '—',
-        r.subject_name || '—',
+        descriptiveTitle,
         fmtDate(r.date_submitted),
         String(r.passed || 0),
         String(r.inc || 0),
         String(r.failed || 0),
         String(r.dropped || 0),
         String(total),
-      ]);
+      ], vMerge);
     }).join('')
     : emptyStateRowXml(columnCount, 'No classes this semester for this program.');
   return `${tblOpenXml}${headerRowsXml}${dataRowsXml}</w:tbl>`;
@@ -285,20 +359,16 @@ export async function exportGradesMonitoringFormDocx({ programs, semester, prepa
     if (tblStart < 0 || tblCloseIdx < 0 || firstTrStart < 0) {
       console.warn('Grades Monitoring Form template: table not found as expected — leaving the template default in place.');
     } else {
-      // Descriptive Title (the widest text this table ever holds — full
-      // subject names) was cramped at the template's own default width,
-      // wrapping awkwardly. Widened, funded by shrinking the five
-      // Passed/Incomplete/Failed/Dropped/Total columns, which only ever
-      // hold a 1-2 digit number. Incomplete/Dropped need more than
-      // Passed/Failed since "Incomplete" is the longest header word in that
-      // group — an earlier pass under-provisioned it and it started
-      // wrapping onto two lines ("Incompl" / "ete"); given more room here,
-      // taken back from Descriptive Title.
-      const COLUMN_WIDTH_REMAP = { 3402: 4380, 1134: 900, 1276: 1300, 1458: 1000 };
       let tblOpenXml = docXml.slice(tblStart, firstTrStart).replace(/<w:tblpPr\b[^>]*\/>/, '');
-      Object.entries(COLUMN_WIDTH_REMAP).forEach(([oldW, newW]) => {
-        tblOpenXml = tblOpenXml.split(`<w:gridCol w:w="${oldW}"/>`).join(`<w:gridCol w:w="${newW}"/>`);
-      });
+      const tblPrEnd = tblOpenXml.indexOf('</w:tblPr>') + '</w:tblPr>'.length;
+      const newGridXml = `<w:tblGrid>${NEW_GRID_COLS.map((w) => `<w:gridCol w:w="${w}"/>`).join('')}</w:tblGrid>`;
+
+      if (!/<w:tblCellMar\b/.test(tblOpenXml)) {
+        tblOpenXml = tblOpenXml.slice(0, tblPrEnd - '</w:tblPr>'.length) + '<w:tblCellMar><w:top w:w="40" w:type="dxa"/><w:bottom w:w="40" w:type="dxa"/><w:left w:w="80" w:type="dxa"/><w:right w:w="80" w:type="dxa"/></w:tblCellMar></w:tblPr>' + newGridXml;
+      } else {
+        tblOpenXml = tblOpenXml.replace(/<w:tblCellMar>[\s\S]*?<\/w:tblCellMar>/, '<w:tblCellMar><w:top w:w="40" w:type="dxa"/><w:bottom w:w="40" w:type="dxa"/><w:left w:w="80" w:type="dxa"/><w:right w:w="80" w:type="dxa"/></w:tblCellMar>');
+        tblOpenXml = tblOpenXml.slice(0, tblPrEnd) + newGridXml;
+      }
 
       const firstTrCloseIdx = docXml.indexOf('</w:tr>', firstTrStart) + '</w:tr>'.length;
       const secondTrCloseIdx = docXml.indexOf('</w:tr>', firstTrCloseIdx) + '</w:tr>'.length;
@@ -308,15 +378,12 @@ export async function exportGradesMonitoringFormDocx({ programs, semester, prepa
       const blankRowTemplate = blankRowXml
         .replace(/<w:tblPrEx>[\s\S]*?<\/w:tblPrEx>/, '')
         .replace(/<w:trPr>[\s\S]*?<\/w:trPr>/, '');
-      // Only the OUTER <w:tblGrid>'s own gridCols — tblOpenXml also
-      // contains a duplicate nested copy inside <w:tblGridChange>, which
-      // would double this count if not excluded.
-      const columnCount = (tblOpenXml.split('<w:tblGridChange')[0].match(/<w:gridCol/g) || []).length;
+      const columnCount = NEW_GRID_COLS.length;
 
       const list = programs && programs.length > 0 ? programs : [];
       const sectionsXml = list.map(({ program, class_breakdown }) => (
         (list.length > 1 ? programHeadingXml(program) : '') +
-        buildProgramTableXml(tblOpenXml, headerRowsXml, blankRowTemplate, columnCount, class_breakdown || [])
+        buildProgramTableXml(tblOpenXml, headerRowsXml, blankRowTemplate, columnCount, class_breakdown || [], program)
       )).join('');
 
       if (sectionsXml) {
@@ -325,6 +392,8 @@ export async function exportGradesMonitoringFormDocx({ programs, semester, prepa
     }
 
     zip.file('word/document.xml', docXml);
+
+    addHeaderRule(zip, docXml);
 
     // ── Footer: "Prepared By" name/title — "Noted By" (the Dean) stays
     // fixed, matching this app's own org chart (no separate Dean role).

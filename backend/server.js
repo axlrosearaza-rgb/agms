@@ -46,7 +46,7 @@ const PORT = process.env.PORT || 5000;
 // ================= CORS ORIGIN CHECKER =================
 // CLIENT_URL (already in .env.example, previously unused) is the deployed
 // frontend's real origin(s) — comma-separated if there's more than one
-// (e.g. a Render subdomain during setup, plus a custom domain once attached).
+// (e.g. a host's default subdomain plus a custom domain once attached).
 // Everything else here stays exactly as it was for local/LAN development.
 const allowedOriginsFromEnv = (process.env.CLIENT_URL || '')
   .split(',')

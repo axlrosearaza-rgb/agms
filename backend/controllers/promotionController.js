@@ -9,6 +9,7 @@ const { asyncHandler } = require('../middleware/errorHandler');
 // would leave it silently sitting there until the recipient's next page
 // load/manual refresh.
 const { notifyAdmins, createNotification } = require('./notificationController');
+const { followsCurriculum } = require('../utils/studentCurriculum');
 
 const { logSectionActivity } = require('../utils/sectionActivity');
 
@@ -87,7 +88,7 @@ const getRequiredSubjectsByProgramYear = async (students, semOrder) => {
 
   const subjects = await Subject.findAll({
     where: { [Op.or]: pairs, semester: subjectSemester },
-    attributes: ['id', 'code', 'name', 'program', 'year_level'],
+    attributes: ['id', 'code', 'name', 'program', 'year_level', 'curriculum_year'],
     // Needed to tell "just hasn't taken it yet" apart from "can't even
     // enroll — the prerequisite/co-requisite isn't satisfied" (see
     // missingSubjectsBlockedByPrereqs below).
@@ -221,7 +222,7 @@ const evaluateStudents = asyncHandler(async (req, res) => {
     // own record with this system starts, so the normal full check applies.
     const skipCompletenessCheck = semOrder === '1st' && student.year_level > 1;
     const requiredSubjects = (requiredByProgramYear && !skipCompletenessCheck)
-      ? (requiredByProgramYear[`${student.program}|${student.year_level}`] || [])
+      ? (requiredByProgramYear[`${student.program}|${student.year_level}`] || []).filter((subj) => followsCurriculum(subj, student))
       : null;
     // A retakable Failed subject was actually attempted, not skipped —
     // excluded here so it doesn't double as "missing" on top of already
@@ -506,7 +507,7 @@ const runPromotion = async ({ app, students, semester, actor = null, auto = fals
     let missingSubjects = [];
     const skipCompletenessCheck = semOrder === '1st' && student.year_level > 1;
     if (requiredByProgramYear && !skipCompletenessCheck) {
-      const required = requiredByProgramYear[`${student.program}|${student.year_level}`] || [];
+      const required = (requiredByProgramYear[`${student.program}|${student.year_level}`] || []).filter((subj) => followsCurriculum(subj, student));
       missingSubjects = required.filter((s) => !(passedSubjectIds[student.id] || new Set()).has(s.id) && !notPassedIds.has(s.id));
     }
     // Per-class automatic checks wait for the rest of the semester's classes;

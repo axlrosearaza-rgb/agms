@@ -1,6 +1,6 @@
 const { USER_SECRET_FIELDS } = require('../utils/userFields');
 const { Class, Subject, User, Enrollment, Grade, GradeComponent, ComponentItem, ComponentScore, Semester } = require('../models');
-const { Op, fn, col } = require('sequelize');
+const { Op, fn, col, QueryTypes } = require('sequelize');
 const { logActivity } = require('../utils/activityLogger');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { actsAsInstructor } = require('../utils/teachingAuth');
@@ -76,6 +76,20 @@ const getEnrollableStudentIds = async (user, studentIds, program) => {
 };
 
 // GET /api/classes
+// Classes with any Class Record score or grade row recorded: their subject can
+// no longer be changed from Edit Class.
+const classIdsWithScores = async (classIds) => {
+  const rows = await Class.sequelize.query(
+    `SELECT gc.class_id FROM component_scores cs
+       JOIN component_items ci ON ci.id = cs.item_id
+       JOIN grade_components gc ON gc.id = ci.component_id
+      WHERE gc.class_id IN (:ids)
+     UNION SELECT class_id FROM grades WHERE class_id IN (:ids)`,
+    { replacements: { ids: classIds }, type: QueryTypes.SELECT },
+  );
+  return new Set(rows.map((r) => r.class_id));
+};
+
 const getClasses = asyncHandler(async (req, res) => {
   const { semester, department, instructor_id, search, page = 1, limit = 50 } = req.query;
 
@@ -129,7 +143,7 @@ const getClasses = asyncHandler(async (req, res) => {
   // PER class (this list is asked for up to 200 classes at a time — that was
   // ~400 round trips per request).
   const listClassIds = classes.map((c) => c.id);
-  const [enrollmentRows, submittedRows, encodedByClass] = listClassIds.length === 0 ? [[], [], new Map()] : await Promise.all([
+  const [enrollmentRows, submittedRows, encodedByClass, classesWithRecord] = listClassIds.length === 0 ? [[], [], new Map(), new Set()] : await Promise.all([
     Enrollment.findAll({
       where: { class_id: listClassIds },
       attributes: ['class_id', [fn('COUNT', col('id')), 'n']],
@@ -142,6 +156,7 @@ const getClasses = asyncHandler(async (req, res) => {
       raw: true,
     }),
     encodingCounts(listClassIds),
+    classIdsWithScores(listClassIds),
   ]);
   const studentCountByClass = new Map(enrollmentRows.map((r) => [r.class_id, parseInt(r.n, 10)]));
   const submittedByClass = new Map();
@@ -167,6 +182,7 @@ const getClasses = asyncHandler(async (req, res) => {
       pending_admin_approval: grades.filter((g) => g.status === 'Passed' && !g.admin_approved).length,
       // Admin releases the grades from Grade Approval once both documents are approved.
       all_released: grades.length > 0 && grades.every((g) => g.released),
+      has_scores: classesWithRecord.has(cls.id),
     };
   });
 
@@ -371,7 +387,24 @@ const updateClass = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'You may only update your own classes.' });
   }
 
-  const { schedule, section, semester, academic_year, status, encoding_open, instructor_id, year_level } = req.body;
+  const { schedule, section, semester, academic_year, status, encoding_open, instructor_id, year_level, subject_id } = req.body;
+  // A different subject: only while no score or grade has been recorded,
+  // since every score belongs to the old subject's Class Record. The default
+  // Class Record parts are rebuilt for the new subject after the save.
+  let newSubject = null;
+  if (subject_id !== undefined && Number(subject_id) !== Number(cls.subject_id)) {
+    newSubject = await Subject.findByPk(subject_id);
+    if (!newSubject) return res.status(400).json({ message: 'That subject was not found.' });
+    if ((await classIdsWithScores([cls.id])).has(cls.id)) {
+      return res.status(400).json({ message: 'The subject can no longer be changed: scores or grades have already been recorded for this class. Create a new class for the other subject instead.' });
+    }
+    const enrolledIds = (await Enrollment.findAll({ where: { class_id: cls.id }, attributes: ['student_id'], raw: true })).map((e) => e.student_id);
+    const blocked = await prerequisiteBlocks(newSubject.id, enrolledIds, cls.semester);
+    if (blocked.size > 0) {
+      return res.status(400).json({ message: `${blocked.size} student(s) on this class list have not passed the prerequisites of ${newSubject.code}. Remove them first, or create a new class for ${newSubject.code}.` });
+    }
+    cls.subject_id = newSubject.id;
+  }
   if (schedule !== undefined) cls.schedule = schedule;
   if (section !== undefined) cls.section = section;
   if (year_level !== undefined) cls.year_level = year_level;
@@ -386,7 +419,7 @@ const updateClass = asyncHandler(async (req, res) => {
   // reassigning its instructor) can't be used to sidestep it after the fact.
   // Only matters when this class is actually still Active and a Section is
   // actually set; unaffected by anything about itself (excludes its own id).
-  if (cls.section && (section !== undefined || year_level !== undefined || semester !== undefined || instructor_id !== undefined) && (status === undefined || status === 'Active')) {
+  if (cls.section && (section !== undefined || year_level !== undefined || semester !== undefined || instructor_id !== undefined || subject_id !== undefined) && (status === undefined || status === 'Active')) {
     const claimedBy = await Class.findOne({
       where: {
         id: { [Op.ne]: cls.id },
@@ -406,7 +439,17 @@ const updateClass = asyncHandler(async (req, res) => {
     }
   }
 
-  await cls.save();
+  if (newSubject) {
+    await Class.sequelize.transaction(async (transaction) => {
+      await cls.save({ transaction });
+      const componentIds = (await GradeComponent.findAll({ where: { class_id: cls.id }, attributes: ['id'], raw: true, transaction })).map((c) => c.id);
+      if (componentIds.length) await ComponentItem.destroy({ where: { component_id: componentIds }, transaction });
+      await GradeComponent.destroy({ where: { class_id: cls.id }, transaction });
+    });
+    await createDefaultGradeComponents(cls.id, newSubject);
+  } else {
+    await cls.save();
+  }
   await logActivity(req.user.id, `updated class #${cls.id}`, 'Class', cls.id);
   res.json({ message: 'Class updated successfully.', class: cls });
 });
@@ -766,7 +809,7 @@ const getInstructorClasses = asyncHandler(async (req, res) => {
 
   // Grouped instead of per-class — see getClasses for the reasoning.
   const instClassIds = classes.map((c) => c.id);
-  const [instEnrollRows, instGradeRows, instEncodedByClass] = instClassIds.length === 0 ? [[], [], new Map()] : await Promise.all([
+  const [instEnrollRows, instGradeRows, instEncodedByClass, instRecordIds] = instClassIds.length === 0 ? [[], [], new Map(), new Set()] : await Promise.all([
     Enrollment.findAll({
       where: { class_id: instClassIds },
       attributes: ['class_id', [fn('COUNT', col('id')), 'n']],
@@ -779,6 +822,7 @@ const getInstructorClasses = asyncHandler(async (req, res) => {
       raw: true,
     }),
     encodingCounts(instClassIds),
+    classIdsWithScores(instClassIds),
   ]);
   const instCountByClass = new Map(instEnrollRows.map((r) => [r.class_id, parseInt(r.n, 10)]));
   const instGradesByClass = new Map();
@@ -814,6 +858,7 @@ const getInstructorClasses = asyncHandler(async (req, res) => {
         manually_archived: semesterRow?.status !== 'Completed' && ['Completed', 'Cancelled'].includes(cls.status),
         pending_admin_approval: pendingAdminApproval,
         all_released: allReleased,
+        has_scores: instRecordIds.has(cls.id),
         // Both sign-offs: Chairperson verification AND Admin's approval of
         // the Class Record + Grade Sheet (see gradeController's adminSignedOff).
         can_release: gradeCount > 0 && !!cls.chairperson_verified && !!cls.admin_class_record_approved && !!cls.admin_grade_sheet_approved && pendingAdminApproval === 0 && !allReleased,

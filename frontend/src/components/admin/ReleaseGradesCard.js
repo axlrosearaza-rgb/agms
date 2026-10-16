@@ -1,23 +1,21 @@
 import { useCallback, useEffect, useState } from 'react';
 import toast from 'react-hot-toast';
-import { Icons, Badge, ConfirmDialog, ProgramBadge, formatPersonNameFirstLast } from '../common';
+import { Icons, Badge, ConfirmDialog, ProgramBadge, SearchBar, programShortLabel, formatPersonNameFirstLast } from '../common';
 import { classService, gradeService } from '../../services';
 import { onGradesUpdated } from '../../services/socket';
 import { useAutoRefresh } from '../../hooks/useAutoRefresh';
 
 // Admin dashboard: classes whose Class Record and Grade Sheet are both
-// approved — release each one's grades to its students (same action as the
-// Release to Students button on Grade Approval), or all of them at once.
-// Approving both documents already releases a class on its own; anything that
-// still shows here (e.g. approved before that, or a release that failed) is
-// released from here.
+// approved — the Admin releases each one's grades to its students from here,
+// one class at a time (same action as the Release to Students button on
+// Grade Approval). Search and filters narrow the list.
 const label = (c) => `${c.subject?.code || 'Class'}${c.section ? ` ${c.year_level || ''}-${c.section}` : ''}`;
 
 export default function ReleaseGradesCard() {
   const [classes, setClasses] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [releasing, setReleasing] = useState(null); // class id, or 'all'
-  const [confirm, setConfirm] = useState(null); // a class, or 'all'
+  const [releasing, setReleasing] = useState(null); // the class id being released
+  const [confirm, setConfirm] = useState(null); // the class awaiting confirmation
   const [showReleased, setShowReleased] = useState(false);
 
   const load = useCallback(async () => {
@@ -37,8 +35,32 @@ export default function ReleaseGradesCard() {
   useEffect(() => { load(); return onGradesUpdated(load); }, [load]);
   useAutoRefresh(load);
 
-  const waiting = classes.filter((c) => !c.all_released);
-  const released = classes.filter((c) => c.all_released);
+  // Search + filters — narrow both lists (waiting and already released).
+
+  const [search, setSearch] = useState('');
+  const [program, setProgram] = useState('');
+  const [year, setYear] = useState('');
+  const [section, setSection] = useState('');
+  const [faculty, setFaculty] = useState('');
+  const uniq = (list) => [...new Set(list.filter((v) => v !== undefined && v !== null && v !== ''))];
+  const programs = uniq(classes.map((c) => c.subject?.program)).sort();
+  const years = uniq(classes.map((c) => c.year_level)).sort((a, b) => a - b);
+  const sections = uniq(classes.map((c) => c.section)).sort();
+  const faculties = uniq(classes.map((c) => c.instructor?.name)).sort((a, b) => formatPersonNameFirstLast(a).localeCompare(formatPersonNameFirstLast(b)));
+  const q = search.trim().toLowerCase();
+  const matches = (c) => (!program || c.subject?.program === program)
+    && (!year || String(c.year_level) === String(year))
+    && (!section || c.section === section)
+    && (!faculty || c.instructor?.name === faculty)
+    && (!q || [c.subject?.code, c.subject?.name, c.instructor?.name, c.instructor?.name && formatPersonNameFirstLast(c.instructor.name),
+      programShortLabel(c.subject?.program), `${programShortLabel(c.subject?.program)} ${c.year_level}-${c.section}`, `${c.year_level}-${c.section}`, `${c.year_level}${c.section}`]
+      .some((v) => String(v || '').toLowerCase().includes(q)));
+  const filtering = !!(q || program || year || section || faculty);
+  const clearFilters = () => { setSearch(''); setProgram(''); setYear(''); setSection(''); setFaculty(''); };
+
+  const allWaiting = classes.filter((c) => !c.all_released);
+  const waiting = allWaiting.filter(matches);
+  const released = classes.filter((c) => c.all_released).filter(matches);
 
   const release = async (c) => {
     setReleasing(c.id);
@@ -51,17 +73,6 @@ export default function ReleaseGradesCard() {
       setReleasing(null);
       load();
     }
-  };
-
-  const releaseAll = async () => {
-    setReleasing('all');
-    let ok = 0;
-    for (const c of waiting) {
-      try { await gradeService.releaseClass(c.id); ok += 1; } catch (err) { toast.error(err.response?.data?.message || `Failed to release ${label(c)}`); }
-    }
-    if (ok) toast.success(`Released the grades of ${ok} class${ok !== 1 ? 'es' : ''}.`);
-    setReleasing(null);
-    load();
   };
 
   const row = (c, isReleased) => (
@@ -108,24 +119,54 @@ export default function ReleaseGradesCard() {
   return (
     <div className="card overflow-hidden mb-6">
       <div className="px-5 py-3.5 bg-green-600 text-white flex flex-wrap items-center gap-3">
-        <span className="text-sm font-bold bg-white/20 rounded-full min-w-[26px] h-[26px] px-2 flex items-center justify-center">{waiting.length}</span>
+        <span className="text-sm font-bold bg-white/20 rounded-full min-w-[26px] h-[26px] px-2 flex items-center justify-center">{allWaiting.length}</span>
         <div className="flex-1 min-w-0">
           <p className="text-sm font-bold">Release Grades to Students</p>
           <p className="text-[11px] text-white/80">Classes whose Class Record and Grade Sheet are both approved.</p>
         </div>
-        {waiting.length > 1 && (
-          <button className="btn btn-sm bg-white text-green-700 border-none font-semibold hover:bg-green-50" onClick={() => setConfirm('all')} disabled={!!releasing}>
-            <Icons.Send className="w-3.5 h-3.5" /> {releasing === 'all' ? 'Releasing…' : `Release All (${waiting.length})`}
-          </button>
-        )}
       </div>
+
+      {/* SEARCH + FILTERS */}
+      {classes.length > 0 && (
+        <div className="px-4 py-3 flex flex-wrap items-center gap-2 border-b border-gray-100 bg-gray-50/60">
+          <div className="flex-1 min-w-[220px]">
+            <SearchBar value={search} onChange={setSearch} placeholder="Search subject, faculty or section (e.g. BSIT 4-D)…" />
+          </div>
+          <select className="form-select w-auto min-w-[130px] text-sm" value={program} onChange={(e) => setProgram(e.target.value)}>
+            <option value="">All Programs</option>
+            {programs.map((p) => <option key={p} value={p}>{programShortLabel(p)}</option>)}
+          </select>
+          <select className="form-select w-auto min-w-[110px] text-sm" value={year} onChange={(e) => setYear(e.target.value)}>
+            <option value="">All Years</option>
+            {years.map((y) => <option key={y} value={y}>Year {y}</option>)}
+          </select>
+          <select className="form-select w-auto min-w-[120px] text-sm" value={section} onChange={(e) => setSection(e.target.value)}>
+            <option value="">All Sections</option>
+            {sections.map((sec) => <option key={sec} value={sec}>Section {sec}</option>)}
+          </select>
+          <select className="form-select w-auto min-w-[150px] max-w-[220px] text-sm" value={faculty} onChange={(e) => setFaculty(e.target.value)}>
+            <option value="">All Faculty</option>
+            {faculties.map((n) => <option key={n} value={n}>{formatPersonNameFirstLast(n)}</option>)}
+          </select>
+          {filtering && (
+            <button className="btn btn-outline btn-sm" onClick={clearFilters}>
+              <Icons.X className="w-3.5 h-3.5" /> Clear
+            </button>
+          )}
+          {filtering && (
+            <span className="text-[12px] text-gray-500 w-full sm:w-auto">Showing {waiting.length} of {allWaiting.length} waiting</span>
+          )}
+        </div>
+      )}
 
       {loading ? (
         <p className="text-sm text-gray-400 text-center py-8">Loading…</p>
-      ) : waiting.length === 0 ? (
+      ) : allWaiting.length === 0 ? (
         <p className="text-sm text-gray-400 text-center py-8">
           No grades waiting to be released.{released.length ? ` All ${released.length} approved class${released.length !== 1 ? 'es are' : ' is'} already released.` : ''}
         </p>
+      ) : waiting.length === 0 ? (
+        <p className="text-sm text-gray-400 text-center py-8">No waiting class matches your search or filters.</p>
       ) : table(waiting, false)}
 
       {released.length > 0 && (
@@ -143,13 +184,11 @@ export default function ReleaseGradesCard() {
 
       {confirm && (
         <ConfirmDialog
-          title={confirm === 'all' ? 'Release all approved grades?' : 'Release grades to students?'}
-          message={confirm === 'all'
-            ? `The grades of all ${waiting.length} approved classes become visible to their students, who are notified. Each class's faculty is notified too.`
-            : `The grades of ${label(confirm)}${confirm.instructor?.name ? ` (${formatPersonNameFirstLast(confirm.instructor.name)})` : ''} become visible to its students, who are notified. The faculty member is notified too.`}
-          confirmText={confirm === 'all' ? 'Release All' : 'Release'}
+          title="Release grades to students?"
+          message={`The grades of ${label(confirm)}${confirm.instructor?.name ? ` (${formatPersonNameFirstLast(confirm.instructor.name)})` : ''} become visible to its students, who are notified. The faculty member is notified too.`}
+          confirmText="Release"
           variant="green"
-          onConfirm={async () => { const c = confirm; setConfirm(null); if (c === 'all') await releaseAll(); else await release(c); }}
+          onConfirm={async () => { const c = confirm; setConfirm(null); await release(c); }}
           onCancel={() => setConfirm(null)}
         />
       )}

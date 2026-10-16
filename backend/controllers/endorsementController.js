@@ -165,6 +165,7 @@ const getDepartmentStudents = asyncHandler(async (req, res) => {
         finals: g.finals,
         average: g.average,
         status: g.status,
+        released: !!g.released,
       })),
       endorsement: endorsement ? endorsement.toJSON() : null,
       current_classes: currentClasses,

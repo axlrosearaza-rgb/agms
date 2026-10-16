@@ -37,7 +37,6 @@ export default function SettingsPage() {
   };
   const { theme, setTheme, isDark } = useTheme();
   const isStudent = user?.role === 'Student';
-  const isAdmin = user?.role === 'Admin';
   const loginLabel = isStudent ? 'Student Number' : 'Username';
 
   const [newLogin, setNewLogin] = useState(user?.[isStudent ? 'student_no' : 'username'] || '');
@@ -310,10 +309,11 @@ export default function SettingsPage() {
         </div>
         )}
 
-        {/* Email Address — Available to everyone except Admin (whose email is fixed once set).
-            Students whose accounts were created without an email can add it here,
-            and existing accounts can update their email. */}
-        {!isAdmin && (
+        {/* Email Address — shown to every role, the Admin included: this is
+            the address a password reset link is sent to (Forgot Password), so
+            the Admin must be able to set a real one. An account created
+            without an email can add it here; any account can change it. */}
+        {(
         <div className="card p-6">
           <h3 className="text-base font-semibold text-navy mb-1 flex items-center gap-2">
             <Icons.Mail className="w-4 h-4 text-gold" /> {user?.email ? 'Change Email' : 'Add Email Address'}

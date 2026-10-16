@@ -1,31 +1,51 @@
 import { useState, useEffect } from 'react';
-import { Icons, Badge, LoadingSpinner, ProgramBadge, programShortLabel, formatPersonName } from '../../components/common';
-import { reportService } from '../../services';
+import { Icons, Badge, LoadingSpinner, ProgramBadge, programShortLabel, formatPersonName, formatPersonNameCapsSurname } from '../../components/common';
+import { reportService, semesterService } from '../../services';
 import toast from 'react-hot-toast';
 import { useAuth } from '../../context/AuthContext';
-import { exportGradesMonitoringFormDocx, withFacultySpans } from '../../utils/gradesMonitoringFormDocx';
+import { exportGradesMonitoringFormDocx, withFacultySpans, classSectionCode } from '../../utils/gradesMonitoringFormDocx';
 
 // Same Grades Monitoring Form report as Admin's own Reports page
 // (utils/gradesMonitoringFormDocx.js) — scoped to just this Chairperson's
-// own program(s) instead of the whole college.
+// own program(s) instead of the whole college, supporting any active or archived semester.
 export default function Reports() {
   const { user } = useAuth();
   const [data, setData] = useState(null);
+  const [semesters, setSemesters] = useState([]);
+  const [selectedSemester, setSelectedSemester] = useState('');
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
 
   useEffect(() => {
     (async () => {
       try {
-        const { data: result } = await reportService.getChairpersonReport();
-        setData(result);
+        const { data: semData } = await semesterService.getAll();
+        setSemesters(semData.semesters || []);
       } catch (err) {
-        toast.error('Failed to load report');
-      } finally {
-        setLoading(false);
+        console.error(err);
       }
     })();
   }, []);
+
+  const loadReport = async (sem) => {
+    setLoading(true);
+    try {
+      const params = sem ? { semester: sem } : undefined;
+      const { data: result } = await reportService.getChairpersonReport(params);
+      setData(result);
+      if (!selectedSemester && result?.current_semester) {
+        setSelectedSemester(result.current_semester);
+      }
+    } catch (err) {
+      toast.error('Failed to load report');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadReport(selectedSemester);
+  }, [selectedSemester]);
 
   const programs = data?.programs || [];
   const totalClasses = programs.reduce((s, p) => s + (p.class_breakdown?.length || 0), 0);
@@ -43,7 +63,7 @@ export default function Reports() {
         : 'Program Chairperson';
       await exportGradesMonitoringFormDocx({
         programs,
-        semester: data?.current_semester || '',
+        semester: data?.current_semester || selectedSemester || '',
         preparedByName: user?.name,
         preparedByTitle: title,
       });
@@ -52,16 +72,7 @@ export default function Reports() {
     }
   };
 
-  if (loading) return <LoadingSpinner />;
-
-  if (programs.length === 0) {
-    return (
-      <div className="card p-12 text-center text-gray-400">
-        <Icons.BarChart className="w-10 h-10 mx-auto mb-3 opacity-30" />
-        <p className="font-medium">No program assigned yet</p>
-      </div>
-    );
-  }
+  if (loading && !data) return <LoadingSpinner />;
 
   return (
     <>
@@ -72,9 +83,22 @@ export default function Reports() {
             Grades Monitoring — your program(s){data?.current_semester ? ` — ${data.current_semester}` : ''}
           </p>
         </div>
-        <button className="btn btn-gold text-sm" onClick={exportForm} disabled={exporting || totalClasses === 0}>
-          <Icons.FileText className="w-4 h-4" /> {exporting ? 'Exporting...' : 'Export Grades Monitoring Form'}
-        </button>
+        <div className="flex items-center gap-2.5 flex-wrap">
+          <select
+            className="form-select text-sm py-2 w-auto"
+            value={selectedSemester}
+            onChange={(e) => setSelectedSemester(e.target.value)}
+          >
+            {semesters.map((s) => (
+              <option key={s.id || s.name} value={s.name}>
+                {s.name} {s.is_current ? '(Current)' : s.status === 'Completed' ? '(Completed)' : ''}
+              </option>
+            ))}
+          </select>
+          <button className="btn btn-gold text-sm" onClick={exportForm} disabled={exporting || totalClasses === 0}>
+            <Icons.FileText className="w-4 h-4" /> {exporting ? 'Exporting...' : 'Export Grades Monitoring Form'}
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-5">
@@ -113,37 +137,88 @@ export default function Reports() {
                 <div className="card-body text-center text-gray-400 text-sm py-8">No classes this semester for this program.</div>
               ) : (
                 <div className="overflow-x-auto">
-                  <table className="w-full text-[13px]">
+                  <table className="w-full text-[13px] border-collapse border border-gray-200">
                     <thead>
-                      <tr className="border-b border-gray-200">
-                        <th className="text-left px-4 py-2 text-[11px] font-semibold uppercase text-gray-500">Faculty</th>
-                        <th className="text-left px-2 py-2 text-[11px] font-semibold uppercase text-gray-500">Subject</th>
-                        <th className="text-center px-2 py-2 text-[11px] font-semibold uppercase text-gray-500">Passed</th>
-                        <th className="text-center px-2 py-2 text-[11px] font-semibold uppercase text-gray-500">Incomplete</th>
-                        <th className="text-center px-2 py-2 text-[11px] font-semibold uppercase text-gray-500">Failed</th>
-                        <th className="text-center px-2 py-2 text-[11px] font-semibold uppercase text-gray-500">Dropped</th>
+                      <tr className="bg-gray-100/90 text-gray-700 border-b border-gray-300">
+                        <th rowSpan={2} className="text-left px-3 py-2 text-[11px] font-bold uppercase tracking-wider border-r border-gray-200 align-middle">
+                          Name of Faculty
+                        </th>
+                        <th colSpan={2} className="text-center px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider border-r border-gray-200">
+                          Faculty Teaching Load
+                        </th>
+                        <th rowSpan={2} className="text-center px-3 py-2 text-[11px] font-bold uppercase tracking-wider border-r border-gray-200 align-middle">
+                          Date Submitted to the<br />Program Chairperson
+                        </th>
+                        <th colSpan={5} className="text-center px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider">
+                          No. of students with:
+                        </th>
+                      </tr>
+                      <tr className="bg-gray-100/90 text-gray-700 border-b border-gray-300">
+                        <th className="text-left px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider border-r border-gray-200">
+                          Course Code
+                        </th>
+                        <th className="text-left px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider border-r border-gray-200">
+                          Descriptive Title
+                        </th>
+                        <th className="text-center px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wider border-r border-gray-200">
+                          Passed
+                        </th>
+                        <th className="text-center px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wider border-r border-gray-200">
+                          Incomplete
+                        </th>
+                        <th className="text-center px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wider border-r border-gray-200">
+                          Failed
+                        </th>
+                        <th className="text-center px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wider border-r border-gray-200">
+                          Dropped
+                        </th>
+                        <th className="text-center px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider">
+                          Total
+                        </th>
                       </tr>
                     </thead>
-                    <tbody>
-                      {/* On screen: "Surname, First M.", alphabetical. A
-                          faculty member with several classes is named once,
-                          spanning all their rows. The exported form keeps its
-                          own First M. Surname order. */}
-                      {withFacultySpans(p.class_breakdown).map(({ c, span }) => (
-                        <tr key={c.class_id} className="border-b border-gray-50">
-                          {span > 0 && (
-                            <td className="px-4 py-2.5 align-top" rowSpan={span}>{c.instructor_name ? formatPersonName(c.instructor_name) : '—'}</td>
-                          )}
-                          <td className="px-2 py-2.5">
-                            <span className="font-semibold">{c.subject_code}</span>
-                            <span className="text-gray-400"> — {c.subject_name}</span>
-                          </td>
-                          <td className="px-2 py-2.5 text-center"><Badge variant="green">{c.passed}</Badge></td>
-                          <td className="px-2 py-2.5 text-center"><Badge variant="yellow">{c.inc}</Badge></td>
-                          <td className="px-2 py-2.5 text-center"><Badge variant="red">{c.failed}</Badge></td>
-                          <td className="px-2 py-2.5 text-center"><Badge variant="gray">{c.dropped}</Badge></td>
-                        </tr>
-                      ))}
+                    <tbody className="divide-y divide-gray-200">
+                      {withFacultySpans(p.class_breakdown).map(({ c, span }) => {
+                        const secCode = classSectionCode(c, p.program);
+                        const descriptiveTitle = `${c.subject_name || '—'}${secCode ? ` ${secCode}` : ''}`;
+                        const total = (c.passed || 0) + (c.inc || 0) + (c.failed || 0) + (c.dropped || 0);
+                        const dateFormatted = c.date_submitted
+                          ? new Date(c.date_submitted).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
+                          : '—';
+                        return (
+                          <tr key={c.class_id} className="hover:bg-gray-50/70 transition-colors">
+                            {span > 0 && (
+                              <td className="px-3 py-2.5 align-top font-semibold text-navy border-r border-gray-200 bg-white whitespace-nowrap" rowSpan={span}>
+                                {c.instructor_name ? formatPersonNameCapsSurname(c.instructor_name) : '—'}
+                              </td>
+                            )}
+                            <td className="px-3 py-2 align-top font-medium text-navy border-r border-gray-200 whitespace-nowrap">
+                              {c.subject_code || '—'}
+                            </td>
+                            <td className="px-3 py-2 align-top text-gray-800 border-r border-gray-200">
+                              {descriptiveTitle}
+                            </td>
+                            <td className="px-3 py-2 align-top text-center text-gray-600 text-xs border-r border-gray-200 whitespace-nowrap">
+                              {dateFormatted}
+                            </td>
+                            <td className="px-2 py-2 align-top text-center border-r border-gray-200 font-semibold text-green-600">
+                              {c.passed}
+                            </td>
+                            <td className="px-2 py-2 align-top text-center border-r border-gray-200 font-semibold text-amber-600">
+                              {c.inc}
+                            </td>
+                            <td className="px-2 py-2 align-top text-center border-r border-gray-200 font-semibold text-red-600">
+                              {c.failed}
+                            </td>
+                            <td className="px-2 py-2 align-top text-center border-r border-gray-200 font-semibold text-gray-500">
+                              {c.dropped}
+                            </td>
+                            <td className="px-2 py-2 align-top text-center font-bold text-navy bg-gray-50/50">
+                              {total}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

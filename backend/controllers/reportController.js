@@ -576,20 +576,23 @@ const ADMIN_REPORT_PROGRAMS = [
 
 // Shared by both getAdminGradesReport (every program) and
 // getChairpersonReport (just the caller's own program(s)) — one row per
-// class currently running in `program` this semester, with the
-// Passed/Incomplete/Failed/Dropped breakdown a Grades Monitoring Form needs.
-const buildProgramClassBreakdown = async (program, currentSemester) => {
+// class running in `program` in the selected semester (whether currently
+// Active or Completed/Archived), with the Passed/Incomplete/Failed/Dropped
+// breakdown a Grades Monitoring Form needs.
+const buildProgramClassBreakdown = async (program, targetSemester) => {
+  const where = {};
+  if (targetSemester?.name) where.semester = targetSemester.name;
   const classes = await Class.findAll({
-    where: { status: 'Active' },
+    where,
     include: [
-      { model: Subject, as: 'subject', where: { program }, attributes: ['id', 'code', 'name'] },
+      { model: Subject, as: 'subject', where: { program }, attributes: ['id', 'code', 'name', 'program'] },
       { model: User, as: 'instructor', attributes: ['id', 'name'] },
     ],
     attributes: ['id', 'semester', 'year_level', 'section'],
   });
-  const currentClasses = currentSemester ? classes.filter((c) => c.semester === currentSemester.name) : [];
+  const matchedClasses = targetSemester ? classes.filter((c) => c.semester === targetSemester.name) : classes;
 
-  const classBreakdown = await Promise.all(currentClasses.map(async (cls) => {
+  const classBreakdown = await Promise.all(matchedClasses.map(async (cls) => {
     const clsGrades = await Grade.findAll({ where: { class_id: cls.id, submitted: true } });
     // The class-level "sent to chairperson" flag isn't timestamped, so the
     // closest real date to "submitted" is the latest of this class's own
@@ -600,6 +603,7 @@ const buildProgramClassBreakdown = async (program, currentSemester) => {
       : null;
     return {
       class_id: cls.id,
+      program: cls.subject?.program || program,
       year_level: cls.year_level,
       section: cls.section,
       subject_code: cls.subject?.code,
@@ -620,34 +624,37 @@ const buildProgramClassBreakdown = async (program, currentSemester) => {
   return classBreakdown;
 };
 
-// GET /api/reports/admin — one row per class currently running in each of
-// the college's 4 programs, this semester only. Unlike the Chairperson's own
-// equivalent (scoped to req.user.programs), Admin sees every program — this
-// is the whole-college version.
+// GET /api/reports/admin — one row per class in each of the college's 4 programs
+// for the chosen (or current) semester, including archived terms.
 const getAdminGradesReport = asyncHandler(async (req, res) => {
-  const currentSemester = await Semester.findOne({ where: { is_current: true } });
+  const { semester } = req.query;
+  const targetSemester = semester
+    ? await Semester.findOne({ where: { name: semester } }) || { name: semester }
+    : await Semester.findOne({ where: { is_current: true } }) || await Semester.findOne({ order: [['academic_year', 'DESC'], ['term', 'DESC']] });
 
   const programReports = await Promise.all(ADMIN_REPORT_PROGRAMS.map(async (program) => ({
     program,
-    class_breakdown: await buildProgramClassBreakdown(program, currentSemester),
+    class_breakdown: await buildProgramClassBreakdown(program, targetSemester),
   })));
 
-  res.json({ current_semester: currentSemester?.name || null, programs: programReports });
+  res.json({ current_semester: targetSemester?.name || null, programs: programReports });
 });
 
 // GET /api/reports/chairperson — same shape as getAdminGradesReport above,
-// scoped to just the calling Chairperson's own program(s) instead of every
-// program in the college.
+// scoped to just the calling Chairperson's own program(s), for any semester.
 const getChairpersonReport = asyncHandler(async (req, res) => {
   const programs = req.user.programs || [];
-  const currentSemester = await Semester.findOne({ where: { is_current: true } });
+  const { semester } = req.query;
+  const targetSemester = semester
+    ? await Semester.findOne({ where: { name: semester } }) || { name: semester }
+    : await Semester.findOne({ where: { is_current: true } }) || await Semester.findOne({ order: [['academic_year', 'DESC'], ['term', 'DESC']] });
 
   const programReports = await Promise.all(programs.map(async (program) => ({
     program,
-    class_breakdown: await buildProgramClassBreakdown(program, currentSemester),
+    class_breakdown: await buildProgramClassBreakdown(program, targetSemester),
   })));
 
-  res.json({ current_semester: currentSemester?.name || null, programs: programReports });
+  res.json({ current_semester: targetSemester?.name || null, programs: programReports });
 });
 
 module.exports = { getInstructorGradeReport, sendGradeReport, sendGradingSheet, notifyGradingSheetSent, forwardGradingSheetToAdmin, verifyDocument, returnToChairperson, returnToFaculty, sendApprovedGradeSheet, getAdminGradesReport, getChairpersonReport };

@@ -830,7 +830,52 @@ const resolveCompletedINCs = async (classId) => {
   return completed;
 };
 
+// The Final Grade of each student in a class, worked out from its Class
+// Record — { [studentId]: { average, status } } — for every student whose
+// Midterm AND Finals are both completely scored. Empty when the class has no
+// components in both periods. The same rule saveScores applies (combinedGWA:
+// the true average of both periods' exact composites, converted once), so
+// anything else that saves a grade row can keep that figure instead of
+// replacing it with a plain (Midterm + Finals) / 2.
+const classRecordFinalGrades = async (cls) => {
+  const components = await GradeComponent.findAll({
+    where: { class_id: cls.id },
+    include: [{ model: ComponentItem, as: 'items', separate: true, order: [['order_index', 'ASC']] }],
+  });
+  const midtermComps = components.filter((c) => c.period === 'Midterm');
+  const finalsComps = components.filter((c) => c.period === 'Finals');
+  if (midtermComps.length === 0 || finalsComps.length === 0) return {};
+  const rateFormula = getRateFormula(cls);
+  const itemIds = components.flatMap((c) => c.items.map((i) => i.id));
+  const scores = itemIds.length ? await ComponentScore.findAll({ where: { item_id: itemIds } }) : [];
+  const byStudent = {};
+  scores.forEach((s) => {
+    if (!byStudent[s.student_id]) byStudent[s.student_id] = {};
+    byStudent[s.student_id][s.item_id] = s.score !== null ? parseFloat(s.score) : null;
+  });
+  const compositeOf = (periodComps, studentScores) => {
+    let composite = 0;
+    for (const comp of periodComps) {
+      if (comp.items.length === 0) return null;
+      if (!comp.items.every((i) => studentScores[i.id] !== null && studentScores[i.id] !== undefined)) return null;
+      const rates = comp.items.map((i) => itemRate(studentScores[i.id], i.max_score, i.is_rate_direct, rateFormula));
+      composite += (rates.reduce((sum, r) => sum + r, 0) / rates.length) * (parseFloat(comp.weight) / 100);
+    }
+    return composite;
+  };
+  const out = {};
+  Object.entries(byStudent).forEach(([studentId, studentScores]) => {
+    const mid = compositeOf(midtermComps, studentScores);
+    const fin = compositeOf(finalsComps, studentScores);
+    if (mid === null || fin === null) return;
+    const average = combinedGWA(mid, fin);
+    out[studentId] = { average, status: average >= 1.0 && average <= 3.01 ? 'Passed' : 'Failed' };
+  });
+  return out;
+};
+
 module.exports = {
+  classRecordFinalGrades,
   getComponents,
   saveComponents,
   getScores,

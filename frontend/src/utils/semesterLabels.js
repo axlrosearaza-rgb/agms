@@ -10,12 +10,12 @@ import { getToken } from '../services/authStorage';
 import socket from '../services/socket';
 import toast from 'react-hot-toast';
 
-const DEFAULT_LABEL = 'Academic Year';
+const DEFAULT_LABEL = 'School Year';
 
-// "Academic Year" → A.Y. / AY; "School Year" → S.Y. / SY.
+// "School Year" → S.Y. / SY; "Academic Year" → A.Y. / AY.
 export const yearLabelOf = (semester) => semester?.year_label || DEFAULT_LABEL;
-export const yearAbbrOf = (semester) => (yearLabelOf(semester) === 'School Year' ? 'S.Y.' : 'A.Y.');
-export const yearShortOf = (semester) => (yearLabelOf(semester) === 'School Year' ? 'SY' : 'AY');
+export const yearAbbrOf = (semester) => (yearLabelOf(semester) === 'Academic Year' ? 'A.Y.' : 'S.Y.');
+export const yearShortOf = (semester) => (yearLabelOf(semester) === 'Academic Year' ? 'AY' : 'SY');
 
 let semesters = null;
 let inflight = null;

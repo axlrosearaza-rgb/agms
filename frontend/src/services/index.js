@@ -25,6 +25,8 @@ export const userService = {
   importAdvisoryList: (section, students, rowOffset = 0) => api.post('/users/my-advisory/import', { ...section, students, row_offset: rowOffset }, { timeout: 5 * 60 * 1000 }),
   setAdvisory: (id, data) => api.put(`/users/${id}/advisory`, data),
   importAdvisories: (data) => api.post('/users/advisories/import', data),
+  // Past advisers and the advisees they had.
+  getAdviserArchive: () => api.get('/users/advisers/archive'),
   create: (data) => api.post('/users', data),
   checkStudentNos: (studentNos, names = []) => api.post('/users/check-student-nos', { student_nos: studentNos, names }),
   update: (id, data) => api.put(`/users/${id}`, data),
@@ -43,6 +45,8 @@ export const subjectService = {
   create: (data) => api.post('/subjects', data),
   update: (id, data) => api.put(`/subjects/${id}`, data),
   archive: (id, archived = true) => api.put(`/subjects/${id}/archive`, { archived }),
+  importMany: (data) => api.post('/subjects/import', data),
+  archiveCurriculum: (program, curriculum_year, archived = true) => api.put('/subjects/curriculum/archive', { program, curriculum_year, archived }),
 };
 
 // ============ CLASS SERVICE ============
@@ -119,8 +123,8 @@ export const reportService = {
   returnToChairperson: (classId, message) => api.post(`/reports/return-to-chairperson/${classId}`, { message }),
   returnToFaculty: (classId, message) => api.post(`/reports/return-to-faculty/${classId}`, { message }),
   sendApprovedGradeSheet: (classId) => api.post(`/reports/send-approved-grade-sheet/${classId}`),
-  getAdminGradesReport: () => api.get('/reports/admin'),
-  getChairpersonReport: () => api.get('/reports/chairperson'),
+  getAdminGradesReport: (params) => api.get('/reports/admin', { params }),
+  getChairpersonReport: (params) => api.get('/reports/chairperson', { params }),
 };
 
 // ============ PROMOTION SERVICE ============
@@ -164,6 +168,7 @@ export const accountSetupService = {
   setPassword: (newPassword, confirmPassword) => api.post('/account-setup/password', { newPassword, confirmPassword }),
   requestEmailCode: (email) => api.post('/account-setup/email/request', { email }),
   confirmEmailCode: (code) => api.post('/account-setup/email/confirm', { code }),
+  skipEmail: () => api.post('/account-setup/email/skip'),
   getStatus: () => api.get('/account-setup/status'),
   declareStatus: (student_status, student_type) => api.post('/account-setup/status', { student_status, student_type }),
   getClassConfirmations: () => api.get('/account-setup/class-confirmations'),

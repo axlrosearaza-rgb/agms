@@ -1266,7 +1266,9 @@ const writePeriodSection = (ws, tableStartRow, comps, studentGrades, componentSc
 // time from whatever this class's own components actually are, since every
 // subject's own grading scheme is different (see the comment on SSU_TEMPLATE
 // above) and a fixed-shape template file can't adapt to that.
-async function exportUsingGeneratedLayout(classData, components, studentGrades, componentScores) {
+// Returns the ExcelJS workbook — the Export button saves it as .xlsx and the
+// in-app preview (pages/common/ClassRecordView.js) draws this same workbook.
+async function buildGeneratedWorkbook(classData, components, studentGrades, componentScores) {
   const midComps = [...components.filter((c) => c.period === 'Midterm')].sort((a, b) => a.order_index - b.order_index);
   const finComps = [...components.filter((c) => c.period === 'Finals')].sort((a, b) => a.order_index - b.order_index);
 
@@ -1456,10 +1458,7 @@ async function exportUsingGeneratedLayout(classData, components, studentGrades, 
         cell.font = { size: 9, name: 'Arial', bold: true };
         cell.alignment = { horizontal: align, vertical: 'middle', wrapText: false, shrinkToFit: false };
       };
-      // The official Class Record writes the year level in Roman numerals
-      // ("BSIT I-Z"), not the plain digit this system stores (1-4).
-      const ROMAN_YEARS = { 1: 'I', 2: 'II', 3: 'III', 4: 'IV', 5: 'V' };
-      const yearLabel = classData?.year_level ? (ROMAN_YEARS[parseInt(classData.year_level, 10)] || String(classData.year_level)) : null;
+      const yearLabel = classData?.year_level ? String(classData.year_level) : null;
       const courseYearParts = [programShortLabel(classData?.subject?.program), yearLabel].filter(Boolean);
       let courseYearSection = courseYearParts.join(' ');
       if (classData?.section) courseYearSection += (courseYearSection ? '-' : '') + classData.section;
@@ -1505,7 +1504,7 @@ async function exportUsingGeneratedLayout(classData, components, studentGrades, 
 
       infoField(7, infoStartCol, midSplitCol, row7Fields[0]);
       infoField(7, midSplitCol + 1, infoEndCol, row7Fields[1]);
-      infoField(7, col3StartCol, endCol, `${classData?.yearAbbr || 'A.Y.'} ${academicYear}`);
+      infoField(7, col3StartCol, endCol, `${classData?.yearAbbr || 'S.Y.'} ${academicYear}`);
 
       infoField(8, infoStartCol, midSplitCol, row8Fields[0]);
       infoField(8, midSplitCol + 1, infoEndCol, row8Fields[1]);
@@ -1595,14 +1594,24 @@ async function exportUsingGeneratedLayout(classData, components, studentGrades, 
       }
     }
 
-    const buffer = await workbook.xlsx.writeBuffer();
-    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    saveAs(blob, `${classData?.subject?.code || 'class'}_ClassRecord.xlsx`);
-    toast.success('Exported to Excel!');
+    return workbook;
   } catch (err) {
-    console.error(err);
-    toast.error('Failed to export to Excel');
+    console.error('Class Record workbook could not be built:', err);
+    throw err;
   }
+}
+
+// The Class Record workbook for a class, exactly as it is exported. Returns
+// null when the class has no components set up yet.
+export async function buildClassRecordWorkbook({ classData, components, studentGrades, componentScores }) {
+  const hasAnyComponents = components.some((c) => c.period === 'Midterm') || components.some((c) => c.period === 'Finals');
+  if (!hasAnyComponents) return null;
+  // Alphabetical by surname — same order the Grade Sheet uses, so the file
+  // never lists students in whatever order they were enrolled.
+  const sortedGrades = studentGrades.slice().sort((a, b) => comparePeopleNames(a.student, b.student));
+  // "A.Y." or "S.Y." — this class's own semester label (Semester Management).
+  const yearAbbr = yearAbbrOf(await getSemesterFor(classData?.semester));
+  return buildGeneratedWorkbook({ ...classData, yearAbbr }, components, sortedGrades, componentScores);
 }
 
 // ====== Excel Export — entry point ======
@@ -1613,17 +1622,18 @@ async function exportUsingGeneratedLayout(classData, components, studentGrades, 
 // from this class's own actual components — the ones its own subject has
 // been set up with.
 export async function exportClassRecordToExcel({ classData, components, studentGrades, componentScores }) {
-  const hasAnyComponents = components.some((c) => c.period === 'Midterm') || components.some((c) => c.period === 'Finals');
-  if (!hasAnyComponents) {
-    toast.error('This class has no Class Record components set up yet.');
-    return;
+  try {
+    const workbook = await buildClassRecordWorkbook({ classData, components, studentGrades, componentScores });
+    if (!workbook) {
+      toast.error('This class has no Class Record components set up yet.');
+      return;
+    }
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    saveAs(blob, `${classData?.subject?.code || 'class'}_ClassRecord.xlsx`);
+    toast.success('Exported to Excel!');
+  } catch (err) {
+    toast.error('Failed to export to Excel');
   }
-  // Alphabetical by surname — same order the on-screen Class Record
-  // (ClassRecordView.js) and the Grade Sheet export already use, so the
-  // exported file never lists students in whatever order they were enrolled.
-  const sortedGrades = studentGrades.slice().sort((a, b) => comparePeopleNames(a.student, b.student));
-  // "A.Y." or "S.Y." — this class's own semester label (Semester Management).
-  const yearAbbr = yearAbbrOf(await getSemesterFor(classData?.semester));
-  await exportUsingGeneratedLayout({ ...classData, yearAbbr }, components, sortedGrades, componentScores);
 }
 

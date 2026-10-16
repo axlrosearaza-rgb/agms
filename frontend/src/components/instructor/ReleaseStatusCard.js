@@ -142,7 +142,10 @@ export default function ReleaseStatusCard({ classes, onOpenClass }) {
   const [openGroups, setOpenGroups] = useState({});
   const [preview, setPreview] = useState(null); // { cls, type: 'record' | 'sheet' }
 
-  const toggleGroup = (key, next) => setOpenGroups((prev) => ({ ...prev, [key]: next }));
+  const toggleGroup = (key, next) => setOpenGroups((prev) => ({
+    ...prev,
+    [key]: next !== undefined ? next : !prev[key]
+  }));
 
   // Every active class — including one just created that has no students
   // yet, so a new class shows up here right away.

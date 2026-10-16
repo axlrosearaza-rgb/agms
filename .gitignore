@@ -4,3 +4,6 @@ build/
 dist/
 .DS_Store
 *.log
+
+# Old local copy of the GitHub repo (has its own .git) — never part of the project
+/agms/

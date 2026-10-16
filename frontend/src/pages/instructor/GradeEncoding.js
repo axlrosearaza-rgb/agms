@@ -1283,7 +1283,22 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
     if (incomplete.length > 0) errors.push(`${incomplete.length} student${incomplete.length !== 1 ? 's have' : ' has'} incomplete grades: ${nameList(incomplete)}. Complete their scores, or mark them INC or Dropped.`);
     if (invalid.length > 0) errors.push(`${invalid.length} student${invalid.length !== 1 ? 's have' : ' has'} a grade outside 1.0–5.0: ${nameList(invalid)}.`);
 
-    const passed = active.filter((g) => isPassed(getAverage(g))).length;
+    // Passed / Failed here is judged on the SAME Final Grade the Grade Sheet
+    // tab, the Class Record and the exported Grade Sheet show — the true
+    // average of both periods' composites — not on a plain average of the two
+    // period grades, which can sit a tenth higher and wrongly read "Failed"
+    // for a student whose Final Grade is 3.0.
+    const finalGradeOf = (g) => {
+      if (isLapsedInc(g)) return 5.0;
+      const midC = hasComponents && midtermComps.length > 0 ? periodComposite(midtermComps, g.student.id, componentScores, rateFormula) : null;
+      const finC = hasComponents && finalsComps.length > 0 ? periodComposite(finalsComps, g.student.id, componentScores, rateFormula) : null;
+      const midShown = midC !== null ? gwaFromComposite(midC) : (g.midterm ? parseFloat(g.midterm) : null);
+      const finShown = finC !== null ? gwaFromComposite(finC) : (g.finals ? parseFloat(g.finals) : null);
+      if (midtermComps.length === 0) return finShown;
+      if (hasComponents) { const overall = overallComposite(midC, finC); return overall !== null ? gwaFromComposite(overall) : null; }
+      return finalGradeAverage(midShown, finShown);
+    };
+    const passed = active.filter((g) => isPassed(finalGradeOf(g) ?? getAverage(g))).length;
     return {
       errors,
       summary: {
@@ -1960,7 +1975,7 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
       const f = finComposite !== null ? gwaFromComposite(finComposite) : null;
       return { ...g, midterm: m !== null ? formatGrade(m) : g.midterm, finals: f !== null ? formatGrade(f) : g.finals };
     });
-    return exportGradingSheetDocx({ classData, studentGrades: rows });
+    return exportGradingSheetDocx({ classData, studentGrades: rows, components, componentScores });
   };
 
   // ====== Excel Export — entry point (shared with pages/common/ClassRecordView.js
@@ -3178,25 +3193,40 @@ export default function GradeEncoding({ classId: classIdProp, onBack } = {}) {
               <button className="btn btn-outline" onClick={() => setLeaveTarget(null)} disabled={savingScores}>Stay</button>
               <button
                 className="btn btn-gold"
-                disabled={savingScores}
+                disabled={savingScores || navigator.onLine === false}
+                title={navigator.onLine === false ? 'Saving needs an internet connection' : undefined}
                 onClick={async () => {
                   const target = leaveTarget;
                   setLeaveTarget(null);
                   if (await saveAllScores()) leaveNow(target);
                 }}
               >
-                <Icons.Save className="w-4 h-4" /> {savingScores ? 'Saving...' : 'Save All Scores & Leave'}
+                <Icons.Save className="w-4 h-4" /> {savingScores ? 'Saving...' : navigator.onLine === false ? 'Saving needs internet' : 'Save All Scores & Leave'}
               </button>
             </>
           }
         >
-          <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
-            <Icons.AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
-            <p className="text-sm text-amber-800">
-              You haven't clicked <b>Save All Scores</b> yet. Save the scores in this Class Record before going to another page —
-              unsaved scores don't count toward the students' grades (they stay only as a draft on this computer).
-            </p>
-          </div>
+          {navigator.onLine === false ? (
+            // Offline: saving is paused (services/api.js), so say what is
+            // really happening instead of asking for a save that can't go
+            // through. The typed scores are safe in this browser's draft.
+            <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+              <Icons.AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+              <p className="text-sm text-amber-800">
+                There is <b>no internet connection</b>, so these scores have <b>not been saved</b> to the server yet. They are kept on
+                this computer as a draft and will still be here when you come back to this class. Click <b>Save All Scores</b> once the
+                connection is back — until then they don't count toward the students' grades.
+              </p>
+            </div>
+          ) : (
+            <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+              <Icons.AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+              <p className="text-sm text-amber-800">
+                You haven't clicked <b>Save All Scores</b> yet. Save the scores in this Class Record before going to another page —
+                unsaved scores don't count toward the students' grades (they stay only as a draft on this computer).
+              </p>
+            </div>
+          )}
         </Modal>
       )}
 

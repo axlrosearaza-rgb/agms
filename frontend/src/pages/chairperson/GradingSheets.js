@@ -1,12 +1,13 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Icons, Avatar, Badge, SearchBar, LoadingSpinner, ConfirmDialog, FacultyProgramTags, ProgramBadge, Modal, ProgramDot, programShortLabel, comparePeopleNames, formatPersonName } from '../../components/common';
+import { Icons, Avatar, Badge, SearchBar, LoadingSpinner, ConfirmDialog, FacultyProgramTags, ProgramBadge, Modal, ProgramDot, programShortLabel, comparePeopleNames, formatPersonName, groupBySemester } from '../../components/common';
 import { classService, reportService, userService, dashboardService } from '../../services';
 import toast from 'react-hot-toast';
 import { usePageState } from '../../hooks/usePageState';
 import { onGradesUpdated } from '../../services/socket';
 import { EncodingProgress } from '../../components/common/FacultyProgressRow';
 import { useAuth } from '../../context/AuthContext';
+import FloatingPanel from '../../components/common/FloatingPanel';
 
 // Mirrors Admin's Grade Approval page (same filter bar, grouped containers,
 // and inline preview-modal pattern) since both pages are two ends of the
@@ -411,9 +412,10 @@ export default function GradingSheets() {
   const facultyPassed = (f) => { const rc = realClasses(f); return rc.length > 0 && rc.every((c) => verifiedClassIds.has(c.class_id)); };
   const facultyPassedCount = facultyList.filter(facultyPassed).length;
 
-  const totalDoneClasses = classes.filter((c) => c.chairperson_verified || (c.class_record_verified && c.grade_sheet_verified)).length;
-  const totalPendingRecordClasses = classes.filter((c) => !c.class_record_verified).length;
-  const totalPendingSheetClasses = classes.filter((c) => !c.grade_sheet_verified).length;
+  const activeClassesList = classes.filter((c) => !isArchived(c));
+  const totalDoneClasses = activeClassesList.filter((c) => c.chairperson_verified || (c.class_record_verified && c.grade_sheet_verified)).length;
+  const totalPendingRecordClasses = activeClassesList.filter((c) => !c.class_record_verified).length;
+  const totalPendingSheetClasses = activeClassesList.filter((c) => !c.grade_sheet_verified).length;
 
   const facultyPartTime = facultyList.filter((f) => f.instructor.employment_type === 'Part Time');
   const facultyFullTime = facultyList.filter((f) => f.instructor.employment_type !== 'Part Time');
@@ -1015,7 +1017,7 @@ export default function GradingSheets() {
       </div>
 
       {filtered.length === 0 ? (
-        <div className="card text-center py-14 text-gray-400 text-sm">
+        <div className="card text-center py-14 text-gray-400 text-sm mb-6">
           <Icons.FileText className="w-8 h-8 mx-auto mb-2 opacity-30" />
           {hasActiveFilters ? (
             <>
@@ -1032,7 +1034,7 @@ export default function GradingSheets() {
           behind its own collapsed toggle instead of a permanently-visible
           section, since most visits have nothing to do here. */}
       {archivedList.length > 0 && (
-        <div className="card overflow-hidden mb-5">
+        <div className="card overflow-hidden mt-6 mb-6">
           <button
             onClick={() => setShowArchived((v) => !v)}
             className="w-full px-5 py-3.5 flex items-center justify-between border-none cursor-pointer font-sans text-white transition-colors bg-gray-400 hover:bg-gray-500"
@@ -1053,9 +1055,27 @@ export default function GradingSheets() {
               otherwise have a single Year bucket silently span several
               programs with no way to tell them apart short of opening every
               section underneath. */}
-          {showArchived && (() => {
+          {showArchived && groupBySemester(archivedList).map(({ semester, list: semesterClasses }) => {
+            // SEMESTER first — every archived class sits under the semester it
+            // belongs to (a semester's classes are all archived when it ends).
+            const semesterKey = `archived-semester|${semester}`;
+            const semesterOpen = !!openGroups[semesterKey];
+            return (
+              <div key={semester} className="border-t border-gray-200">
+                <button
+                  onClick={() => toggleGroup(semesterKey)}
+                  className="w-full px-5 py-3 flex items-center justify-between border-none cursor-pointer font-sans bg-navy/5 hover:bg-navy/10 transition-colors"
+                >
+                  <div className="flex items-center gap-2.5">
+                    <Icons.Clock className="w-4 h-4 text-navy" />
+                    <span className="text-sm font-bold text-navy">{semester}</span>
+                    <span className="text-xs text-gray-500">{semesterClasses.length} class{semesterClasses.length !== 1 ? 'es' : ''}</span>
+                  </div>
+                  {semesterOpen ? <Icons.ChevronUp className="w-4 h-4 text-gray-500" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-500" />}
+                </button>
+          {semesterOpen && (() => {
             const byProgram = {};
-            archivedList.forEach((c) => {
+            semesterClasses.forEach((c) => {
               const program = c.subject?.program || 'No Program';
               if (!byProgram[program]) byProgram[program] = [];
               byProgram[program].push(c);
@@ -1065,7 +1085,7 @@ export default function GradingSheets() {
               <div className="border-t border-gray-100">
                 {programKeys.map((program) => {
                   const programClasses = byProgram[program];
-                  const programKey = `archived|${program}`;
+                  const programKey = `archived|${semester}|${program}`;
                   const programOpen = !!openGroups[programKey];
                   const years = groupByYearSection(programClasses);
                   const yearKeys = Object.keys(years).sort((a, b) => (a === '—' ? 1 : b === '—' ? -1 : a - b));
@@ -1164,6 +1184,9 @@ export default function GradingSheets() {
               </div>
             );
           })()}
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -1177,25 +1200,18 @@ export default function GradingSheets() {
           onClose={closePreview}
           size="max-w-[98vw]"
           footer={
-            showReturnForm ? (
-              <>
-                <button className="btn btn-outline" onClick={() => setShowReturnForm(false)} disabled={returning}>Cancel</button>
-                <button className="btn btn-red" onClick={() => setConfirmReturn(true)} disabled={returning || !returnMessage.trim()}>
-                  <Icons.Send className="w-4 h-4" /> {returning ? 'Sending...' : 'Send Back'}
-                </button>
-              </>
-            ) : (
+            (
               <>
                 {previewVerified ? (
                   <Badge variant="green"><Icons.Check className="w-3 h-3" /> Verified</Badge>
                 ) : previewHasSubmissions ? (
-                  <button className="btn btn-gold" onClick={() => setApproveTarget({ cls: preview.cls, type: preview.type })} disabled={approving} title={`Approve the ${previewDoc.label}`}>
+                  <button className="btn btn-gold" onClick={() => setApproveTarget({ cls: preview.cls, type: preview.type })} disabled={approving || showReturnForm} title={showReturnForm ? 'Not available while you are returning this class to the Faculty' : `Approve the ${previewDoc.label}`}>
                     <Icons.Check className="w-4 h-4" /> Approve
                   </button>
                 ) : (
                   <span className="text-xs text-gray-400 italic">Nothing submitted yet</span>
                 )}
-                {!preview.cls.chairperson_verified && (
+                {!preview.cls.chairperson_verified && !showReturnForm && (
                   <button
                     className="btn btn-outline !text-red-500 !border-red-200 hover:!bg-red-50"
                     onClick={() => { setReturnMessage(preview.cls.admin_return_reason || ''); setShowReturnForm(true); }}
@@ -1207,13 +1223,37 @@ export default function GradingSheets() {
             )
           }
         >
-          {showReturnForm ? (
-            <div>
-              <p className="text-[13px] text-gray-500 mb-3">
-                This sends BOTH the Class Record and Grade Sheet back to {preview.cls.instructor?.name ? formatPersonName(preview.cls.instructor.name) : 'the faculty'} for
-                revision — they always move together. Every grade unlocks for editing, and once resubmitted it goes through
-                Chairperson and Admin review again from the start.
-              </p>
+            <iframe
+              key={`${preview.cls.id}-${preview.type}`}
+              src={`${previewDoc.path}/${preview.cls.id}?preview=1`}
+              title="Document preview"
+              style={{ width: '100%', height: 'calc(90vh - 200px)', minHeight: 360, border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
+            />
+        </Modal>
+      )}
+
+      {/* RETURN TO FACULTY — a small window that floats over the preview and
+          can be dragged out of the way, so the Class Record or Grade Sheet
+          stays visible while the reason is typed. Hidden while the final
+          "Send back?" confirmation is up; what was typed is kept. */}
+      {preview && showReturnForm && !confirmReturn && (
+        <FloatingPanel
+          title={`Return to Faculty — ${preview.cls.subject?.code || ''}${preview.cls.section ? ` Sec ${preview.cls.section}` : ''}`}
+          onClose={() => setShowReturnForm(false)}
+          footer={(
+            <>
+              <button className="btn btn-outline btn-sm" onClick={() => setShowReturnForm(false)} disabled={returning}>Cancel</button>
+              <button className="btn btn-red btn-sm" onClick={() => setConfirmReturn(true)} disabled={returning || !returnMessage.trim()}>
+                <Icons.Send className="w-4 h-4" /> {returning ? 'Sending...' : 'Send Back'}
+              </button>
+            </>
+          )}
+        >
+          <p className="text-[12px] text-gray-500 mb-3">
+            This sends BOTH the Class Record and Grade Sheet back to {preview.cls.instructor?.name ? formatPersonName(preview.cls.instructor.name) : 'the faculty'} for
+            revision — they always move together. Every grade unlocks for editing, and once resubmitted it goes through
+            Chairperson and Admin review again from the start.
+          </p>
               <label className="form-label">What needs to be revised? <span className="text-red-500">*</span></label>
               <textarea
                 className="form-input"
@@ -1223,16 +1263,7 @@ export default function GradingSheets() {
                 placeholder="e.g. Grade for student X looks incorrect — please double-check the Midterm score."
                 autoFocus
               />
-            </div>
-          ) : (
-            <iframe
-              key={`${preview.cls.id}-${preview.type}`}
-              src={`${previewDoc.path}/${preview.cls.id}?preview=1`}
-              title="Document preview"
-              style={{ width: '100%', height: 'calc(90vh - 200px)', minHeight: 360, border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
-            />
-          )}
-        </Modal>
+        </FloatingPanel>
       )}
 
       {confirmReturn && (

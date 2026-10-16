@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
-import { Icons, Avatar, Badge, StatCard, LoadingSpinner, ConfidentialityBanner, CurrentSemesterTag, studentYearSectionsLabel, studentCurrentYearSectionLabel, ConfirmDialog, studentTypeLabel } from '../../components/common';
+import { Icons, Avatar, Badge, StatCard, LoadingSpinner, ConfidentialityBanner, CurrentSemesterTag, studentYearSectionsLabel, studentCurrentYearSectionLabel, ConfirmDialog, studentTypeLabel, formatPersonNameFirstLast } from '../../components/common';
 import { SubjectsTakingSection } from '../../components/student/EnrollmentPanel';
 import RetakeSubjectsCard from '../../components/student/RetakeSubjectsCard';
 import { gradeService, subjectService, userService, studentEnrollmentService } from '../../services';
@@ -124,6 +124,15 @@ export default function StudentDashboard() {
               )}
               <CurrentSemesterTag className="!bg-white/10 !text-white" />
             </div>
+            {/* The adviser of the student's own program, year and section
+                (assigned by the Admin) — comes with the prospectus. */}
+            <p className="text-[13px] mt-2 flex items-center gap-1.5">
+              <Icons.Users className="w-3.5 h-3.5 opacity-80" />
+              <span className="opacity-75">Adviser:</span>
+              {data?.adviser?.name
+                ? <span className="font-semibold">{formatPersonNameFirstLast(data.adviser.name)}</span>
+                : <span className="opacity-75 italic">not yet assigned</span>}
+            </p>
             {user?.student_status === 'Irregular' && user?.irregular_sections?.length > 1 && (() => {
               // Same fallback studentCurrentYearSectionLabel uses — legacy
               // accounts with no is_current on any pair treat the first as

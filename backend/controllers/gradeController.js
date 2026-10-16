@@ -1,7 +1,7 @@
 const { emitGradesUpdated } = require('../utils/realtime');
 const { cached } = require('../utils/responseCache');
 const { USER_SECRET_FIELDS } = require('../utils/userFields');
-const { Grade, Class, Subject, User, Enrollment, GradeComponent, ComponentItem, ComponentScore } = require('../models');
+const { Grade, Class, Subject, User, Enrollment, GradeComponent, ComponentItem, ComponentScore, Semester } = require('../models');
 const { Op } = require('sequelize');
 const { logActivity } = require('../utils/activityLogger');
 const { asyncHandler } = require('../middleware/errorHandler');
@@ -12,7 +12,7 @@ const { actsAsInstructor } = require('../utils/teachingAuth');
 // directly would leave it silently sitting there until the recipient's next
 // page load/manual refresh, with no live badge update or sound at all.
 const { createNotification } = require('./notificationController');
-const { resolveCompletedINCs } = require('./gradeComponentController');
+const { resolveCompletedINCs, classRecordFinalGrades } = require('./gradeComponentController');
 
 // Grades only go out to students after BOTH sign-offs: the Chairperson's
 // verification (chairperson_verified) AND Admin's approval of both documents
@@ -116,6 +116,9 @@ const encodeGrades = asyncHandler(async (req, res) => {
   }
 
   const results = [];
+  // A class with a Class Record: the Final Grade and Passed/Failed come from
+  // the record's scores, not from averaging the two period grades sent here.
+  const fromRecord = await classRecordFinalGrades(cls);
 
   for (const g of grades) {
     const { student_id, midterm, finals } = g;
@@ -149,7 +152,17 @@ const encodeGrades = asyncHandler(async (req, res) => {
       grade.midterm = midterm;
       grade.finals = finals;
       grade.is_draft = true;
-      await grade.save(); // beforeSave hook will auto-compute average & status
+    }
+
+    const recordGrade = fromRecord[student_id];
+    if (recordGrade && grade.status !== 'INC' && grade.status !== 'DRP') {
+      // Keep the Class Record's own Final Grade (the hook's plain average can
+      // differ from it by a tenth, enough to flip Passed/Failed at 3.0).
+      grade.average = recordGrade.average;
+      grade.status = recordGrade.status;
+      await grade.save({ skipAutoAverage: true });
+    } else if (!created) {
+      await grade.save(); // no Class Record: the hook computes average & status
     }
 
     results.push(grade);
@@ -888,7 +901,7 @@ const getStudentProspectus = asyncHandler(async (req, res) => {
   // query on this page — so it's fetched once and shared, not once per student
   // (every student opening My Grades ran their own copy). Dropped the moment a
   // subject is edited (see utils/responseCache.js TAGS_BY_PREFIX).
-  const subjects = await cached(`curriculum:${student.program}`, { ttlMs: 60000, tags: ['classes'] }, () => Subject.findAll({
+  const programSubjects = await cached(`curriculum:${student.program}`, { ttlMs: 60000, tags: ['classes'] }, () => Subject.findAll({
     where: { program: student.program },
     include: [
       { model: Subject, as: 'prerequisites', through: { attributes: [] }, attributes: ['id', 'code'] },
@@ -902,6 +915,11 @@ const getStudentProspectus = asyncHandler(async (req, res) => {
     include: [{ model: Class, as: 'class' }],
   });
   const enrolledSubjectIds = new Set(enrollments.filter((e) => e.class).map((e) => e.class.subject_id));
+  // The student's own curriculum (utils/studentCurriculum.js) — plus any
+  // subject of another curriculum they were actually enrolled in, so a grade
+  // is never left off the prospectus.
+  const { followsCurriculum } = require('../utils/studentCurriculum');
+  const subjects = programSubjects.filter((s) => followsCurriculum(s, student) || enrolledSubjectIds.has(s.id));
 
   const isSetup = !!student.account_setup_at;
 
@@ -1010,21 +1028,31 @@ const getGradeDistribution = asyncHandler(async (req, res) => {
   // filter option. Both are now accepted (and returned together below) so
   // the dropdown can offer real Academic Year + Semester combinations.
   const { semester, academic_year } = req.query;
+  let filterSemester = semester;
+  let filterAcademicYear = academic_year;
+  if (!filterSemester && !filterAcademicYear) {
+    const currentSem = await Semester.findOne({ where: { is_current: true } });
+    if (currentSem) {
+      filterSemester = currentSem.name;
+    }
+  }
 
   // Admin sees the system-wide distribution; a Chairperson only sees their
   // own program(s) — otherwise this endpoint would leak other programs'
   // grades into what's meant to read as "my program's" chart.
   const classWhere = {};
-  if (semester) classWhere.semester = semester;
-  if (academic_year) classWhere.academic_year = academic_year;
+  if (filterSemester) classWhere.semester = filterSemester;
+  if (filterAcademicYear) classWhere.academic_year = filterAcademicYear;
   const classInclude = [{ model: Class, as: 'class', where: classWhere, attributes: ['semester', 'academic_year'] }];
   if (req.user.role === 'Chairperson') {
     classInclude[0].include = [{ model: Subject, as: 'subject', where: { program: { [Op.in]: req.user.programs || [] } }, attributes: [] }];
   }
 
+  // Only grades the Admin has RELEASED to the students count: the chart
+  // fills in by itself as each class is released, never earlier.
   const grades = await Grade.findAll({
-    where: { submitted: true },
-    include: (semester || academic_year || req.user.role === 'Chairperson') ? classInclude : undefined,
+    where: { released: true },
+    include: classInclude,
   });
 
   // One bar-slot per STUDENT, not per grade row — a student takes several

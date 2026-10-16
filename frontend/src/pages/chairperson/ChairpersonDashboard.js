@@ -11,6 +11,7 @@ import ArchivedActivitiesModal from '../../components/common/ArchivedActivitiesM
 import FacultyProgressRow from '../../components/common/FacultyProgressRow';
 import StudentGradeRecordModal from '../../components/common/StudentGradeRecordModal';
 import socket, { onGradesUpdated } from '../../services/socket';
+import { onSemestersUpdated } from '../../utils/semesterLabels';
 
 // Excluded from grouping (same as UserManagement.js / AdminDashboard.js) — GE
 // is a bonus tag every program's faculty can carry, not a program of its own.
@@ -92,6 +93,8 @@ export default function ChairpersonDashboard() {
   const [irregYearFilter, setIrregYearFilter] = useState('');
   const [irregSectionFilter, setIrregSectionFilter] = useState('');
   const [irregSearch, setIrregSearch] = useState('');
+  // Which list the card shows: 'Regular' or 'Irregular' students.
+  const [statusTab, setStatusTab] = usePageState('ChairpersonDashboard.statusTab', 'Regular');
   // A student's full prospectus with grades (Chairperson of their program can view it).
   const [prospectusTarget, setProspectusTarget] = useState(null);
   // Starts collapsed — usePageState (not plain useState) so navigating away
@@ -122,6 +125,11 @@ export default function ChairpersonDashboard() {
   // everything from the real REST endpoints the moment a (re)connection
   // actually lands — same fix Messages.js already applies to its own
   // conversation list on reconnect.
+  useEffect(() => {
+    const handler = () => loadData();
+    return onSemestersUpdated(handler);
+  }, []);
+
   useEffect(() => {
     const handler = () => loadData();
     socket.on('connect', handler);
@@ -167,13 +175,17 @@ export default function ChairpersonDashboard() {
   // already-filtered-to-Irregular set doesn't happen to touch every section.
   // Year uses a fixed 1-4 tab row instead (see below), so it needs no such
   // derived list.
-  const irregSectionOptions = [...new Set(irregularStudents.map((s) => s.section).filter(Boolean))].sort();
-  const filteredIrregularStudents = irregularStudents.filter((s) =>
+  const regularStudents = data?.students?.filter((s) => s.student_status !== 'Irregular') || [];
+  // The Regular / Irregular card lists one group at a time (statusTab); the
+  // Year tabs, Section filter and search apply to whichever is shown.
+  const showingIrregular = statusTab === 'Irregular';
+  const statusList = showingIrregular ? irregularStudents : regularStudents;
+  const irregSectionOptions = [...new Set(statusList.map((s) => s.section).filter(Boolean))].sort();
+  const matchesStatusFilters = (s) =>
     (!irregYearFilter || String(s.year_level) === irregYearFilter) &&
     (!irregSectionFilter || s.section === irregSectionFilter) &&
-    (!irregSearch.trim() || s.name?.toLowerCase().includes(irregSearch.trim().toLowerCase()) || s.student_no?.includes(irregSearch.trim()))
-  );
-  const regularStudents = data?.students?.filter((s) => s.student_status !== 'Irregular') || [];
+    (!irregSearch.trim() || s.name?.toLowerCase().includes(irregSearch.trim().toLowerCase()) || s.student_no?.includes(irregSearch.trim()));
+  const filteredIrregularStudents = statusList.filter(matchesStatusFilters);
 
   // "Submitted Grades by Status" — one bucket per STUDENT (not per grade
   // row), matching how the GWA Distribution chart above it already counts:
@@ -182,10 +194,13 @@ export default function ChairpersonDashboard() {
   // trouble" just because a student with 5 Passed classes and 1 Failed one
   // padded the Passed count five times. Students with no submitted grades
   // yet aren't counted either way — there's nothing to classify them by.
+  // Released grades only: a student is counted once the Admin has released
+  // their grades, same as the Admin's dashboard.
   const gradeStatusCounts = { Passed: 0, Failed: 0 };
   (data?.students || []).forEach((s) => {
-    if (!s.grades || s.grades.length === 0) return;
-    if ((s.failed_count || 0) > 0) gradeStatusCounts.Failed += 1;
+    const released = (s.grades || []).filter((g) => g.released);
+    if (released.length === 0) return;
+    if (released.some((g) => g.status === 'Failed')) gradeStatusCounts.Failed += 1;
     else gradeStatusCounts.Passed += 1;
   });
   const gradeStatusRows = Object.entries(gradeStatusCounts).map(([status, count]) => ({ status, count }));
@@ -381,21 +396,38 @@ export default function ChairpersonDashboard() {
         )}
       </div>
 
-      {/* Irregular Students */}
-      {irregularStudents.length > 0 && (
+      {/* Regular and Irregular Students — one card, a tab for each list. */}
+      {(regularStudents.length > 0 || irregularStudents.length > 0) && (
         <div className="card">
           <button
             onClick={() => setIrregularExpanded((prev) => !prev)}
             className="card-header w-full flex items-center justify-between gap-3 border-none bg-transparent cursor-pointer font-sans text-left"
           >
             <div>
-              <h3 className="text-base font-semibold text-navy">Irregular Students</h3>
-              <p className="text-xs text-gray-400 mt-0.5">Students in your program(s) currently flagged Irregular.</p>
+              <h3 className="text-base font-semibold text-navy">Regular and Irregular Students</h3>
+              <p className="text-xs text-gray-400 mt-0.5">
+                Students in your program(s): <span className="font-semibold text-green-600">{regularStudents.length} Regular</span> · <span className="font-semibold text-red-500">{irregularStudents.length} Irregular</span>
+              </p>
             </div>
             {irregularExpanded ? <Icons.ChevronUp className="w-4 h-4 text-gray-400 flex-shrink-0" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />}
           </button>
           {irregularExpanded && (
           <div className="card-body">
+            {/* Which list: Regular or Irregular. */}
+            <div className="flex flex-wrap gap-2 mb-3">
+              {[
+                { key: 'Regular', count: regularStudents.length, on: 'bg-green-600 text-white border-transparent', off: 'hover:border-green-300 hover:text-green-700' },
+                { key: 'Irregular', count: irregularStudents.length, on: 'bg-red-500 text-white border-transparent', off: 'hover:border-red-300 hover:text-red-600' },
+              ].map((t) => (
+                <button
+                  key={t.key}
+                  onClick={() => { setStatusTab(t.key); setIrregSectionFilter(''); }}
+                  className={`px-4 py-2 rounded-xl text-sm font-semibold cursor-pointer font-sans border transition-colors ${statusTab === t.key ? t.on : `bg-white text-gray-600 border-gray-200 ${t.off}`}`}
+                >
+                  {t.key} Students <span className={`ml-1 text-xs font-normal ${statusTab === t.key ? 'opacity-80' : 'text-gray-400'}`}>({t.count})</span>
+                </button>
+              ))}
+            </div>
             <div className="flex flex-wrap items-center gap-2 mb-4">
               {/* Year as tabs — "YEAR 1"/"YEAR 2"/... — rather than a dropdown,
                   so switching years is a single click and the current one is
@@ -407,7 +439,7 @@ export default function ChairpersonDashboard() {
                   key={y}
                   onClick={() => setIrregYearFilter(irregYearFilter === String(y) ? '' : String(y))}
                   className={`px-3.5 py-1.5 rounded-full text-xs font-semibold cursor-pointer font-sans border transition-colors
-                    ${irregYearFilter === String(y) ? 'bg-red-500 text-white border-transparent' : 'bg-white text-gray-600 border-gray-200 hover:border-red-300 hover:text-red-600'}`}
+                    ${irregYearFilter === String(y) ? 'bg-navy text-white border-transparent' : 'bg-white text-gray-600 border-gray-200 hover:border-gray-400'}`}
                 >
                   YEAR {y}
                 </button>
@@ -437,14 +469,14 @@ export default function ChairpersonDashboard() {
                 (index.css), and stacking a second, smaller max-h directly on
                 that same element fought over the box's height instead of
                 just capping it, leaving a large gap under a short list. */}
-            <div className="space-y-2 max-h-[280px] overflow-y-auto pr-1">
+            <div className="space-y-2 max-h-[360px] overflow-y-auto pr-1">
               {filteredIrregularStudents.length === 0 && (
-                <p className="text-center py-6 text-gray-400 text-sm">No Irregular students match this filter.</p>
+                <p className="text-center py-6 text-gray-400 text-sm">{statusList.length === 0 ? `No ${statusTab} students in your program(s).` : `No ${statusTab} students match this filter.`}</p>
               )}
               {filteredIrregularStudents.slice().sort(comparePeopleNames).map((s, idx) => (
-                <div key={s.id} className="flex items-center gap-3 p-3 border border-gray-100 rounded-lg hover:border-red-200 hover:bg-red-50/30 transition-colors">
+                <div key={s.id} className={`flex items-center gap-3 p-3 border border-gray-100 rounded-lg transition-colors ${showingIrregular ? 'hover:border-red-200 hover:bg-red-50/30' : 'hover:border-green-200 hover:bg-green-50/30'}`}>
                   <span className="text-xs font-semibold text-gray-400 w-5 flex-shrink-0 text-right">{idx + 1}.</span>
-                  <Avatar letter={s.name?.[0]} className="bg-red-500 text-white flex-shrink-0" size="w-8 h-8 text-xs" />
+                  <Avatar letter={s.name?.[0]} className={`${showingIrregular ? 'bg-red-500' : 'bg-green-600'} text-white flex-shrink-0`} size="w-8 h-8 text-xs" />
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-bold text-navy truncate">{formatPersonName(s.name)}</p>
                     <p className="text-xs text-gray-500">{s.student_no}</p>
@@ -457,7 +489,7 @@ export default function ChairpersonDashboard() {
                       </p>
                     )}
                   </div>
-                  <Badge variant="red" className="text-right whitespace-normal">{studentYearSectionsLabel(s)}</Badge>
+                  <Badge variant={showingIrregular ? 'red' : 'green'} className="text-right whitespace-normal">{studentYearSectionsLabel(s)}</Badge>
                   <button type="button" className="btn btn-outline btn-sm flex items-center gap-1 flex-shrink-0" onClick={() => setProspectusTarget(s)} title="View this student's prospectus with grades">
                     <Icons.FileText className="w-3.5 h-3.5" /> Prospectus
                   </button>

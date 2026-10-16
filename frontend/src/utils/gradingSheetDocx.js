@@ -21,7 +21,8 @@ import PizZip from 'pizzip';
 import Docxtemplater from 'docxtemplater';
 import { saveAs } from 'file-saver';
 import toast from 'react-hot-toast';
-import { remarksFor, remarksText, isLapsedInc, formatGrade } from './classRecordExcel';
+import { remarksFor, remarksText, isLapsedInc, formatGrade, periodComposite, gwaFromComposite, overallComposite, getRateFormula } from './classRecordExcel';
+import API from '../services/api';
 import { comparePeopleNames, formatPersonNameFirstLast, formatPersonNameCapsSurname } from '../components/common';
 import { getSemesterFor, yearShortOf } from './semesterLabels';
 
@@ -85,10 +86,43 @@ function splitSemester(classData) {
   return { term, ay };
 }
 
+// Builds the Grading Sheet .docx itself — the one file both the Export button
+// saves and the in-app preview (pages/common/GradingSheet.js) displays, so the
+// preview can never differ from what is exported.
 // `studentGrades` — same shape GradeEncoding's own loadData() builds:
 // [{ student: {student_no, name}, midterm, finals, status }, ...]
-export async function exportGradingSheetDocx({ classData, studentGrades }) {
-  try {
+// `components` / `componentScores` — the class's Class Record. Leave them out
+// and they are fetched here. With a Class Record, the Midterm and Final Grade
+// printed are computed from its scores (the same figures the Grade Sheet tab
+// shows), so they appear even before the grades are submitted and saved.
+// Returns { blob, pageCount, studentCount }.
+export async function buildGradingSheetDocx({ classData, studentGrades, components, componentScores }) {
+  {
+    let comps = components; let scores = componentScores;
+    if (!comps && classData?.id) {
+      try {
+        const [compRes, scoreRes] = await Promise.all([
+          API.get(`/grade-components/${classData.id}/components`),
+          API.get(`/grade-components/${classData.id}/scores`),
+        ]);
+        comps = compRes.data.components || []; scores = scoreRes.data.scores || {};
+      } catch (err) {
+        comps = []; scores = {}; // no Class Record to read: the saved grades are used
+      }
+    }
+    const midComps = (comps || []).filter((c) => c.period === 'Midterm');
+    const finComps = (comps || []).filter((c) => c.period === 'Finals');
+    const rateF = getRateFormula(classData);
+    // Midterm Grade and Final Grade straight off the Class Record — the same
+    // formula as the Grade Sheet tab: each period's exact composite, and the
+    // Final Grade from the true average of the two composites.
+    const liveOf = (g) => {
+      if (!midComps.length || !finComps.length || !g?.student?.id) return null;
+      const midC = periodComposite(midComps, g.student.id, scores || {}, rateF);
+      const finC = periodComposite(finComps, g.student.id, scores || {}, rateF);
+      const overall = overallComposite(midC, finC);
+      return { mid: midC !== null ? gwaFromComposite(midC) : null, final: overall !== null ? gwaFromComposite(overall) : null };
+    };
     // Alphabetical by LAST name (comparePeopleNames — Last, First order),
     // same as the Class Record roster (GradeEncoding.js/ClassRecordView.js),
     // not the raw "First Last" string — so the two documents never disagree
@@ -98,9 +132,6 @@ export async function exportGradingSheetDocx({ classData, studentGrades }) {
     // the last one padded out to a full page.
     const rowCount = Math.max(MIN_ROWS, Math.ceil(sorted.length / ROWS_PER_PAGE) * ROWS_PER_PAGE);
     const pageCount = rowCount / ROWS_PER_PAGE;
-    if (pageCount > 1) {
-      toast(`${sorted.length} students — the grading sheet runs to ${pageCount} pages (25 per page, each with its own header).`, { icon: 'ℹ️' });
-    }
 
     // "*** NOTHING FOLLOWS ***" on the row right after the last student (the
     // official form's convention) whenever the table has room for it; the
@@ -112,8 +143,10 @@ export async function exportGradingSheetDocx({ classData, studentGrades }) {
       }
       const g = sorted[i];
       if (!g) return { no: i + 1, student_id: '', name: '', midterm: '', finals: '', remarks: '' };
+      const live = (g.status === 'INC' || g.status === 'DRP') ? null : liveOf(g);
+      const midValue = live && live.mid !== null ? formatGrade(live.mid) : g.midterm;
       // INC not completed by its deadline → the recorded 5.0.
-      const avg = isLapsedInc(g) ? 5.0 : getAverage(g);
+      const avg = isLapsedInc(g) ? 5.0 : ((live && live.final !== null) ? live.final : getAverage(g));
       // Mirrors whatever the Class Record already has marked for this
       // student — an INC/DRP there shows the same here automatically.
       // INC only in the Midterm with the Finals complete: the FINALS column
@@ -141,7 +174,7 @@ export async function exportGradingSheetDocx({ classData, studentGrades }) {
           ? 'DROP'
           : (g.status === 'INC' && ((g.inc_midterm || g.inc_finals) ? g.inc_midterm : (g.midterm == null || g.midterm === '')))
             ? 'INC'
-            : (g.midterm != null && g.midterm !== '') ? g.midterm : '',
+            : (midValue != null && midValue !== '') ? midValue : '',
         // The form's "FINALS" column is the Final Grade for the whole term —
         // the (Midterm + Finals) / 2 average already computed above as `avg`
         // — not the raw Finals-period score, matching the Class Record's own
@@ -207,6 +240,16 @@ export async function exportGradingSheetDocx({ classData, studentGrades }) {
       type: 'blob',
       mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     });
+    return { blob, pageCount, studentCount: sorted.length };
+  }
+}
+
+export async function exportGradingSheetDocx({ classData, studentGrades, components, componentScores }) {
+  try {
+    const { blob, pageCount, studentCount } = await buildGradingSheetDocx({ classData, studentGrades, components, componentScores });
+    if (pageCount > 1) {
+      toast(`${studentCount} students — the grading sheet runs to ${pageCount} pages (25 per page, each with its own header).`, { icon: 'ℹ️' });
+    }
     saveAs(blob, `${classData?.subject?.code || 'class'}_GradingSheet.docx`);
     toast.success('Exported using the official SSU Grading Sheet format!');
   } catch (err) {

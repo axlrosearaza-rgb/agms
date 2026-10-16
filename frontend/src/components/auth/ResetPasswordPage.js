@@ -1,6 +1,9 @@
 import { useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { authService } from '../../services';
+import { Icons } from '../common';
+import ConstellationBg, { AuthGlow } from './ConstellationBg';
+import { checkPassword, isStrongPassword } from '../../utils/passwordRules';
 
 export default function ResetPasswordPage() {
   const [searchParams] = useSearchParams();
@@ -9,6 +12,12 @@ export default function ResetPasswordPage() {
 
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  // Show / hide each password box (the eye buttons).
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
+  const rules = checkPassword(password);
+  const strong = isStrongPassword(password);
+
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
@@ -21,8 +30,8 @@ export default function ResetPasswordPage() {
       setError('This reset link is missing its token. Please request a new one.');
       return;
     }
-    if (password.length < 8) {
-      setError('Password must be at least 8 characters.');
+    if (!strong) {
+      setError('Choose a stronger password — it must meet every rule below.');
       return;
     }
     if (password !== confirmPassword) {
@@ -44,6 +53,9 @@ export default function ResetPasswordPage() {
 
   return (
     <div style={styles.shell}>
+      {/* Same background as the Login page. */}
+      <ConstellationBg />
+      <AuthGlow />
       <div style={styles.card}>
         <p style={styles.eyebrow}>Account Recovery</p>
         <h2 style={styles.title}>Set a New Password</h2>
@@ -59,15 +71,38 @@ export default function ResetPasswordPage() {
         ) : (
           <form onSubmit={handleSubmit}>
             <label style={styles.label}>New Password</label>
-            <input
-              type="password" style={styles.input} placeholder="Min. 8 characters"
-              value={password} onChange={(e) => setPassword(e.target.value)} autoFocus
-            />
+            <div style={styles.field}>
+              <input
+                type={showPassword ? 'text' : 'password'} style={styles.inputWithEye} placeholder="Create a strong password"
+                value={password} onChange={(e) => setPassword(e.target.value)} autoFocus
+              />
+              <button type="button" style={styles.eye} onClick={() => setShowPassword((v) => !v)}
+                title={showPassword ? 'Hide password' : 'Show password'} aria-label={showPassword ? 'Hide password' : 'Show password'}>
+                {showPassword ? <Icons.EyeOff /> : <Icons.Eye />}
+              </button>
+            </div>
+            {/* What the password still needs — a rule disappears once it is
+                met, so nothing shows when the password is already strong. */}
+            {rules.some((r) => !r.ok) && (
+              <ul style={styles.rules}>
+                {rules.filter((r) => !r.ok).map((r) => (
+                  <li key={r.key} style={{ ...styles.rule, color: 'rgba(255,255,255,0.55)' }}>
+                    <span style={styles.ruleMark}>•</span>{r.label}
+                  </li>
+                ))}
+              </ul>
+            )}
             <label style={styles.label}>Confirm New Password</label>
-            <input
-              type="password" style={styles.input} placeholder="Re-enter password"
-              value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)}
-            />
+            <div style={styles.field}>
+              <input
+                type={showConfirm ? 'text' : 'password'} style={styles.inputWithEye} placeholder="Re-enter password"
+                value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)}
+              />
+              <button type="button" style={styles.eye} onClick={() => setShowConfirm((v) => !v)}
+                title={showConfirm ? 'Hide password' : 'Show password'} aria-label={showConfirm ? 'Hide password' : 'Show password'}>
+                {showConfirm ? <Icons.EyeOff /> : <Icons.Eye />}
+              </button>
+            </div>
             <button type="submit" style={styles.submit} disabled={loading}>
               {loading ? 'Resetting...' : 'Reset Password'}
             </button>
@@ -84,11 +119,12 @@ export default function ResetPasswordPage() {
 const styles = {
   shell: {
     minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
-    background: 'linear-gradient(135deg, #060d1c 0%, #0a1525 100%)', padding: 20, fontFamily: 'Inter, sans-serif',
+    background: '#060d1c', padding: 20, fontFamily: 'Inter, sans-serif', position: 'relative', overflow: 'hidden',
   },
   card: {
-    width: '100%', maxWidth: 420, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)',
-    borderRadius: 16, padding: '36px 32px', backdropFilter: 'blur(10px)',
+    width: '100%', maxWidth: 420, background: 'rgba(10, 20, 42, 0.78)', border: '1px solid rgba(255,255,255,0.1)',
+    borderRadius: 16, padding: '36px 32px', backdropFilter: 'blur(10px)', position: 'relative', zIndex: 1,
+    boxShadow: '0 24px 60px rgba(0,0,0,0.45)',
   },
   eyebrow: { fontSize: 11, fontWeight: 600, letterSpacing: 2.5, textTransform: 'uppercase', color: '#3ab8cc', marginBottom: 8 },
   title: { fontFamily: "'Playfair Display', serif", fontSize: 26, fontWeight: 700, color: '#fff', marginBottom: 8 },
@@ -97,6 +133,20 @@ const styles = {
   input: {
     width: '100%', padding: '12px 14px', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)',
     borderRadius: 10, fontSize: 13, color: 'rgba(255,255,255,0.9)', outline: 'none', fontFamily: 'inherit',
+  },
+  rules: { listStyle: 'none', margin: '10px 0 0', padding: 0, display: 'grid', gap: 3 },
+  rule: { fontSize: 12, display: 'flex', alignItems: 'center', gap: 7, transition: 'color 0.2s ease' },
+  ruleMark: { width: 12, textAlign: 'center', fontWeight: 700 },
+  // A password box with the show / hide (eye) button inside its right edge.
+  field: { position: 'relative' },
+  inputWithEye: {
+    width: '100%', padding: '12px 44px 12px 14px', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)',
+    borderRadius: 10, fontSize: 13, color: 'rgba(255,255,255,0.9)', outline: 'none', fontFamily: 'inherit',
+  },
+  eye: {
+    position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)', width: 34, height: 34,
+    display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'transparent', border: 'none',
+    borderRadius: 8, cursor: 'pointer', color: 'rgba(255,255,255,0.55)', padding: 0,
   },
   submit: {
     width: '100%', padding: 14, border: 'none', borderRadius: 12, fontSize: 13, fontWeight: 700,

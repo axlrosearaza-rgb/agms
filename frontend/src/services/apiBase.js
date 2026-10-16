@@ -2,10 +2,9 @@
 // live connection (socket.js).
 //
 //   1. REACT_APP_API_URL, when set: the frontend and backend live on
-//      different hosts (e.g. frontend on Vercel, backend on Render).
+//      different hosts.
 //   2. A production build with nothing set: the backend is served from the
-//      SAME domain under /api (Vercel services — see /vercel.json, which
-//      routes /api/* to the backend service and everything else here).
+//      SAME domain under /api.
 //   3. Local / LAN development: both run on this machine, so the backend is
 //      whatever host the browser used to load the page, on port 5000 — load
 //      the page via 192.168.x.x:3000 and it talks to 192.168.x.x:5000, via

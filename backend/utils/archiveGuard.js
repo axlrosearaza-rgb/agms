@@ -8,13 +8,10 @@ const { Semester } = require('../models');
 // null when the class is still running.
 async function archivedClassMessage(cls) {
   if (!cls) return null;
-  if (['Completed', 'Cancelled'].includes(cls.status)) {
-    return 'This class is archived — its class list, class record and grades are kept as they are and can\'t be changed. Restore the class first if it is still running.';
+  if (['Cancelled'].includes(cls.status)) {
+    return 'This class is cancelled and cannot be modified.';
   }
-  const semester = cls.semester ? await Semester.findOne({ where: { name: cls.semester }, attributes: ['status'] }) : null;
-  if (semester?.status === 'Completed') {
-    return `${cls.semester} has ended — this class is archived, so its class list, class record and grades are kept as they are and can't be changed.`;
-  }
+  // Classes from completed/ended semesters allow late grade encoding and submission.
   return null;
 }
 

@@ -51,6 +51,12 @@ export function clearAuth() {
   sessionStorage.removeItem(USER_KEY);
   sessionStorage.removeItem(LAST_ACTIVITY_KEY);
   sessionStorage.removeItem(LOCKED_KEY);
+  // The last-loaded copies of pages kept for when the internet is down
+  // (services/api.js) — never shown to whoever signs in next on this browser.
+  // Grade Encoding drafts are kept: they belong to the faculty's own account.
+  try {
+    Object.keys(localStorage).filter((k) => k.startsWith('agms.lastKnown.')).forEach((k) => localStorage.removeItem(k));
+  } catch (e) { /* storage blocked */ }
 }
 
 let lastRecordedActivity = 0;

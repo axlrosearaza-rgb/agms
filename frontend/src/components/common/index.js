@@ -39,6 +39,7 @@ export const Icons = {
   AlertTriangle: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>,
   // ✅ Added missing icons
   AlertCircle: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>,
+  Info: (p) => <svg {...p} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>,
   Clock: (p) => <svg {...p} width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
   Loader: (p) => <svg {...p} width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="animate-spin"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>,
   MessageSquare: (p) => <svg {...p} width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>,
@@ -664,6 +665,26 @@ export function ConfirmDialog({ title, message, onConfirm, onCancel, confirmText
 }
 
 // ============ GROUPING HELPERS ============
+// Archived classes by the semester they belong to (Class.semester, e.g.
+// "First Semester 2026-2027") — newest semester first: later academic year
+// first, and within a year Summer, then Second, then First Semester.
+const TERM_RANK = { first: 1, second: 2, summer: 3 };
+const semesterSortKey = (name = '') => {
+  const year = parseInt((String(name).match(/(\d{4})\s*-\s*\d{4}/) || [])[1], 10) || 0;
+  const term = TERM_RANK[String(name).trim().split(/\s+/)[0]?.toLowerCase()] || 0;
+  return year * 10 + term;
+};
+export function groupBySemester(list) {
+  const map = {};
+  (list || []).forEach((c) => {
+    const semester = c.semester || 'No Semester';
+    (map[semester] = map[semester] || []).push(c);
+  });
+  return Object.keys(map)
+    .sort((a, b) => (a === 'No Semester' ? 1 : b === 'No Semester' ? -1 : semesterSortKey(b) - semesterSortKey(a) || a.localeCompare(b)))
+    .map((semester) => ({ semester, list: map[semester] }));
+}
+
 export function groupByProgramYearSection(list) {
   const byProgram = {};
   (list || []).forEach((c) => {

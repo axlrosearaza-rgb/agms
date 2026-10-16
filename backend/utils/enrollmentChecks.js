@@ -12,6 +12,7 @@ const { Op } = require('sequelize');
 const { User, Enrollment, Class, Subject } = require('../models');
 const { createNotification } = require('../controllers/notificationController');
 const { logActivity } = require('./activityLogger');
+const { followsCurriculum } = require('./studentCurriculum');
 
 // 1 for a 1st-Semester name/label, 2 for 2nd, else null (Summer etc.).
 const semesterOrder = (text) => {
@@ -96,7 +97,7 @@ async function syncRegularity(app, studentIds, actorId = null) {
   if (!sem) return changed;
   const subjectSemester = TERM_TO_SUBJECT_SEMESTER[sem.term] || null;
 
-  const students = await User.findAll({ where: { id: { [Op.in]: ids }, role: 'Student', graduated_at: null }, attributes: ['id', 'name', 'program', 'year_level', 'section', 'student_status', 'declared_status', 'status_declared_semester'] });
+  const students = await User.findAll({ where: { id: { [Op.in]: ids }, role: 'Student', graduated_at: null }, attributes: ['id', 'name', 'program', 'curriculum_year', 'year_level', 'section', 'student_status', 'declared_status', 'status_declared_semester'] });
   const enrollments = await Enrollment.findAll({
     where: { student_id: { [Op.in]: ids } },
     attributes: ['student_id'],
@@ -117,7 +118,7 @@ async function syncRegularity(app, studentIds, actorId = null) {
   for (const key of pairs) {
     const [program, year] = key.split('|');
     required[key] = subjectSemester
-      ? (await Subject.findAll({ where: { program, year_level: Number(year), semester: subjectSemester }, attributes: ['id'] })).map((s) => s.id)
+      ? await Subject.findAll({ where: { program, year_level: Number(year), semester: subjectSemester }, attributes: ['id', 'curriculum_year'] })
       : [];
   }
 
@@ -152,7 +153,7 @@ async function syncRegularity(app, studentIds, actorId = null) {
     } else {
       const taking = new Set(classes.map((c) => c.subject_id));
       // Every subject of their own Year + this semester…
-      const complete = (required[`${s.program}|${s.year_level}`] || []).every((id) => taking.has(id));
+      const complete = (required[`${s.program}|${s.year_level}`] || []).filter((subj) => followsCurriculum(subj, s)).every((subj) => taking.has(subj.id));
       // …and nothing outside it: no back subject, no class of another
       // section / year, no advance (later-year) subject.
       const outside = classes.some((c) => isBackSubject(s, c) || isOtherSection(s, c) || Number(c.subject?.year_level) > Number(s.year_level));

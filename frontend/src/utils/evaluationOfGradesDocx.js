@@ -14,6 +14,7 @@ import PizZip from 'pizzip';
 import { saveAs } from 'file-saver';
 import toast from 'react-hot-toast';
 import { docxBlobToPdf } from './docxToPdf';
+import { applyGradeSheetHeaderFooter } from './gradeSheetLetterhead';
 import { programShortLabel, formatPersonName, formatPersonNameFirstLast } from '../components/common';
 import { gradeCellText, gradeCellColor, hrsOrDash, requisiteText, semesterSums } from '../components/student/ProspectusTable';
 
@@ -368,6 +369,8 @@ export async function exportEvaluationOfGradesDocx({ student, years, chairperson
           `</w:tblBorders><w:tblLayout w:type="fixed"/></w:tblPr>` +
           `<w:tblGrid><w:gridCol w:w="${colW}"/><w:gridCol w:w="${gapW}"/><w:gridCol w:w="${colW}"/></w:tblGrid>` +
           `<w:tr>${cell(run(evaluatedByLabelRPr, 'Evaluated By:'))}${gapCell}${cell(run(notedByLabelRPr, 'Noted By:'))}</w:tr>` +
+          // Two blank lines to sign on, above each printed name.
+          `<w:tr>${cell(run(notedByLabelRPr, ' '))}${gapCell}${cell(run(notedByLabelRPr, ' '))}</w:tr>`.repeat(2) +
           `<w:tr>${cell(adviserName ? run(nameRPr, adviserName) : run(blankLineRPr, '            '))}${gapCell}${cell(run(nameRPr, 'SWEET MERCY F. PACOLOR, DIT'))}</w:tr>` +
           `<w:tr>${cell(run(adviserRPr, 'Adviser'))}${gapCell}${cell(run(deanRPr, 'Dean, College of Arts and Sciences'))}</w:tr>` +
           `</w:tbl>`;
@@ -383,6 +386,7 @@ export async function exportEvaluationOfGradesDocx({ student, years, chairperson
           `</w:tblBorders><w:tblLayout w:type="fixed"/></w:tblPr>` +
           `<w:tblGrid><w:gridCol w:w="${colW}"/></w:tblGrid>` +
           `<w:tr>${cell(run(notedByLabelRPr, 'Verified By:'))}</w:tr>` +
+          `<w:tr>${cell(run(notedByLabelRPr, ' '))}</w:tr>`.repeat(2) +
           `<w:tr>${cell(chairpersonName ? run(nameRPr, chairpersonName) : run(blankLineRPr, '            '))}</w:tr>` +
           `<w:tr>${cell(run(deanRPr, chairpersonRole))}</w:tr>` +
           `</w:tbl>`;
@@ -483,14 +487,29 @@ export async function exportEvaluationOfGradesDocx({ student, years, chairperson
     }
 
     if (pdfNameTableXml) docXml = docXml.replace(NAME_LINE_PLACEHOLDER, pdfNameTableXml);
+    // The template's own rule line at the top of the first page (an empty
+    // paragraph with a bottom border) goes: the page header now carries the
+    // rule, the same one as on the Grade Slip, on every page.
+    {
+      const mark = '<w:pBdr><w:bottom w:color="000000" w:space="1" w:sz="12" w:val="single"/></w:pBdr>';
+      const at = docXml.indexOf(mark);
+      const title = docXml.indexOf('EVALUATION OF GRADES');
+      if (at >= 0 && (title < 0 || at < title)) {
+        const start = Math.max(docXml.lastIndexOf('<w:p>', at), docXml.lastIndexOf('<w:p ', at));
+        const end = docXml.indexOf('</w:p>', at);
+        if (start >= 0 && end > at && !/<w:t[ >]/.test(docXml.slice(start, end))) docXml = docXml.slice(0, start) + docXml.slice(end + 6);
+      }
+    }
     zip.file('word/document.xml', docXml);
+    // Same page header and footer as the faculty's Grade Sheet.
+    await applyGradeSheetHeaderFooter(zip);
 
     const blob = zip.generate({
       type: 'blob',
       mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     });
     const baseName = `${(student.student_no || student.name || 'Evaluation').replace(/\s+/g, '_')}_EvaluationOfGrades`;
-    if (format === 'pdf') await docxBlobToPdf(blob, `${baseName}.pdf`);
+    if (format === 'pdf') await docxBlobToPdf(blob, `${baseName}.pdf`, { edgeSideMarginIn: 1 });
     else saveAs(blob, `${baseName}.docx`);
     toast.success('Exported the Evaluation of Grades!');
   } catch (err) {

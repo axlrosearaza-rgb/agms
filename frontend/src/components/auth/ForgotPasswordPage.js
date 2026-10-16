@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { authService } from '../../services';
+import ConstellationBg, { AuthGlow } from './ConstellationBg';
 
 // Mirrors RegisterPage.js's EMAIL_REGEX — registration now accepts a Gmail or
 // SSU email, so recovery has to accept whichever one the student actually used.
@@ -38,6 +39,9 @@ export default function ForgotPasswordPage() {
 
   return (
     <div style={styles.shell}>
+      {/* Same background as the Login page. */}
+      <ConstellationBg />
+      <AuthGlow />
       <div style={styles.card}>
         <p style={styles.eyebrow}>Account Recovery</p>
         <h2 style={styles.title}>Forgot Password?</h2>
@@ -82,11 +86,12 @@ export default function ForgotPasswordPage() {
 const styles = {
   shell: {
     minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
-    background: 'linear-gradient(135deg, #060d1c 0%, #0a1525 100%)', padding: 20, fontFamily: 'Inter, sans-serif',
+    background: '#060d1c', padding: 20, fontFamily: 'Inter, sans-serif', position: 'relative', overflow: 'hidden',
   },
   card: {
-    width: '100%', maxWidth: 420, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)',
-    borderRadius: 16, padding: '36px 32px', backdropFilter: 'blur(10px)',
+    width: '100%', maxWidth: 420, background: 'rgba(10, 20, 42, 0.78)', border: '1px solid rgba(255,255,255,0.1)',
+    borderRadius: 16, padding: '36px 32px', backdropFilter: 'blur(10px)', position: 'relative', zIndex: 1,
+    boxShadow: '0 24px 60px rgba(0,0,0,0.45)',
   },
   eyebrow: { fontSize: 11, fontWeight: 600, letterSpacing: 2.5, textTransform: 'uppercase', color: '#3ab8cc', marginBottom: 8 },
   title: { fontFamily: "'Playfair Display', serif", fontSize: 26, fontWeight: 700, color: '#fff', marginBottom: 8 },

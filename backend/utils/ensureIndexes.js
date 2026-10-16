@@ -20,8 +20,10 @@ const STATEMENTS = [
   'ALTER TABLE semesters ADD COLUMN IF NOT EXISTS end_warning_for DATE',
   // Grade-submission reminder (30 days before the end) already sent for this end date.
   'ALTER TABLE semesters ADD COLUMN IF NOT EXISTS grade_warning_for DATE',
-  // Per-semester "Academic Year" vs "School Year" label (see Semester model).
-  "ALTER TABLE semesters ADD COLUMN IF NOT EXISTS year_label VARCHAR(20) NOT NULL DEFAULT 'Academic Year'",
+  // Per-semester "School Year" vs "Academic Year" label (see Semester model).
+  "ALTER TABLE semesters ADD COLUMN IF NOT EXISTS year_label VARCHAR(20) NOT NULL DEFAULT 'School Year'",
+  "ALTER TABLE semesters ALTER COLUMN year_label SET DEFAULT 'School Year'",
+  "UPDATE semesters SET year_label = 'School Year' WHERE year_label = 'Academic Year' OR year_label IS NULL",
   // Graduated-student archive (see User model).
   'ALTER TABLE users ADD COLUMN IF NOT EXISTS graduated_at TIMESTAMPTZ',
   'ALTER TABLE users ADD COLUMN IF NOT EXISTS graduated_semester VARCHAR(100)',
@@ -77,6 +79,32 @@ const STATEMENTS = [
   // Nothing is deleted from the system — accounts and subjects are archived.
   'ALTER TABLE users ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ',
   'ALTER TABLE subjects ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ',
+  // A course code is unique within its program + curriculum, so another
+  // curriculum can be imported with the same codes (see Subject model).
+  'ALTER TABLE subjects DROP CONSTRAINT IF EXISTS subjects_code_key',
+  'CREATE UNIQUE INDEX IF NOT EXISTS subjects_code_program_curriculum_key ON subjects (code, program, curriculum_year)',
+  // Past advisers and the advisees they had (utils/adviserArchive.js).
+  `CREATE TABLE IF NOT EXISTS adviser_archives (
+    id SERIAL PRIMARY KEY,
+    adviser_id INTEGER,
+    adviser_name VARCHAR(150) NOT NULL,
+    program VARCHAR(150) NOT NULL,
+    year_level INTEGER NOT NULL,
+    section VARCHAR(10) NOT NULL,
+    students JSONB NOT NULL DEFAULT '[]',
+    student_count INTEGER NOT NULL DEFAULT 0,
+    semester VARCHAR(100),
+    replaced_by_name VARCHAR(150),
+    ended_by_name VARCHAR(150),
+    ended_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`,
+  // The curriculum each student follows (utils/studentCurriculum.js). Students
+  // from before this column existed get their program's curriculum as it stood.
+  'ALTER TABLE users ADD COLUMN IF NOT EXISTS curriculum_year VARCHAR(20)',
+  "UPDATE users u SET curriculum_year = (SELECT MAX(s.curriculum_year) FROM subjects s WHERE s.program = u.program AND s.curriculum_year IS NOT NULL) WHERE u.role = 'Student' AND u.curriculum_year IS NULL AND u.program IS NOT NULL",
+  // Deactivated staff accounts are archived accounts — catches any that were
+  // deactivated before the two became one and the same.
+  "UPDATE users SET archived_at = NOW() WHERE status = 'Deactivated' AND archived_at IS NULL AND role IN ('Faculty', 'Chairperson')",
   // "Is this your class?" — a class outside the student's own Year + Section.
   'ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS needs_confirmation BOOLEAN NOT NULL DEFAULT false',
   'ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ',

@@ -96,6 +96,20 @@ export default function AccountSetupWizard() {
     }
   };
 
+  // Finish setup without an e-mail — it can be added later in Settings.
+  const skipEmail = async () => {
+    setBusy(true);
+    try {
+      const { data } = await accountSetupService.skipEmail();
+      toast.success('Your account is all set!');
+      updateUser(data.user);
+    } catch (err) {
+      fail(err, 'Could not finish the setup.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const confirmCode = async (e) => {
     e.preventDefault();
     setBusy(true);
@@ -241,10 +255,15 @@ export default function AccountSetupWizard() {
             {step === 2 && !sentTo && (
               <form onSubmit={sendCode}>
                 <h2 className="text-base font-semibold text-navy mb-1">Add your email</h2>
-                <p className="text-[13px] text-gray-500 mb-4">Your Gmail or your SSU university email — we'll use it if you forget your password.</p>
-                <label className="form-label">Gmail or university email</label>
+                <p className="text-[13px] text-gray-500 mb-4">Your Gmail or your SSU university email — we'll use it if you forget your password. You can also add it later.</p>
+                <label className="form-label">Gmail or university email <span className="text-gray-400 font-normal normal-case">(optional)</span></label>
                 <input className="form-input mb-5" type="email" placeholder="juandelacruz@gmail.com or jdelacruz@ssu.edu.ph" value={email} onChange={(e) => setEmail(e.target.value)} autoFocus />
                 <button type="submit" className="btn btn-primary w-full justify-center" disabled={busy || !email.trim()}>{busy ? 'Sending...' : 'Send verification code'}</button>
+                {/* The e-mail is optional — the account works without it. */}
+                <button type="button" className="btn btn-outline w-full justify-center mt-2.5" onClick={skipEmail} disabled={busy}>
+                  Skip for now — I'll add it later
+                </button>
+                <p className="text-[11px] text-gray-400 mt-2 text-center">Without an email you can't use "Forgot password". Add one any time in Settings.</p>
               </form>
             )}
 

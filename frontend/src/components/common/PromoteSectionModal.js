@@ -156,37 +156,41 @@ export default function PromoteSectionModal({ section, onClose, onDone }) {
       {loading ? <LoadingSpinner text="Checking grades..." /> : students.length === 0 ? (
         <p className="text-sm text-gray-400 text-center py-10">No students in {label} yet.</p>
       ) : (
-        <div className="border border-gray-200 rounded-lg overflow-hidden max-h-[50vh] overflow-y-auto">
-          <table className="w-full text-[13px]">
-            <thead className="bg-gray-50 sticky top-0 z-10">
-              <tr className="text-left text-[11px] uppercase text-gray-500">
-                <th className="px-3 py-2 w-8">
+        <div className="border border-gray-200 rounded-lg overflow-x-auto max-h-[50vh] overflow-y-auto">
+          <table className="w-full text-[13px] min-w-[720px]">
+            <thead className="bg-gray-50 sticky top-0 z-10 border-b border-gray-200">
+              <tr className="text-left text-[11px] uppercase tracking-wider text-gray-500">
+                <th className="px-3 py-2.5 text-center w-10">
                   <input type="checkbox" checked={allOn} disabled={!promotable.length}
                     onChange={() => setSelected(allOn ? new Set() : new Set(promotable.map((s) => s.id)))} />
                 </th>
-                <th className="px-3 py-2 w-1/3">Student</th>
-                <th className="px-3 py-2">GWA</th>
-                <th className="px-3 py-2 w-1/4">Status</th>
-                <th className="px-3 py-2">Details</th>
+                <th className="px-3 py-2.5 text-left w-[30%]">Student</th>
+                <th className="px-3 py-2.5 text-center w-24">GWA</th>
+                <th className="px-3 py-2.5 text-center w-[170px]">Status</th>
+                <th className="px-3 py-2.5 text-center">Details</th>
               </tr>
             </thead>
             <tbody>
               {students.map((s) => {
                 const can = PROMOTABLE.includes(s.promotion_status);
                 return (
-                  <tr key={s.id} className={`border-t border-gray-100 ${can ? '' : 'bg-gray-50/60'}`}>
-                    <td className="px-3 py-2">
+                  <tr key={s.id} className={`border-t border-gray-100 ${can ? '' : 'bg-gray-50/60'} hover:bg-gray-50/80 transition-colors`}>
+                    <td className="px-3 py-2.5 text-center align-middle">
                       <input type="checkbox" disabled={!can} checked={selected.has(s.id)} onChange={() => toggle(s.id)} />
                     </td>
-                    <td className="px-3 py-2">
-                      <p className="font-medium">{formatStudentName(s.name)}</p>
-                      <p className="text-[11px] text-gray-400">{s.student_no}</p>
+                    <td className="px-3 py-2.5 align-middle">
+                      <p className="font-medium text-navy">{formatStudentName(s.name)}</p>
+                      <p className="text-[11px] text-gray-400 font-mono">{s.student_no}</p>
                     </td>
-                    <td className="px-3 py-2 font-mono text-[12px]">
+                    <td className="px-3 py-2.5 text-center font-mono text-[12px] text-gray-600 align-middle">
                       {(!s.account_setup_at || s.gwa == null || !s.already_released) ? '—' : Number(s.gwa).toFixed(3)}
                     </td>
-                    <td className="px-3 py-2"><Badge variant={STATUS_BADGE[s.promotion_status] || 'gray'}>{s.promotion_status}</Badge></td>
-                    <td className="px-3 py-2 text-[12px] text-gray-500">{reasonFor(s)}</td>
+                    <td className="px-3 py-2.5 text-center align-middle whitespace-nowrap">
+                      <Badge variant={STATUS_BADGE[s.promotion_status] || 'gray'}>{s.promotion_status}</Badge>
+                    </td>
+                    <td className="px-3 py-2.5 text-center text-[12px] text-gray-500 align-middle">
+                      {reasonFor(s)}
+                    </td>
                   </tr>
                 );
               })}

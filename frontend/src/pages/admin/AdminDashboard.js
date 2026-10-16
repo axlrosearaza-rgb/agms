@@ -11,7 +11,7 @@ import FacultyProgressRow from '../../components/common/FacultyProgressRow';
 import SemesterEndingBanner from '../../components/admin/SemesterEndingBanner';
 import ReleaseGradesCard from '../../components/admin/ReleaseGradesCard';
 import AdviserSummaryCard from '../../components/admin/AdviserSummaryCard';
-import { useSemesterLabels } from '../../utils/semesterLabels';
+import { useSemesterLabels, onSemestersUpdated } from '../../utils/semesterLabels';
 
 // Excluded from grouping (same as UserManagement.js) — GE is a bonus tag every
 // program's faculty can carry, not a program of its own to bucket people under.
@@ -100,6 +100,11 @@ export default function AdminDashboard() {
     return onGradesUpdated(handler);
   }, []);
 
+  useEffect(() => {
+    const handler = () => { loadDashboard(); loadFacultyReview(); loadDistribution(); };
+    return onSemestersUpdated(handler);
+  }, []);
+
   // 'gradesUpdated' above only reaches this page WHILE the socket is
   // actually connected — a dropped connection (backgrounded tab, network
   // blip) silently swallows whatever happened during that gap. Re-pull the
@@ -160,7 +165,11 @@ export default function AdminDashboard() {
   const loadDistribution = async () => {
     try {
       const params = {};
-      if (semesterKey) {
+      const [, keySem] = (semesterKey || '').split('::');
+      // The current semester is asked for with no filter at all — the server
+      // then uses the current semester by its name. Filtering on the school
+      // year too would miss classes saved without one and show an empty chart.
+      if (semesterKey && !(currentSemester && keySem === currentSemester.name)) {
         const [academicYear, sem] = semesterKey.split('::');
         if (academicYear) params.academic_year = academicYear;
         if (sem) params.semester = sem;
@@ -181,10 +190,11 @@ export default function AdminDashboard() {
   // the current semester out of its own Archived list below, and to label
   // the chart accurately.
   const currentSemesterKey = currentSemester ? `${currentSemester.academic_year || ''}::${currentSemester.name}` : null;
-  const archivedSemesters = semesters.filter(
-    (s) => `${s.academic_year || ''}::${s.semester}` !== currentSemesterKey
-  );
-  const isViewingCurrent = !semesterKey || semesterKey === currentSemesterKey;
+  // Matched on the semester's name: its classes may not carry the school
+  // year separately, and the current semester must never be listed as past.
+  const isCurrentName = (name) => !!currentSemester && name === currentSemester.name;
+  const archivedSemesters = semesters.filter((s) => !isCurrentName(s.semester));
+  const isViewingCurrent = !semesterKey || semesterKey === currentSemesterKey || isCurrentName(semesterKey.split('::')[1]);
   const formatSemesterDate = (date) => date
     ? new Date(date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
     : null;
@@ -506,7 +516,7 @@ export default function AdminDashboard() {
                   </>
                 ) : (
                   <span className="inline-flex items-center gap-1 text-amber-600 font-medium">
-                    <Icons.Archive className="w-3 h-3" /> {semesterKey ? 'Viewing an archived semester' : 'Viewing all semesters'}
+                    <Icons.Archive className="w-3 h-3" /> Viewing a past semester
                   </span>
                 )}
               </p>
@@ -527,7 +537,7 @@ export default function AdminDashboard() {
                 !isViewingCurrent ? 'bg-amber-50 border-amber-200 text-amber-700' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
               }`}
             >
-              <Icons.Archive className="w-3.5 h-3.5" /> Archived
+              <Icons.Clock className="w-3.5 h-3.5" /> {isViewingCurrent ? 'Current Semester' : 'Past Semester'}
               {showArchivedSemesters ? <Icons.ChevronUp className="w-3 h-3" /> : <Icons.ChevronDown className="w-3 h-3" />}
             </button>
 
@@ -537,13 +547,15 @@ export default function AdminDashboard() {
                 <div className="absolute right-0 top-[calc(100%+6px)] w-64 bg-white rounded-xl shadow-2xl z-[999] border border-gray-100 overflow-hidden">
                   <button
                     onClick={() => { setSemesterKey(''); setShowArchivedSemesters(false); }}
-                    className={`w-full text-left px-4 py-2.5 text-sm border-none bg-transparent cursor-pointer font-sans hover:bg-gray-50 ${!semesterKey ? 'text-navy font-semibold bg-blue-50' : 'text-gray-600'}`}
+                    className={`w-full text-left px-4 py-2.5 text-sm border-none bg-transparent cursor-pointer font-sans hover:bg-gray-50 ${isViewingCurrent ? 'text-navy font-semibold bg-blue-50' : 'text-gray-600'}`}
                   >
-                    All Semesters
+                    <span className="block">Current Semester</span>
+                    {currentSemester && <span className="block text-xs text-gray-400 font-normal">{currentSemester.term} · {abbrFor(currentSemester)} {currentSemester.academic_year}</span>}
                   </button>
-                  <div className="border-t border-gray-100 max-h-[240px] overflow-y-auto">
+                  <p className="px-4 pt-2.5 pb-1 text-[11px] font-semibold text-gray-400 uppercase tracking-wide border-t border-gray-100 m-0">Past Semesters</p>
+                  <div className="max-h-[240px] overflow-y-auto">
                     {archivedSemesters.length === 0 ? (
-                      <p className="px-4 py-4 text-xs text-gray-400 text-center">Nothing archived yet.</p>
+                      <p className="px-4 py-4 text-xs text-gray-400 text-center">No past semesters yet.</p>
                     ) : archivedSemesters.map((s, i) => {
                       const key = `${s.academic_year || ''}::${s.semester}`;
                       return (

@@ -15,7 +15,7 @@ const TERMS = ['First Semester', 'Second Semester', 'Summer'];
 function groupByYearTerm(list) {
   const byYear = {};
   list.forEach((s) => {
-    const year = s.academic_year || 'No Academic Year';
+    const year = s.academic_year || 'No School Year';
     const term = s.term || 'No Term';
     if (!byYear[year]) byYear[year] = {};
     if (!byYear[year][term]) byYear[year][term] = [];
@@ -46,12 +46,10 @@ const academicYearOptions = (() => {
 // never default earlier than the dropdown's own starting year.
 const defaultYear = Math.max(ACADEMIC_YEAR_START, new Date().getFullYear());
 const currentAcademicYear = `${defaultYear}-${defaultYear + 1}`;
-// No `is_current` here anymore — "current" is now derived from status
-// (Active ⇒ current) at save time rather than a separate manual checkbox,
-// so there's nothing to default it to; see handleSave.
-const emptyForm = { term: 'First Semester', year_label: 'Academic Year', academic_year: currentAcademicYear, start_date: '', end_date: '', status: 'Upcoming' };
-// What this semester's year is called everywhere it's shown ("A.Y." / "S.Y.").
-const YEAR_LABELS = ['Academic Year', 'School Year'];
+// Status and "current" are automatically derived from duration (start_date to end_date).
+const emptyForm = { term: 'First Semester', year_label: 'School Year', academic_year: currentAcademicYear, start_date: '', end_date: '' };
+// What this semester's year is called everywhere it's shown ("S.Y." / "A.Y.").
+const YEAR_LABELS = ['School Year', 'Academic Year'];
 
 export default function SemesterManagement() {
   const { user } = useAuth();
@@ -69,9 +67,6 @@ export default function SemesterManagement() {
   // on why that broke string-matching elsewhere) — only the starting year is
   // typed, the "YYYY-YYYY" shape itself is still always generated, never typed.
   const [customYear, setCustomYear] = useState(false);
-  // Shared confirm-warning for Delete/Set Current — same styled ConfirmDialog
-  // pattern used elsewhere in the app, instead of the browser's own plain
-  // window.confirm() popup.
   // "View" on a semester (Done ones especially) — everything that got
   // archived under it, pulled fresh from GET /classes?semester=<name>
   // (same endpoint the ongoing Grade Approval/Grading Sheets pages already
@@ -92,14 +87,6 @@ export default function SemesterManagement() {
     } finally {
       setViewLoading(false);
     }
-  };
-
-  const [confirmAction, setConfirmAction] = useState(null);
-  const requestConfirm = (config) => setConfirmAction(config);
-  const runConfirmedAction = async () => {
-    const cfg = confirmAction;
-    setConfirmAction(null);
-    if (cfg?.action) await cfg.action();
   };
 
   const loadSemesters = useCallback(async () => {
@@ -129,11 +116,10 @@ export default function SemesterManagement() {
     setEditSem(sem);
     setFormData({
       term: sem.term || 'First Semester',
-      year_label: sem.year_label || 'Academic Year',
+      year_label: sem.year_label || 'School Year',
       academic_year: sem.academic_year || '',
       start_date: sem.start_date || '',
       end_date: sem.end_date || '',
-      status: sem.status || 'Upcoming',
     });
     // Already outside the generated dropdown range — opens straight into
     // the typed-year field instead of silently falling back to some other
@@ -157,24 +143,13 @@ export default function SemesterManagement() {
       return;
     }
 
-    // "Current" is no longer a separate manual checkbox — it's derived
-    // straight from Status: Active IS the one in progress right now, so
-    // marking a semester Active automatically makes it current (and the
-    // backend's own supersession logic — see semesterController.endSemester
-    // — handles retiring/archiving whichever one was current before, same
-    // as it always did). Upcoming never starts out current; a Completed
-    // semester being edited stays exactly whatever it already was — it's
-    // not reachable from this dropdown anymore either way (see Status
-    // below), so there's nothing new to derive for it here.
-    const payload = { ...formData, is_current: formData.status === 'Active' };
-
     try {
       setSaving(true);
       if (editSem) {
-        await semesterService.update(editSem.id, payload);
+        await semesterService.update(editSem.id, formData);
         toast.success('Semester updated');
       } else {
-        await semesterService.create(payload);
+        await semesterService.create(formData);
         toast.success('Semester created');
       }
       setShowModal(false);
@@ -185,48 +160,6 @@ export default function SemesterManagement() {
     } finally {
       setSaving(false);
     }
-  };
-
-  // Semesters are never deleted — archiving marks one Completed, which also
-  // archives its classes. Everything in it is kept.
-  const handleArchive = (sem) => {
-    if (sem.is_current) {
-      toast.error('The current semester can\'t be archived — set another semester as current first');
-      return;
-    }
-    requestConfirm({
-      title: 'Archive Semester',
-      message: `Archive ${sem.name}? It is marked Completed and its classes are archived. All of its classes, grades and records are kept.`,
-      confirmText: 'Archive',
-      variant: 'gold',
-      action: async () => {
-        try {
-          await semesterService.update(sem.id, { status: 'Completed' });
-          toast.success(`${sem.name} archived`);
-          loadSemesters();
-        } catch (err) {
-          toast.error(err.response?.data?.message || 'Failed to archive');
-        }
-      },
-    });
-  };
-
-  const handleSetCurrent = (sem) => {
-    requestConfirm({
-      title: 'Set Current Semester',
-      message: `Set "${sem.name}" as the current semester?`,
-      confirmText: 'Set as Current',
-      variant: 'gold',
-      action: async () => {
-        try {
-          await semesterService.setCurrent(sem.id);
-          toast.success(`${sem.name} is now the current semester`);
-          loadSemesters();
-        } catch (err) {
-          toast.error('Failed to set current semester');
-        }
-      },
-    });
   };
 
   const currentSem = semesters.find(s => s.is_current);
@@ -280,25 +213,17 @@ export default function SemesterManagement() {
       <td className="px-4 py-3.5">
         {s.is_current ? (
           <Badge variant="green"><Icons.Check className="w-3 h-3" /> Current</Badge>
-        ) : canManage ? (
-          <button onClick={() => handleSetCurrent(s)} className="text-xs text-blue-500 hover:underline cursor-pointer bg-transparent border-none font-sans">
-            Set as Current
-          </button>
-        ) : <span className="text-xs text-gray-400">—</span>}
+        ) : (
+          <span className="text-xs text-gray-400">—</span>
+        )}
       </td>
       <td className="px-4 py-3.5">
         <div className="flex gap-1.5 justify-end">
           {/* Everyone can look — View is read-only, not a management action,
-              so it's not gated behind canManage the way Edit/Delete are. */}
+              so it's not gated behind canManage the way Edit is. */}
           <button className="btn-icon" onClick={() => openView(s)} title="View classes & data"><Icons.Eye /></button>
           {canManage && (
-            <>
-              <button className="btn-icon" onClick={() => openEdit(s)} title="Edit"><Icons.Edit /></button>
-              {/* Archive instead of delete — a Completed semester already is one. */}
-              {!s.is_current && s.status !== 'Completed' && (
-                <button className="btn-icon hover:!bg-amber-50 hover:!text-amber-600" onClick={() => handleArchive(s)} title="Archive"><Icons.Archive /></button>
-              )}
-            </>
+            <button className="btn-icon" onClick={() => openEdit(s)} title="Edit"><Icons.Edit /></button>
           )}
         </div>
       </td>
@@ -386,7 +311,7 @@ export default function SemesterManagement() {
         <div>
           <h2 className="text-lg font-bold text-navy">Semester Management</h2>
           <p className="text-[13px] text-gray-500">
-            {canManage ? 'Manage semesters and set the current term' : 'Read-only — only the Administrator manages semesters.'}
+            {canManage ? 'Manage semesters; terms automatically activate and archive based on duration.' : 'Read-only — only the Administrator manages semesters.'}
           </p>
         </div>
         {canManage && <button className="btn btn-gold" onClick={openCreate}><Icons.Plus /> Add Semester</button>}
@@ -547,30 +472,6 @@ export default function SemesterManagement() {
                 <input className="form-input" type="date" value={formData.end_date} min={formData.start_date || undefined} onChange={(e) => setFormData({ ...formData, end_date: e.target.value })} />
               </div>
             </div>
-            <div>
-              {/* Completed is deliberately not a pickable option — it's
-                  never something to set by hand anymore, only something
-                  that happens automatically when a semester gets superseded
-                  or explicitly ended (see semesterController.endSemester,
-                  which also archives its classes and notifies everyone —
-                  a manual dropdown pick here would skip all of that). If a
-                  Completed semester is being edited anyway, its own value
-                  still shows correctly rather than snapping to Upcoming. */}
-              <label className="form-label">Status</label>
-              <select className="form-select" value={formData.status} onChange={(e) => setFormData({ ...formData, status: e.target.value })}>
-                <option>Upcoming</option>
-                <option>Active</option>
-                {formData.status === 'Completed' && <option>Completed</option>}
-              </select>
-              {/* "Current" used to be its own checkbox here — now it's just
-                  a direct consequence of Status, explained inline instead
-                  of asked for separately. */}
-              <p className="text-xs text-gray-400 mt-1.5">
-                {formData.status === 'Active'
-                  ? 'Active semesters automatically become the current one — the previous current semester ends and its classes archive.'
-                  : 'Only an Active semester can be current.'}
-              </p>
-            </div>
           </div>
         </Modal>
       )}
@@ -653,17 +554,6 @@ export default function SemesterManagement() {
           </Modal>
         );
       })()}
-
-      {confirmAction && (
-        <ConfirmDialog
-          title={confirmAction.title}
-          message={confirmAction.message}
-          confirmText={confirmAction.confirmText}
-          variant={confirmAction.variant}
-          onConfirm={runConfirmedAction}
-          onCancel={() => setConfirmAction(null)}
-        />
-      )}
     </>
   );
 }

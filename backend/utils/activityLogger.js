@@ -40,15 +40,39 @@ const isNotPromotionAction = { [Op.and]: PROMOTION_ACTION_PATTERNS.map((p) => ({
 
 // `recent: true` for "still within its own type's window" (Recent
 // Activity), `recent: false` for "aged past it" (Archived Activities).
-const activityRetentionWhere = (recent) => {
+// When a semesterCutoff is passed, recent only includes entries created during
+// the current active semester, moving previous semester entries to Archived.
+const activityRetentionWhere = (recent, semesterCutoff = null) => {
   const now = Date.now();
-  const op = recent ? Op.gte : Op.lt;
-  return {
-    [Op.or]: [
-      { action: isPromotionAction, created_at: { [op]: new Date(now - ONE_DAY_MS) } },
-      { action: isNotPromotionAction, created_at: { [op]: new Date(now - SEVEN_DAYS_MS) } },
-    ],
-  };
+  if (recent) {
+    const conditions = [
+      { action: isPromotionAction, created_at: { [Op.gte]: new Date(now - ONE_DAY_MS) } },
+      { action: isNotPromotionAction, created_at: { [Op.gte]: new Date(now - SEVEN_DAYS_MS) } },
+    ];
+    if (semesterCutoff) {
+      return {
+        [Op.and]: [
+          { [Op.or]: conditions },
+          { created_at: { [Op.gte]: semesterCutoff } },
+        ],
+      };
+    }
+    return { [Op.or]: conditions };
+  } else {
+    const conditions = [
+      { action: isPromotionAction, created_at: { [Op.lt]: new Date(now - ONE_DAY_MS) } },
+      { action: isNotPromotionAction, created_at: { [Op.lt]: new Date(now - SEVEN_DAYS_MS) } },
+    ];
+    if (semesterCutoff) {
+      return {
+        [Op.or]: [
+          { created_at: { [Op.lt]: semesterCutoff } },
+          ...conditions,
+        ],
+      };
+    }
+    return { [Op.or]: conditions };
+  }
 };
 
 // Just the promotion-type rows still within their own 24h window — for
@@ -65,10 +89,27 @@ const promotionActivityRecentWhere = () => ({
 // type (no promotion-vs-everything-else split like activityRetentionWhere
 // above), since the department-scoped feed is small enough that a uniform
 // same-day cutoff is what actually keeps it useful, per the Chairperson's
-// own request. Admin's dashboard/archive views are untouched by this — they
-// keep using activityRetentionWhere above.
-const chairpersonActivityRetentionWhere = (recent) => ({
-  created_at: { [recent ? Op.gte : Op.lt]: new Date(Date.now() - ONE_DAY_MS) },
-});
+// own request. When semesterCutoff is provided, only actions during the active
+// semester are shown in recent.
+const chairpersonActivityRetentionWhere = (recent, semesterCutoff = null) => {
+  const now = Date.now();
+  if (recent) {
+    if (semesterCutoff) {
+      const minDate = semesterCutoff > new Date(now - ONE_DAY_MS) ? semesterCutoff : new Date(now - ONE_DAY_MS);
+      return { created_at: { [Op.gte]: minDate } };
+    }
+    return { created_at: { [Op.gte]: new Date(now - ONE_DAY_MS) } };
+  } else {
+    if (semesterCutoff) {
+      return {
+        [Op.or]: [
+          { created_at: { [Op.lt]: semesterCutoff } },
+          { created_at: { [Op.lt]: new Date(now - ONE_DAY_MS) } },
+        ],
+      };
+    }
+    return { created_at: { [Op.lt]: new Date(now - ONE_DAY_MS) } };
+  }
+};
 
 module.exports = { logActivity, activityRetentionWhere, promotionActivityRecentWhere, chairpersonActivityRetentionWhere };

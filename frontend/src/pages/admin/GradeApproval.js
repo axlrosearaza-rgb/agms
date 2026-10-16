@@ -1,11 +1,12 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Icons, Avatar, Badge, SearchBar, LoadingSpinner, FacultyProgramTags, Modal, ConfirmDialog, ProgramDot, programShortLabel, comparePeopleNames, formatPersonName } from '../../components/common';
+import { Icons, Avatar, Badge, SearchBar, LoadingSpinner, FacultyProgramTags, Modal, ConfirmDialog, ProgramDot, programShortLabel, comparePeopleNames, formatPersonName, groupBySemester } from '../../components/common';
 import { classService, reportService, gradeService, dashboardService, userService } from '../../services';
 import toast from 'react-hot-toast';
 import { usePageState } from '../../hooks/usePageState';
 import { useSearchParams } from 'react-router-dom';
 import { EncodingProgress } from '../../components/common/FacultyProgressRow';
 import { onGradesUpdated } from '../../services/socket';
+import FloatingPanel from '../../components/common/FloatingPanel';
 
 const PROGRAMS = [
   'Bachelor of Science in Information Technology',
@@ -33,9 +34,10 @@ const DOC = {
 // it lands in:
 // - 'pending': Not yet submitted by Faculty or awaiting Chairperson verification.
 // - 'needs_approval': Chairperson has verified and forwarded — awaiting Admin approval.
-// - 'done': Both Class Record and Grade Sheet are approved by Admin.
+// - 'to_release': Both documents approved by Admin, grades not yet released to the students.
+// - 'done': Approved AND released to the students.
 const stageOf = (c) => {
-  if (c.admin_class_record_approved && c.admin_grade_sheet_approved) return 'done';
+  if (c.admin_class_record_approved && c.admin_grade_sheet_approved) return c.all_released ? 'done' : 'to_release';
   if (c.chairperson_verified) return 'needs_approval';
   return 'pending';
 };
@@ -46,7 +48,8 @@ const stageOf = (c) => {
 const STAGES = [
   { key: 'pending', label: 'Pending Grades', hint: 'Not yet submitted by Faculty or awaiting Chairperson verification.', header: 'bg-gray-500 hover:bg-gray-600' },
   { key: 'needs_approval', label: 'Needs Your Approval', hint: 'Chairperson has forwarded these — approve each document.', header: 'bg-amber-500 hover:bg-amber-600' },
-  { key: 'done', label: 'Done', hint: 'Fully approved — release the grades to the students.', header: 'bg-green-500 hover:bg-green-600' },
+  { key: 'to_release', label: 'Unreleased Grades', hint: 'Both documents approved — not yet released to the students.', header: 'bg-blue-600 hover:bg-blue-700' },
+  { key: 'done', label: 'Done', hint: 'Approved and released — the students can see their grades.', header: 'bg-green-500 hover:bg-green-600' },
 ];
 
 // Approve only happens from inside the preview now (see the Preview modal's
@@ -209,8 +212,18 @@ export default function GradeApproval() {
 
   const loadAllFaculty = async () => {
     try {
-      const { data } = await userService.getAll({ all: true, role: 'Faculty' });
-      setAllFaculty(data.users || []);
+      // Faculty, plus every Chairperson who also teaches — a teaching
+      // Chairperson has classes of their own and submits a Class Record and
+      // Grade Sheet for them like any Faculty, so they belong in this roster
+      // and in its counts.
+      const [faculty, chairs] = await Promise.all([
+        userService.getAll({ all: true, role: 'Faculty' }),
+        userService.getAll({ all: true, role: 'Chairperson' }),
+      ]);
+      setAllFaculty([
+        ...(faculty.data.users || []),
+        ...(chairs.data.users || []).filter((u) => u.is_teaching),
+      ]);
     } catch (err) {
       toast.error('Failed to load faculty list');
     }
@@ -340,7 +353,7 @@ export default function GradeApproval() {
     setSectionFilter('');
   };
 
-  const byStage = { pending: [], needs_approval: [], done: [] };
+  const byStage = { pending: [], needs_approval: [], to_release: [], done: [] };
   filtered.forEach((c) => {
     const stage = stageOf(c);
     if (byStage[stage]) byStage[stage].push(c);
@@ -364,7 +377,7 @@ export default function GradeApproval() {
   // live) rather than facultyReview, which only knows about submission.
   // A class that hasn't even been forwarded yet correctly keeps its faculty
   // out of "passed", same as one still sitting in Needs Your Approval.
-  const approvedClassIds = new Set(classes.filter((c) => stageOf(c) === 'done').map((c) => c.id));
+  const approvedClassIds = new Set(classes.filter((c) => ['to_release', 'done'].includes(stageOf(c))).map((c) => c.id));
   // A class with zero enrolled students has nothing to submit at all — it
   // can never turn `sent` true no matter what, so counting it in the
   // all-or-nothing check below permanently blocked a faculty from ever
@@ -385,7 +398,13 @@ export default function GradeApproval() {
   // vacuously true.
   const reviewByInstructorId = {};
   facultyReview.forEach((f) => { reviewByInstructorId[f.instructor.id] = f; });
-  const facultyList = allFaculty.map((u) => reviewByInstructorId[u.id] || { instructor: u, classes: [] });
+  const rosterIds = new Set(allFaculty.map((u) => u.id));
+  const facultyList = [
+    ...allFaculty.map((u) => reviewByInstructorId[u.id] || { instructor: u, classes: [] }),
+    // Anyone with an active class who is somehow not in the roster above is
+    // still shown: a class with grades to approve must never be left out.
+    ...facultyReview.filter((r) => !rosterIds.has(r.instructor.id)),
+  ];
   const facultyDoneCount = facultyList.filter(facultySent).length;
   const facultyPassedCount = facultyList.filter(facultyPassed).length;
 
@@ -416,9 +435,10 @@ export default function GradeApproval() {
   ];
 
   const allClassMap = new Map((allClasses || []).map((c) => [c.id, c]));
-  const totalDoneClasses = (allClasses || []).filter((c) => c.admin_class_record_approved && c.admin_grade_sheet_approved).length;
-  const totalPendingRecordClasses = (allClasses || []).filter((c) => !c.admin_class_record_approved).length;
-  const totalPendingSheetClasses = (allClasses || []).filter((c) => !c.admin_grade_sheet_approved).length;
+  const activeClassesList = (allClasses || []).filter((c) => !isArchived(c));
+  const totalDoneClasses = activeClassesList.filter((c) => stageOf(c) === 'done').length;
+  const totalPendingRecordClasses = activeClassesList.filter((c) => !c.admin_class_record_approved).length;
+  const totalPendingSheetClasses = activeClassesList.filter((c) => !c.admin_grade_sheet_approved).length;
 
   const toggleStage = (key) => setOpenStages((prev) => ({ ...prev, [key]: !prev[key] }));
   const toggleGroup = (key) => setOpenGroups((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -483,14 +503,19 @@ export default function GradeApproval() {
                 <Icons.Send className="w-3.5 h-3.5" /> {releasing === c.id ? 'Releasing...' : 'Release to Students'}
               </button>
             )}
-            <button
-              className="btn btn-outline btn-sm whitespace-nowrap"
-              onClick={() => setArchiveTarget(c)}
-              disabled={archiving === c.id}
-              title="Move this class to Archived"
-            >
-              <Icons.Archive className="w-3.5 h-3.5" /> {archiving === c.id ? 'Archiving...' : 'Archive'}
-            </button>
+            {/* Archive comes AFTER the release — it only appears once the
+                grades have been released to the students, so a class can't
+                be tucked away with its grades still unreleased. */}
+            {c.all_released && (
+              <button
+                className="btn btn-outline btn-sm whitespace-nowrap"
+                onClick={() => setArchiveTarget(c)}
+                disabled={archiving === c.id}
+                title="Move this class to Archived"
+              >
+                <Icons.Archive className="w-3.5 h-3.5" /> {archiving === c.id ? 'Archiving...' : 'Archive'}
+              </button>
+            )}
           </div>
         </td>
       )}
@@ -503,7 +528,7 @@ export default function GradeApproval() {
     const stageOpen = !!openStages[stage.key] || hasActiveFilters;
     const programs = groupByProgramYearSection(stageClasses);
     const programKeys = Object.keys(programs).sort((a, b) => (a === 'No Program' ? 1 : b === 'No Program' ? -1 : a.localeCompare(b)));
-    const isDoneStage = stage.key === 'done';
+    const isDoneStage = stage.key === 'done' || stage.key === 'to_release';
 
     return (
       <div key={stage.key} className="card overflow-hidden mb-5">
@@ -674,7 +699,7 @@ export default function GradeApproval() {
                 });
               });
 
-              const doneClasses = groupClasses.filter((c) => c.admin_class_record_approved && c.admin_grade_sheet_approved).length;
+              const doneClasses = groupClasses.filter((c) => stageOf(c) === 'done').length;
               const pendingRecordClasses = groupClasses.filter((c) => !c.admin_class_record_approved).length;
               const pendingSheetClasses = groupClasses.filter((c) => !c.admin_grade_sheet_approved).length;
               const classCount = groupClasses.length;
@@ -905,7 +930,7 @@ export default function GradeApproval() {
       </div>
 
       {filtered.length === 0 ? (
-        <div className="card text-center py-14 text-gray-400 text-sm">
+        <div className="card text-center py-14 text-gray-400 text-sm mb-6">
           <Icons.FileText className="w-8 h-8 mx-auto mb-2 opacity-30" />
           {hasActiveFilters ? (
             <>
@@ -923,7 +948,7 @@ export default function GradeApproval() {
           do here. Same status field Faculty's own Archive button and
           Chairperson's Grading Sheets page both already use. */}
       {archivedList.length > 0 && (
-        <div className="card overflow-hidden mb-5">
+        <div className="card overflow-hidden mt-6 mb-6">
           <button
             onClick={() => setShowArchived((v) => !v)}
             className="w-full px-5 py-3.5 flex items-center justify-between border-none cursor-pointer font-sans text-white transition-colors bg-gray-400 hover:bg-gray-500"
@@ -942,9 +967,27 @@ export default function GradeApproval() {
               Admin sees every program at once, so a single Year bucket
               routinely spans several of them, with no way to tell them
               apart short of opening every section underneath. */}
-          {showArchived && (() => {
+          {showArchived && groupBySemester(archivedList).map(({ semester, list: semesterClasses }) => {
+            // SEMESTER first — every archived class sits under the semester it
+            // belongs to (a semester's classes are all archived when it ends).
+            const semesterKey = `archived-semester|${semester}`;
+            const semesterOpen = !!openGroups[semesterKey];
+            return (
+              <div key={semester} className="border-t border-gray-200">
+                <button
+                  onClick={() => toggleGroup(semesterKey)}
+                  className="w-full px-5 py-3 flex items-center justify-between border-none cursor-pointer font-sans bg-navy/5 hover:bg-navy/10 transition-colors"
+                >
+                  <div className="flex items-center gap-2.5">
+                    <Icons.Clock className="w-4 h-4 text-navy" />
+                    <span className="text-sm font-bold text-navy">{semester}</span>
+                    <span className="text-xs text-gray-500">{semesterClasses.length} class{semesterClasses.length !== 1 ? 'es' : ''}</span>
+                  </div>
+                  {semesterOpen ? <Icons.ChevronUp className="w-4 h-4 text-gray-500" /> : <Icons.ChevronDown className="w-4 h-4 text-gray-500" />}
+                </button>
+          {semesterOpen && (() => {
             const byProgram = {};
-            archivedList.forEach((c) => {
+            semesterClasses.forEach((c) => {
               const program = c.subject?.program || 'No Program';
               if (!byProgram[program]) byProgram[program] = [];
               byProgram[program].push(c);
@@ -954,7 +997,7 @@ export default function GradeApproval() {
               <div className="border-t border-gray-100">
                 {programKeys.map((program) => {
                   const programClasses = byProgram[program];
-                  const programKey = `archived|${program}`;
+                  const programKey = `archived|${semester}|${program}`;
                   const programOpen = !!openGroups[programKey];
                   const years = groupByYearSection(programClasses);
                   const yearKeys = Object.keys(years).sort((a, b) => (a === '—' ? 1 : b === '—' ? -1 : a - b));
@@ -1053,6 +1096,9 @@ export default function GradeApproval() {
               </div>
             );
           })()}
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -1072,13 +1118,6 @@ export default function GradeApproval() {
               // stage a class ever archives from) — this is a read-only
               // look-back, not a place to take a new action on it.
               <Badge variant="green"><Icons.Check className="w-3 h-3" /> Approved</Badge>
-            ) : showReturnForm ? (
-              <>
-                <button className="btn btn-outline" onClick={() => setShowReturnForm(false)} disabled={returning}>Cancel</button>
-                <button className="btn btn-red" onClick={() => setConfirmReturn(true)} disabled={returning || !returnMessage.trim()}>
-                  <Icons.Send className="w-4 h-4" /> {returning ? 'Sending...' : 'Send Back'}
-                </button>
-              </>
             ) : (
               <>
                 {previewApproved ? (
@@ -1092,24 +1131,50 @@ export default function GradeApproval() {
                     <Icons.Clock className="w-4 h-4" /> Awaiting Chairperson
                   </button>
                 ) : (
-                  <button className="btn btn-gold" onClick={() => setApproveTarget({ cls: preview.cls, type: preview.type })} disabled={approving} title={`Approve the ${previewDoc.label}`}>
+                  <button className="btn btn-gold" onClick={() => setApproveTarget({ cls: preview.cls, type: preview.type })} disabled={approving || showReturnForm} title={showReturnForm ? 'Not available while you are returning this class to the Chairperson' : `Approve the ${previewDoc.label}`}>
                     <Icons.Check className="w-4 h-4" /> Approve
                   </button>
                 )}
-                <button className="btn btn-outline !text-red-500 !border-red-200 hover:!bg-red-50" onClick={() => setShowReturnForm(true)}>
-                  <Icons.AlertTriangle className="w-4 h-4" /> Send Back to Chairperson
-                </button>
+                {!showReturnForm && (
+                  <button className="btn btn-outline !text-red-500 !border-red-200 hover:!bg-red-50" onClick={() => setShowReturnForm(true)}>
+                    <Icons.AlertTriangle className="w-4 h-4" /> Send Back to Chairperson
+                  </button>
+                )}
               </>
             )
           }
         >
-          {showReturnForm ? (
-            <div>
-              <p className="text-[13px] text-gray-500 mb-3">
-                This sends BOTH the Class Record and Grade Sheet back to {preview.cls.subject?.program || 'the'} Chairperson
-                (and notifies {preview.cls.instructor?.name ? formatPersonName(preview.cls.instructor.name) : 'the faculty'}) — they always move together, so this
-                un-verifies both documents (and any of your own approvals) until the issue is fixed and it's forwarded again.
-              </p>
+            <iframe
+              key={`${preview.cls.id}-${preview.type}`}
+              src={`${previewDoc.path}/${preview.cls.id}?preview=1`}
+              title="Document preview"
+              style={{ width: '100%', height: 'calc(90vh - 200px)', minHeight: 360, border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
+            />
+        </Modal>
+      )}
+
+      {/* SEND BACK TO CHAIRPERSON — a small window that floats over the preview
+          and can be dragged out of the way, so the Class Record or Grade Sheet
+          stays visible while the reason is typed. Hidden while the final
+          "Send back?" confirmation is up; what was typed is kept. */}
+      {preview && showReturnForm && !confirmReturn && !isArchived(preview.cls) && (
+        <FloatingPanel
+          title={`Send Back to Chairperson — ${preview.cls.subject?.code || ''}${preview.cls.section ? ` Sec ${preview.cls.section}` : ''}`}
+          onClose={() => setShowReturnForm(false)}
+          footer={(
+            <>
+              <button className="btn btn-outline btn-sm" onClick={() => setShowReturnForm(false)} disabled={returning}>Cancel</button>
+              <button className="btn btn-red btn-sm" onClick={() => setConfirmReturn(true)} disabled={returning || !returnMessage.trim()}>
+                <Icons.Send className="w-4 h-4" /> {returning ? 'Sending...' : 'Send Back'}
+              </button>
+            </>
+          )}
+        >
+          <p className="text-[12px] text-gray-500 mb-3">
+            This sends BOTH the Class Record and Grade Sheet back to {preview.cls.subject?.program || 'the'} Chairperson
+            (and notifies {preview.cls.instructor?.name ? formatPersonName(preview.cls.instructor.name) : 'the faculty'}) — they always move together, so this
+            un-verifies both documents (and any of your own approvals) until the issue is fixed and it's forwarded again.
+          </p>
               <label className="form-label">What needs to be revised? <span className="text-red-500">*</span></label>
               <textarea
                 className="form-input"
@@ -1119,16 +1184,7 @@ export default function GradeApproval() {
                 placeholder="e.g. Grade for student X looks incorrect — please double-check the Midterm score."
                 autoFocus
               />
-            </div>
-          ) : (
-            <iframe
-              key={`${preview.cls.id}-${preview.type}`}
-              src={`${previewDoc.path}/${preview.cls.id}?preview=1`}
-              title="Document preview"
-              style={{ width: '100%', height: 'calc(90vh - 200px)', minHeight: 360, border: '1px solid #e5e7eb', borderRadius: 8, background: '#fff' }}
-            />
-          )}
-        </Modal>
+        </FloatingPanel>
       )}
 
       {confirmReturn && (

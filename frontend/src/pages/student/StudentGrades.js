@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, TableBorders, WidthType, AlignmentType, ShadingType, BorderStyle, VerticalAlign, ImageRun } from 'docx';
+import { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, AlignmentType, ShadingType, BorderStyle, VerticalAlign } from 'docx';
 import { docxBlobToPdf } from '../../utils/docxToPdf';
 import { useAuth } from '../../context/AuthContext';
 import { LoadingSpinner, ConfidentialityBanner, ProgramBadge, RegularityBadge, Modal, Icons, programShortLabel, formatPersonName, formatPersonNameFirstLast, ClearSearchButton } from '../../components/common';
 import ProspectusTable from '../../components/student/ProspectusTable';
 import { exportEvaluationOfGradesDocx } from '../../utils/evaluationOfGradesDocx';
+import { withGradeSheetHeaderFooter } from '../../utils/gradeSheetLetterhead';
 import { gradeService, semesterService } from '../../services';
 import { onGradesUpdated } from '../../services/socket';
 import { usePageState } from '../../hooks/usePageState';
@@ -15,15 +16,18 @@ import { getSemesterFor, yearLabelOf } from '../../utils/semesterLabels';
 const CELL_BORDER = { style: BorderStyle?.SINGLE || 'single', size: 4, color: '999999' };
 const CELL_BORDERS = { top: CELL_BORDER, bottom: CELL_BORDER, left: CELL_BORDER, right: CELL_BORDER };
 const HEADER_SHADE = 'F3F4F6';
+const SLIP_FONT = 'Arial';
 
-function cell(text, { bold = false, shade = null, rowSpan, columnSpan, align = (AlignmentType?.CENTER || 'center'), color } = {}) {
+function cell(text, { bold = false, shade = null, rowSpan, columnSpan, align = (AlignmentType?.CENTER || 'center'), color, width } = {}) {
   return new TableCell({
+    width: width ? { size: width, type: WidthType?.PERCENTAGE || 'pct' } : undefined,
     rowSpan,
     columnSpan,
     borders: CELL_BORDERS,
     verticalAlign: VerticalAlign?.CENTER || 'center',
     shading: shade ? { fill: shade, type: ShadingType?.CLEAR || 'clear' } : undefined,
-    children: [new Paragraph({ alignment: align, children: [new TextRun({ text: String(text ?? ''), bold, size: 18, color })] })],
+    margins: { top: 50, bottom: 50, left: 90, right: 90 },
+    children: [new Paragraph({ alignment: align, children: [new TextRun({ text: String(text ?? ''), bold, size: 18, color, font: SLIP_FONT })] })],
   });
 }
 
@@ -31,7 +35,7 @@ function headingParagraph(text, { size = 24, underline = false, spacingBefore = 
   return new Paragraph({
     alignment: AlignmentType.CENTER,
     spacing: { before: spacingBefore, after: spacingAfter },
-    children: [new TextRun({ text, bold: true, size, underline: underline ? {} : undefined })],
+    children: [new TextRun({ text, bold: true, size, underline: underline ? {} : undefined, font: SLIP_FONT })],
   });
 }
 
@@ -105,55 +109,9 @@ export default function StudentGrades() {
         .filter((r) => slipYear === 'all' || String(r.class?.year_level) === slipYear);
 
       const children = [];
-      try {
-        // Both seals side by side — same pairing Login/Register already show
-        // on screen (SSU on the left, the college's own CAS seal on the
-        // right), not just the university seal alone.
-        const [sealBuf, casBuf] = await Promise.all([
-          fetch('/assets/logos/ssu-logo.png').then((r) => r.arrayBuffer()),
-          fetch('/assets/logos/cas-logo.png').then((r) => r.arrayBuffer()),
-        ]);
-        // A plain inline Paragraph (two ImageRuns either side of a literal
-        // "   " TextRun) used to place both seals — but inline images
-        // anchor to the surrounding text's baseline, not to each other, so
-        // two DIFFERENT-height images (60 vs 56, see below) never actually
-        // landed level with each other, and the gap between them was just
-        // however wide three space characters happened to render. A
-        // borderless one-row, two-cell table sidesteps both problems: each
-        // cell's own `verticalAlign: CENTER` centers its image within the
-        // shared row height regardless of the two images' own differing
-        // sizes, and the gap is the two cells meeting in the middle of a
-        // fixed-width table instead of font-dependent whitespace.
-        const sealCell = (imageRun, align) => new TableCell({
-          width: { size: 50, type: WidthType?.PERCENTAGE || 'pct' },
-          verticalAlign: VerticalAlign?.CENTER || 'center',
-          children: [new Paragraph({ alignment: align, children: [imageRun] })],
-        });
-        children.push(new Table({
-          width: { size: 40, type: WidthType?.PERCENTAGE || 'pct' },
-          alignment: AlignmentType?.CENTER || 'center',
-          borders: TableBorders?.NONE || { top: { style: 'none' }, bottom: { style: 'none' }, left: { style: 'none' }, right: { style: 'none' } },
-          rows: [new TableRow({
-            children: [
-              sealCell(new ImageRun({ type: 'png', data: sealBuf, transformation: { width: 60, height: 60 } }), AlignmentType?.RIGHT || 'right'),
-              // Same box height as the SSU seal (60), but a hair narrower —
-              // ssu-logo.png's own seal fills ~92% of its transparent canvas
-              // while cas-logo.png's fills ~99% of its (see RegisterPage's
-              // own measurement of the same two files), so an identical
-              // 60x60 box for both reads as CAS being visibly the bigger
-              // seal. 56 makes the two seals' own visible diameters — not
-              // just their boxes — come out the same.
-              sealCell(new ImageRun({ type: 'png', data: casBuf, transformation: { width: 56, height: 56 } }), AlignmentType.LEFT),
-            ],
-          })],
-        }));
-      } catch (imgErr) {
-        console.error('Seal image(s) failed to load — continuing without them:', imgErr);
-      }
-      children.push(new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: 'SAMAR STATE UNIVERSITY', bold: true, size: 28 })] }));
-      children.push(new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: 'Arteche Blvd., Catbalogan City, Philippines 6700', size: 18 })] }));
-      children.push(new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: 'College of Arts and Sciences', size: 18 })] }));
-      children.push(headingParagraph('GRADE SLIP', { size: 30, spacingBefore: 300 }));
+      // No letterhead in the body: the page header (the Grade Sheet's own,
+      // added below) already carries the university's seal, name and address.
+      children.push(headingParagraph('GRADE SLIP', { size: 30, spacingBefore: 240 }));
 
       // Each field its own line (not paired up via tabs). Year Level prefers
       // the actual CLASS's own year_level for this term over the student's
@@ -171,32 +129,35 @@ export default function StudentGrades() {
       const firstClass = rows[0]?.class;
       const academicYear = firstClass?.academic_year || (slipSemester.match(/\d{4}-\d{4}/) || [])[0] || '';
       const semesterName = slipSemester.replace(/\s*\d{4}-\d{4}\s*/, '').trim();
-      const infoField = (label, value, after = 60) => children.push(new Paragraph({
-        spacing: { after },
+      // The student's details as direct inline lines (no table columns) so that
+      // each value immediately follows its label with no artificial spacing:
+      // Name, Student ID Number, Year Level, Semester, School Year, Section.
+      const infoLine = (label, value) => new Paragraph({
+        spacing: { before: 30, after: 30 },
         children: [
-          new TextRun({ text: `${label}: `, bold: true, size: 20 }),
-          new TextRun({ text: value, size: 20 }),
+          new TextRun({ text: `${label}: `, bold: true, size: 20, font: SLIP_FONT }),
+          new TextRun({ text: String(value ?? ''), bold: false, size: 20, font: SLIP_FONT }),
         ],
-      }));
-      infoField('NAME', formatPersonName(student.name).toUpperCase());
-      infoField('STUDENT ID NUMBER', student.student_no || '—');
-      infoField('YEAR LEVEL', firstClass?.year_level ? `Year ${firstClass.year_level}` : (student.year_level ? `Year ${student.year_level}` : '—'));
-      infoField('SECTION', firstClass?.section || student.section || '—');
-      infoField('SEMESTER', semesterName);
-      // "ACADEMIC YEAR" or "SCHOOL YEAR" — this semester's own label.
-      infoField(yearLabelOf(await getSemesterFor(slipSemester)).toUpperCase(), academicYear, 200);
+      });
+      children.push(infoLine('NAME', formatPersonName(student.name).toUpperCase()));
+      children.push(infoLine('STUDENT ID NUMBER', student.student_no || '—'));
+      children.push(infoLine('YEAR LEVEL', firstClass?.year_level ? `Year ${firstClass.year_level}` : (student.year_level ? `Year ${student.year_level}` : '—')));
+      children.push(infoLine('SEMESTER', semesterName));
+      children.push(infoLine(yearLabelOf(await getSemesterFor(slipSemester)).toUpperCase(), academicYear));
+      children.push(infoLine('SECTION', firstClass?.section || student.section || '—'));
+      children.push(new Paragraph({ text: '', spacing: { after: 120 } }));
 
       if (rows.length === 0) {
-        children.push(new Paragraph({ children: [new TextRun({ text: 'No released grades for this semester yet.', italics: true, size: 20 })] }));
+        children.push(new Paragraph({ children: [new TextRun({ text: 'No released grades for this semester yet.', italics: true, size: 20, font: SLIP_FONT })] }));
       } else {
         const headerRow = new TableRow({
           tableHeader: true,
           children: [
-            cell('Subject Code', { bold: true, shade: HEADER_SHADE, align: AlignmentType.LEFT }),
-            cell('Subject Description', { bold: true, shade: HEADER_SHADE, align: AlignmentType.LEFT }),
-            cell('Faculty', { bold: true, shade: HEADER_SHADE, align: AlignmentType.LEFT }),
-            cell('Grade', { bold: true, shade: HEADER_SHADE }),
-            cell('Remarks', { bold: true, shade: HEADER_SHADE }),
+            cell('Subject Code', { bold: true, shade: HEADER_SHADE, align: AlignmentType.LEFT, width: 15 }),
+            cell('Subject Description', { bold: true, shade: HEADER_SHADE, align: AlignmentType.LEFT, width: 37 }),
+            cell('Faculty', { bold: true, shade: HEADER_SHADE, align: AlignmentType.LEFT, width: 26 }),
+            cell('Grade', { bold: true, shade: HEADER_SHADE, width: 10 }),
+            cell('Remarks', { bold: true, shade: HEADER_SHADE, width: 12 }),
           ],
         });
         const dataRows = rows.map((r) => new TableRow({
@@ -211,27 +172,35 @@ export default function StudentGrades() {
         children.push(new Table({ width: { size: 100, type: WidthType?.PERCENTAGE || 'pct' }, rows: [headerRow, ...dataRows] }));
       }
 
-      // Signature — just the one space asked for, not the two-signatory
-      // Registrar block Evaluation of Grades uses (this is the student's own
-      // copy, not an official transcript).
-      children.push(new Paragraph({ text: '', spacing: { before: 500 } }));
-      children.push(new Paragraph({
-        border: { top: { style: BorderStyle?.SINGLE || 'single', size: 4, color: '333333' } },
-        // A paragraph border spans its full line width by default — the
-        // whole page's content width, which read as a stray line running
-        // edge to edge. Indenting both sides shrinks just the border (and
-        // the centered text riding on top of it) down to a normal
-        // signature-line length instead.
-        indent: { left: 2600, right: 2600 },
-        spacing: { before: 500 },
-        alignment: AlignmentType.CENTER,
-        children: [new TextRun({ text: 'Signature Over Printed Name', size: 18 })],
+      // Signatures, side by side: a blank line each for the student and the
+      // adviser to sign and write their name on — no names are printed.
+      const NO_BORDER = { style: BorderStyle?.NONE || 'none', size: 0, color: 'FFFFFF' };
+      const NO_BORDERS = { top: NO_BORDER, bottom: NO_BORDER, left: NO_BORDER, right: NO_BORDER };
+      const signLine = { style: BorderStyle?.SINGLE || 'single', size: 6, color: '000000' };
+      const signCell = (caption) => new TableCell({
+        width: { size: 50, type: WidthType?.PERCENTAGE || 'pct' },
+        borders: NO_BORDERS,
+        children: [new Paragraph({
+          border: { top: signLine },
+          indent: { left: 500, right: 500 },
+          alignment: AlignmentType.CENTER,
+          children: [new TextRun({ text: caption, italics: true, size: 18, font: SLIP_FONT })],
+        })],
+      });
+      children.push(new Paragraph({ text: '', spacing: { before: 900 } }));
+      children.push(new Table({
+        width: { size: 100, type: WidthType?.PERCENTAGE || 'pct' },
+        borders: { ...NO_BORDERS, insideHorizontal: NO_BORDER, insideVertical: NO_BORDER },
+        rows: [new TableRow({ children: [signCell("Student's Signature over Printed Name"), signCell("Adviser's Signature over Printed Name")] })],
       }));
 
-      const doc = new Document({ sections: [{ children }] });
-      const blob = await Packer.toBlob(doc);
+      // Long bond paper (8.5 x 13 in), the same sheet as the Evaluation of Grades
+      // and the Grades Monitoring Form — sizes are in twentieths of a point.
+      const doc = new Document({ sections: [{ properties: { page: { size: { width: 12240, height: 18720 }, margin: { left: 1440, right: 1440 } } }, children }] });
+      // Same page header and footer as the faculty's Grade Sheet.
+      const blob = await withGradeSheetHeaderFooter(await Packer.toBlob(doc));
       const yearSuffix = slipYear === 'all' ? '' : `_Year${slipYear}`;
-      await docxBlobToPdf(blob, `${(student.student_no || student.name || 'GradeSlip').replace(/\s+/g, '_')}_GradeSlip_${slipSemester.replace(/\s+/g, '_')}${yearSuffix}.pdf`);
+      await docxBlobToPdf(blob, `${(student.student_no || student.name || 'GradeSlip').replace(/\s+/g, '_')}_GradeSlip_${slipSemester.replace(/\s+/g, '_')}${yearSuffix}.pdf`, { edgeSideMarginIn: 1 });
       setShowSlipModal(false);
     } catch (err) {
       console.error('Failed to export Grade Slip to PDF:', err);

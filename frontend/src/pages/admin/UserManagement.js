@@ -345,9 +345,7 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
   const [advisoryList, setAdvisoryList] = useState([]);
   const [showAdviserImport, setShowAdviserImport] = useState(false);
   const [savingAdvisory, setSavingAdvisory] = useState(false);
-  const [archiveTarget, setArchiveTarget] = useState(null);
   const [archivedOpen, setArchivedOpen] = useState(false);
-  const [archiving, setArchiving] = useState(false);
   // Reactivate/Deactivate — same status toggle, opposite directions. Both
   // confirmed first: Deactivate locks someone out immediately, and
   // Reactivate isn't harmless either — it can let a Rejected/Deactivated
@@ -561,22 +559,9 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
     }
   };
 
-  // Accounts are never deleted — archived (can't sign in, out of the active
-  // list, every record kept) and restorable from the Archived section.
-  const handleArchive = async () => {
-    if (!archiveTarget) return;
-    try {
-      setArchiving(true);
-      const { data } = await userService.archive(archiveTarget.id);
-      toast.success(data.message || 'Account archived');
-      setArchiveTarget(null);
-      loadUsers();
-    } catch (err) {
-      toast.error(err.response?.data?.message || 'Failed to archive account');
-    } finally {
-      setArchiving(false);
-    }
-  };
+  // Accounts are never deleted. Deactivating one archives it (see
+  // handleDeactivate): it can't sign in, leaves the active list and shows
+  // under the Archived section, from where it can be restored.
   const handleRestore = async (u) => {
     try {
       const { data } = await userService.restore(u.id);
@@ -606,8 +591,9 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
     if (!deactivateTarget) return;
     setDeactivating(true);
     try {
-      await userService.update(deactivateTarget.id, { status: 'Deactivated' });
-      toast.success(`${deactivateTarget.name} deactivated`);
+      // Deactivating archives the account — one action, not two.
+      await userService.archive(deactivateTarget.id);
+      toast.success(`${deactivateTarget.name} deactivated and moved to Archived`);
       setDeactivateTarget(null);
       loadUsers();
     } catch (err) {
@@ -706,18 +692,13 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
           <Icons.Check />
         </button>
       )}
-      {/* Deactivate — the other direction of Reactivate above. Never offered
+      {/* Deactivate — also archives the account (it moves to the Archived
+          section below; Restore there activates it again). Never offered
           on your own account (locking yourself out this way has no way back
           except another Admin/Chairperson doing it for you). */}
       {!facultyMode && u.status === 'Active' && u.id !== currentUser?.id && (
-        <button className="btn-icon hover:!bg-amber-50 hover:!text-amber-600" onClick={() => setDeactivateTarget(u)} title="Deactivate">
+        <button className="btn-icon hover:!bg-amber-50 hover:!text-amber-600" onClick={() => setDeactivateTarget(u)} title="Deactivate (moves the account to Archived)">
           <Icons.Ban />
-        </button>
-      )}
-      {/* Archive (never delete) — not on your own account. */}
-      {!facultyMode && u.id !== currentUser?.id && (
-        <button className="btn-icon hover:!bg-amber-50 hover:!text-amber-600" onClick={() => setArchiveTarget(u)} title="Archive account">
-          <Icons.Archive />
         </button>
       )}
     </div>
@@ -748,8 +729,8 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
         {activeRole !== 'Student' && (
           <div className="flex flex-wrap gap-2">
             {isAdmin && !programScoped && (
-              <button className="btn btn-outline" onClick={() => setShowAdviserImport(true)} title="Set every section's adviser from the Room Assignment list">
-                <Icons.Upload /> Import Advisers
+              <button className="btn btn-outline" onClick={() => setShowAdviserImport(true)} title="Set every section's adviser from the Room Assignment list, and see past advisers">
+                <Icons.Upload /> Manage Advisory
               </button>
             )}
             <button className="btn btn-gold" onClick={() => openCreate()}>
@@ -922,7 +903,7 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
               <span className="text-sm font-bold bg-white/20 rounded-full min-w-[26px] h-[26px] px-2 flex items-center justify-center">{archivedUsers.length}</span>
               <div className="text-left">
                 <p className="text-sm font-bold flex items-center gap-1.5"><Icons.Archive className="w-3.5 h-3.5" /> Archived {activeRole === 'Faculty' ? 'Faculty' : `${activeRole}s`}</p>
-                <p className="text-[11px] text-white/75">Can't sign in. Their grades, classes and records are all kept — restore to bring an account back.</p>
+                <p className="text-[11px] text-white/75">Deactivated accounts — they can't sign in. Their grades, classes and records are all kept; Restore activates an account again.</p>
               </div>
             </div>
             {archivedOpen ? <Icons.ChevronUp className="w-4 h-4" /> : <Icons.ChevronDown className="w-4 h-4" />}
@@ -947,7 +928,7 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
                       <td className="px-4 py-2">
                         <div className="flex gap-1.5 justify-end">
                           <button className="btn-icon" onClick={() => openView(u)} title="View"><Icons.Eye /></button>
-                          <button className="btn btn-outline btn-sm" onClick={() => handleRestore(u)} title="Restore this account">
+                          <button className="btn btn-outline btn-sm" onClick={() => handleRestore(u)} title="Activate this account again">
                             <Icons.RotateCw className="w-3.5 h-3.5" /> Restore
                           </button>
                         </div>
@@ -1331,19 +1312,6 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
 
       {gradesTarget && <StudentGradeRecordModal studentId={gradesTarget.id} onClose={() => setGradesTarget(null)} />}
 
-      {/* DELETE CONFIRMATION */}
-      {archiveTarget && (
-        <ConfirmDialog
-          title="Archive Account"
-          message={`Archive ${archiveTarget.name}'s account${archiveTarget.student_no ? ` (${archiveTarget.student_no})` : ''}? They won't be able to sign in and the account leaves this list, but nothing is deleted — their grades, classes and records are all kept. You can restore it any time from the Archived section.`}
-          confirmText={archiving ? 'Archiving...' : 'Archive'}
-          confirmDisabled={archiving}
-          variant="gold"
-          onConfirm={handleArchive}
-          onCancel={() => setArchiveTarget(null)}
-        />
-      )}
-
       {/* REACTIVATE CONFIRMATION */}
       {reactivateTarget && (
         <ConfirmDialog
@@ -1361,7 +1329,7 @@ export default function UserManagement({ chairpersonMode = false, facultyMode = 
       {deactivateTarget && (
         <ConfirmDialog
           title="Deactivate Account"
-          message={`Deactivate ${deactivateTarget.name}'s account? They won't be able to sign in until an Admin or Chairperson reactivates it — their account data stays intact either way, unlike Delete.`}
+          message={`Deactivate ${deactivateTarget.name}'s account? They won't be able to sign in, and the account is archived automatically — it moves to the Archived section at the bottom of this list. Nothing is deleted: their classes, grades and records are all kept, and Restore there activates the account again.`}
           confirmText={deactivating ? 'Deactivating...' : 'Deactivate'}
           variant="red"
           confirmDisabled={deactivating}

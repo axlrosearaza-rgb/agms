@@ -12,7 +12,8 @@ const Subject = sequelize.define('Subject', {
   code: {
     type: DataTypes.STRING(60),
     allowNull: false,
-    unique: true,
+    // Unique per program + curriculum (index below), not on its own: a new
+    // curriculum reuses the same course codes.
   },
   name: {
     type: DataTypes.STRING(150),
@@ -104,6 +105,7 @@ const Subject = sequelize.define('Subject', {
   },
 }, {
   tableName: 'subjects',
+  indexes: [{ unique: true, fields: ['code', 'program', 'curriculum_year'], name: 'subjects_code_program_curriculum_key' }],
 });
 
 module.exports = Subject;

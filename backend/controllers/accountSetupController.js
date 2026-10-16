@@ -84,13 +84,14 @@ const requestEmailCode = asyncHandler(async (req, res) => {
   // (not verified yet) and the account setup is finished right here.
   if (require('../utils/offline').isOffline()) {
     user.email = email;
-    user.email_verified = false;
+    // Left as it is: email_verified is also the sign-in gate (login refuses
+    // an account with it false), so it must never be switched off here.
     user.pending_email = null;
     user.email_verification_code = null;
     user.email_verification_expires = null;
     user.account_setup_at = new Date();
     await user.save();
-    await logActivity(user.id, 'finished account setup (offline mode — e-mail saved, not verified)', 'User', user.id);
+    await logActivity(user.id, 'finished account setup (offline mode — e-mail saved without a code)', 'User', user.id);
     return res.json({ message: 'Your account is all set.', email, verified: true, offline: true, user: user.toSafeJSON() });
   }
 
@@ -144,6 +145,24 @@ const confirmEmailCode = asyncHandler(async (req, res) => {
   await user.save();
   await logActivity(user.id, 'verified their email and finished account setup', 'User', user.id);
 
+  res.json({ message: 'Your account is all set.', user: user.toSafeJSON() });
+});
+
+// POST /api/account-setup/email/skip — the e-mail is optional: the student
+// finishes account setup without one and adds it later from Settings (their
+// dashboard keeps reminding them — it's what "Forgot password" needs).
+const skipEmail = asyncHandler(async (req, res) => {
+  const user = await loadStudent(req, res);
+  if (!user) return;
+  if (!user.password_changed_at) {
+    return res.status(400).json({ message: 'Set your new password first.' });
+  }
+  user.pending_email = null;
+  user.email_verification_code = null;
+  user.email_verification_expires = null;
+  user.account_setup_at = new Date();
+  await user.save();
+  await logActivity(user.id, 'finished account setup (e-mail to be added later)', 'User', user.id);
   res.json({ message: 'Your account is all set.', user: user.toSafeJSON() });
 });
 
@@ -424,5 +443,5 @@ const answerClassConfirmation = asyncHandler(async (req, res) => {
   res.json({ message: `You were removed from ${cls?.subject?.code || 'that class'}. Your faculty has been told.`, removed: true, user: me.toSafeJSON() });
 });
 
-module.exports = { setPassword, requestEmailCode, confirmEmailCode, getStatusDeclaration, declareStatus, getClassConfirmations, answerClassConfirmation, getContacts, getRetakes };
+module.exports = { setPassword, requestEmailCode, confirmEmailCode, getStatusDeclaration, declareStatus, getClassConfirmations, answerClassConfirmation, getContacts, getRetakes, skipEmail };
 
